@@ -1,0 +1,2120 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pascal Sieve</title>
+<style>
+:root { color-scheme: light dark; --bg: #fff; --fg: #111; --muted: #666; --line: #ddd; --stage: #0a0a0a; }
+@media (prefers-color-scheme: dark) { :root { --bg: #151515; --fg: #e6e6e6; --muted: #999; --line: #2c2c2c; } }
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body { background: var(--bg); color: var(--fg); font: 13px/1.4 system-ui, sans-serif; }
+main { display: flex; height: 100%; }
+#panel { width: 300px; flex: none; overflow-y: auto; padding: 10px 12px 20px; border-right: 1px solid var(--line); }
+#stage { flex: 1; min-width: 0; position: relative; background: var(--stage); }
+#view { display: block; width: 100%; height: 100%; cursor: crosshair; touch-action: none; }
+h1 { font-size: 15px; margin: 0 0 2px; }
+h2 { font-size: 11px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); margin: 0 0 6px; }
+section { border-top: 1px solid var(--line); padding: 10px 0 6px; }
+.row { display: flex; align-items: center; gap: 6px; margin: 5px 0; flex-wrap: wrap; }
+.row > label:first-child { min-width: 58px; color: var(--muted); }
+.chk { display: inline-flex; align-items: center; gap: 4px; }
+input, select, button { font: inherit; }
+input[type=number], input[type=text], select { font-family: ui-monospace, Consolas, monospace; font-size: 12px; padding: 2px 4px; }
+input[type=number] { width: 6.5em; }
+#m { flex: 1; min-width: 7em; }
+input[type=range] { width: 100%; margin: 2px 0; }
+.row input[type=range] { flex: 1; width: auto; min-width: 80px; }
+select { max-width: 100%; }
+button { padding: 3px 9px; cursor: pointer; }
+.note { color: var(--muted); font-size: 12px; margin: 4px 0; }
+.warn { color: #c77700; font-size: 12px; margin: 4px 0; }
+.warn:empty, .note:empty { display: none; }
+.mono { font-family: ui-monospace, Consolas, monospace; }
+.wrap { overflow-wrap: anywhere; }
+[hidden] { display: none !important; }
+#inspect { position: absolute; top: 8px; left: 8px; max-width: min(400px, calc(100% - 16px)); padding: 6px 9px;
+  font: 12px/1.45 ui-monospace, Consolas, monospace; color: #ddd; background: rgba(0,0,0,.78); white-space: pre-wrap; overflow-wrap: anywhere; pointer-events: none; }
+#inspect:empty { display: none; }
+#tools { position: absolute; top: 8px; right: 8px; display: flex; gap: 4px; }
+#status { position: absolute; left: 0; right: 0; bottom: 0; padding: 3px 8px; font: 11px ui-monospace, Consolas, monospace;
+  color: #bbb; background: rgba(0,0,0,.6); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; pointer-events: none; }
+@media (max-width: 760px) {
+  main { flex-direction: column; height: auto; }
+  #stage { order: -1; height: 62vh; flex: none; }
+  #panel { width: auto; border-right: 0; }
+}
+</style>
+</head>
+<body>
+<main>
+<aside id="panel">
+  <h1>Pascal sieve</h1>
+  <p class="note">C(n,k) mod μ. Sweep μ and the prime factorization of μ rebuilds the picture: Lucas's theorem sets the tiles, Kummer's sets the depth of every zero, CRT overlays the factors.</p>
+
+  <section>
+    <h2>Modulus</h2>
+    <div class="row">
+      <label for="m">μ</label>
+      <input id="m" type="text" inputmode="decimal" autocomplete="off" spellcheck="false">
+      <button id="mPrev" title="One step down (←)">◀</button>
+      <button id="mNext" title="One step up (→)">▶</button>
+    </div>
+    <input id="mSlider" type="range" min="0" max="1" aria-label="modulus">
+    <p class="note mono wrap" id="mInfo"></p>
+    <div class="row"><label for="visit">visit</label><select id="visit"></select></div>
+    <div class="row" id="stepRow"><label for="step">step</label><input id="step" type="number" min="1" max="10000"></div>
+    <div class="row"><label for="fine">decimals</label><input id="fine" type="number" min="0" max="300"><span id="fineOut" class="note mono"></span></div>
+    <p class="note" id="visitNote"></p>
+    <p class="note" id="fineNote"></p>
+  </section>
+
+  <section>
+    <h2>Sweep</h2>
+    <div class="row"><label for="from">range</label><input id="from" type="number" min="2" max="100000"><span>to</span><input id="to" type="number" min="2" max="100000"></div>
+    <div class="row">
+      <button id="play">Play</button>
+      <button id="dir" title="Sweep direction"></button>
+      <button id="toStart" title="Jump to the start of the range">⇤ start</button>
+      <label class="chk"><input id="loop" type="checkbox"> loop</label>
+    </div>
+    <div class="row"><label for="speed">frame</label><input id="speed" type="range" min="16" max="1000"><span id="speedOut" class="mono"></span></div>
+    <p class="note" id="sweepNote"></p>
+  </section>
+
+  <section>
+    <h2>Lens</h2>
+    <select id="lens" aria-label="lens"></select>
+    <div class="row" id="pRow"><label for="p">prime p</label><select id="p"></select></div>
+    <div class="row" id="LRow"><label for="L">digit L</label><input id="L" type="number" min="0" max="12"></div>
+    <div class="row" id="JRow"><label for="J">digit j</label><input id="J" type="number" min="0" max="12"></div>
+    <div class="row" id="qshowRow"><label for="qshow">show</label><select id="qshow">
+      <option value="full">phase + magnitude</option>
+      <option value="norot">without the k(n−k) turn</option>
+      <option value="fringe">fringes only (zone plate)</option>
+    </select></div>
+    <div class="row" id="wshowRow"><label for="wshow">show</label><select id="wshow">
+      <option value="energy">energy (palette)</option>
+      <option value="phase">phase (hue)</option>
+    </select></div>
+    <div id="stripeCtl">
+      <div class="row"><label for="stol">similar</label><input id="stol" type="number" min="1" max="20"><span class="note">% of the color cycle</span></div>
+      <div class="row"><label for="srun">min run</label><input id="srun" type="number" min="2" max="12"><span class="note">cells in a row</span></div>
+      <div class="row"><label for="scolor">color</label><select id="scolor"><option value="true">their own colors</option><option value="depth">by rows stacked</option></select></div>
+      <div class="row"><label class="chk"><input id="strack" type="checkbox"> track across frames</label><button id="strackReset">Reset</button></div>
+      <p class="note mono wrap" id="stripeOut"></p>
+    </div>
+    <div class="row" id="censusRow"><span id="censusOut" class="mono"></span><button id="censusReset">Reset</button></div>
+    <p class="note" id="lensNote"></p>
+    <p class="warn" id="lensWarn"></p>
+  </section>
+
+  <section>
+    <h2>Motion</h2>
+    <select id="motion" aria-label="motion detection">
+      <option value="off">off</option>
+      <option value="flow">coherent motion · hue = direction</option>
+      <option value="drift">steady drift · hue = rate</option>
+    </select>
+    <div id="motionCtl">
+      <div class="row"><label for="tau">evidence</label><input id="tau" type="number" min="2" max="64"><span class="note">frames averaged</span></div>
+      <div class="row"><label for="trail">trail</label><input id="trail" type="number" min="0" max="240"><span class="note">frames to fade</span></div>
+      <div class="row"><label for="pool">pool</label><input id="pool" type="number" min="0" max="4"><span class="note">neighbour passes</span></div>
+      <div class="row"><label for="gain">gain</label><input id="gain" type="range" min="1" max="60"><span id="gainOut" class="mono"></span></div>
+      <div class="row"><label for="img">picture</label><input id="img" type="range" min="0" max="100"><span id="imgOut" class="mono"></span></div>
+      <div class="row"><button id="motionReset">Reset</button><span id="motionOut" class="mono note"></span></div>
+    </div>
+    <p class="note" id="motionNote"></p>
+    <p class="warn" id="motionWarn"></p>
+  </section>
+
+  <section>
+    <h2>Rows</h2>
+    <div class="row">
+      <label for="rows">rows</label>
+      <input id="rows" type="number" min="2" max="2000">
+      <label class="chk"><input id="link" type="checkbox"> rows = μ</label>
+    </div>
+    <input id="rowsSlider" type="range" min="2" max="2000" aria-label="rows">
+    <div class="row"><label for="first">first row</label><input id="first" type="number" min="0" max="3998"></div>
+    <p class="note">Values are always computed from row 0. Up to 2000 rows drawn, 4000 computed.</p>
+  </section>
+
+  <section>
+    <h2>Residue filter</h2>
+    <div class="row"><input id="iso" type="text" placeholder="e.g.  0    or    1, n, 1/2" style="flex:1;min-width:0"><button id="isoClear" title="Clear filter">×</button></div>
+    <p class="note">Show only these residues: integers, <b>n</b> = the largest integer below μ, <b>n-2</b>, or a fraction <b>a/b</b> of the way from 0 to n. <b>0</b> alone shows exactly where μ divides C(n,k).</p>
+  </section>
+
+  <section>
+    <h2>Display</h2>
+    <div class="row"><label for="scheme">palette</label><select id="scheme"></select></div>
+    <div class="row"><label for="viewMode">view</label><select id="viewMode"><option value="flat">Flat</option><option value="relief">Relief (height = lens)</option></select></div>
+    <div class="row" id="elevRow"><label for="elev">height</label><input id="elev" type="range" min="0" max="150"><span id="elevOut" class="mono"></span></div>
+    <div class="row"><label class="chk"><input id="nums" type="checkbox"> numbers when zoomed in</label></div>
+  </section>
+
+  <section>
+    <h2>Examples</h2>
+    <select id="example" aria-label="examples"><option value="">Load an example…</option></select>
+  </section>
+
+  <section>
+    <h2>Export</h2>
+    <div class="row"><label for="scale">scale</label><input id="scale" type="number" min="1" max="12"><span class="note">cell = 2×scale px</span></div>
+    <div class="row"><button id="savePng">Save PNG</button><button id="saveZip">Export sweep (ZIP)</button></div>
+    <p class="note" id="expNote"></p>
+  </section>
+
+  <p class="note">Keys: ←/→ one step · PgUp/PgDn whole modulus · ↑/↓ rows · shift = ×10 · space play · F fit. Drag to pan, wheel to zoom, double-click to fit. Hover or tap a cell (flat view) to inspect it.</p>
+</aside>
+
+<div id="stage">
+  <canvas id="view"></canvas>
+  <div id="inspect"></div>
+  <div id="tools"><button id="zoomOut" title="Zoom out">−</button><button id="zoomIn" title="Zoom in">+</button><button id="fitBtn" title="Fit (F)">Fit</button></div>
+  <div id="status"></div>
+</div>
+</main>
+
+<script>
+'use strict';
+// <core> — pure math, color tables, motion detection, painters and the ZIP writer. No DOM.
+// verify-pascal-core.cjs extracts this block and checks it against exact BigInt binomials.
+
+const MOD_CAP = 100000;          // largest whole modulus
+const MAX_ROWS = 2000;           // most rows drawn at once
+const ROW_CAP = 4000;            // most rows computed (first row + rows drawn)
+const ROW_ASPECT = Math.sqrt(3); // row height / half-cell width: equilateral cells
+const P_TABLE_CAP = 1 << 20;     // largest prime given factorial / discrete-log tables
+const MOTION_CELL_CAP = 1200000; // motion detection memory bound (~40 MB)
+const MAX_FINE = 300;            // most decimal places between moduli
+const LIMB_CAP = 16e6;           // multi-word residues: cells × words kept below this (128 MB)
+
+// ---- primes ----
+const PRIMES = [];
+const PRIME_RANK = new Uint16Array(MOD_CAP + 1); // 1-based index among the primes, 0 = not prime
+{
+  const composite = new Uint8Array(MOD_CAP + 1);
+  for (let i = 2; i <= MOD_CAP; i++) {
+    if (composite[i]) continue;
+    PRIME_RANK[i] = PRIMES.push(i);
+    for (let j = i * i; j <= MOD_CAP; j += i) composite[j] = 1;
+  }
+}
+
+// [[p, a], ...] ascending, for whole numbers below 10^10 (trial division by the sieve).
+function factorize(m) {
+  const out = [];
+  for (const p of PRIMES) {
+    if (p * p > m) break;
+    if (m % p === 0) { let a = 0; while (m % p === 0) { m /= p; a++; } out.push([p, a]); }
+  }
+  if (m > 1) out.push([m, 1]);
+  return out;
+}
+const isPrime = (n) => n >= 2 && n <= MOD_CAP && PRIME_RANK[n] !== 0;
+const SUP = '⁰¹²³⁴⁵⁶⁷⁸⁹', SUB = '₀₁₂₃₄₅₆₇₈₉';
+const sup = (n) => String(n).replace(/\d/g, (d) => SUP[d]);
+const sub = (n) => String(n).replace(/\d/g, (d) => SUB[d]);
+const factorString = (fs) => fs.map(([p, a]) => a === 1 ? String(p) : p + sup(a)).join('·');
+
+// Factors of a numerator P (BigInt) that can matter. A prime above n never divides C(n,k), so
+// for rows below 4000 only primes below 4000 shape any zero; larger factors are reported, not
+// needed. Below 2^53 the factorization is complete up to a cofactor with no prime under 10^5.
+const FAC_CACHE = new Map();
+function factorP(P) {
+  const key = P.toString();
+  let f = FAC_CACHE.get(key);
+  if (f) return f;
+  const factors = [];
+  let rest = P, limit;
+  if (P <= 2n ** 53n) {
+    let x = Number(P), done = false;
+    for (const p of PRIMES) {
+      if (p * p > x) { done = true; break; }
+      if (x % p === 0) { let a = 0; while (x % p === 0) { x /= p; a++; } factors.push([p, a]); }
+    }
+    if (x > 1 && (done || x <= 1e10)) { factors.push([x, 1]); x = 1; }
+    rest = BigInt(x); limit = 100000;
+  } else {
+    for (const p of PRIMES) {
+      if (p > ROW_CAP) break;
+      const pb = BigInt(p);
+      if (rest % pb === 0n) { let a = 0; while (rest % pb === 0n) { rest /= pb; a++; } factors.push([p, a]); }
+    }
+    limit = ROW_CAP;
+  }
+  f = { factors, rest, limit };
+  if (FAC_CACHE.size > 256) FAC_CACHE.clear();
+  FAC_CACHE.set(key, f);
+  return f;
+}
+
+const gcdBig = (a, b) => { while (b) { const t = a % b; a = b; b = t; } return a; };
+const POW10 = [];
+const pow10 = (d) => POW10[d] || (POW10[d] = 10n ** BigInt(d));
+// μ = units / 10^d as a reduced fraction P/Q (BigInt). Then C mod μ = ((Q·C) mod P) / Q exactly,
+// and since Q is a unit mod P, μ divides C exactly when P does: every fraction carries its
+// numerator's sieve.
+function rational(units, d) {
+  const Q0 = pow10(d), g = gcdBig(units, Q0);
+  return { P: units / g, Q: Q0 / g };
+}
+
+const digitSum = (n, p) => { let s = 0; while (n > 0) { const d = n % p; s += d; n = (n - d) / p; } return s; };
+// Kummer: ν_p(C(n,k)) = carries adding k and n−k in base p = (s_p(k) + s_p(n−k) − s_p(n)) / (p − 1)
+const carries = (n, k, p) => (digitSum(k, p) + digitSum(n - k, p) - digitSum(n, p)) / (p - 1);
+
+const modpow = (b, e, m) => {
+  let r = 1 % m; b %= m;
+  while (e > 0) { if (e & 1) r = r * b % m; b = b * b % m; e = Math.floor(e / 2); }
+  return r;
+};
+const primitiveRoot = (p) => {
+  if (p === 2) return 1;
+  const qs = factorize(p - 1).map(([q]) => q);
+  for (let g = 2; g < p; g++) if (qs.every((q) => modpow(g, (p - 1) / q, p) !== 1)) return g;
+  return 1;
+};
+
+// Per-prime tables: factorials and inverse factorials mod p (C(a,b) mod p for a,b < p),
+// and the discrete-log table to the smallest primitive root. O(p), cached.
+const P_TABLES = new Map();
+function tablesFor(p) {
+  let t = P_TABLES.get(p);
+  if (t) return t;
+  const fact = new Uint32Array(p), inv = new Uint32Array(p), ind = new Uint32Array(p);
+  fact[0] = 1;
+  for (let i = 1; i < p; i++) fact[i] = fact[i - 1] * i % p;
+  inv[p - 1] = modpow(fact[p - 1], p - 2, p);
+  for (let i = p - 1; i > 0; i--) inv[i - 1] = inv[i] * i % p;
+  const g = primitiveRoot(p);
+  for (let j = 0, x = 1; j < p - 1; j++) { ind[x] = j; x = x * g % p; }
+  t = { fact, inv, ind, g };
+  if (P_TABLES.size > 16) P_TABLES.clear();
+  P_TABLES.set(p, t);
+  return t;
+}
+const binomModP = (a, b, T, p) => b > a ? 0 : T.fact[a] * T.inv[b] % p * T.inv[a - b] % p;
+
+function binomBig(n, k) {
+  k = Math.min(k, n - k);
+  let r = 1n;
+  for (let i = 1; i <= k; i++) r = r * BigInt(n - k + i) / BigInt(i);
+  return r;
+}
+// ln n! for n ≤ ROW_CAP
+const LNF = (() => { const a = new Float64Array(ROW_CAP + 1); for (let i = 2; i <= ROW_CAP; i++) a[i] = a[i - 1] + Math.log(i); return a; })();
+
+// ---- the triangle: C(n,k) mod m by the additive rule, rows 0..N-1, flat index n(n+1)/2 + k ----
+// For small whole moduli (m < 2^31): the lenses that work mod p or mod p^a use this.
+function buildTriangle(N, m) {
+  const t = m <= 65536 ? new Uint16Array(N * (N + 1) / 2) : new Uint32Array(N * (N + 1) / 2);
+  for (let r = 0; r < N; r++) {
+    const row = r * (r + 1) / 2, prev = row - r;
+    t[row] = 1; t[row + r] = 1;
+    for (let c = 1; c < r; c++) {
+      const s = t[prev + c - 1] + t[prev + c];
+      t[row + c] = s - (m & -(s >= m)); // s < 2m: branchless reduction
+    }
+  }
+  return t;
+}
+
+// ---- the scaled triangle S(n,k) = Q·C(n,k) mod P, exact at any number of decimals ----
+// Same additive rule with edges Q mod P. Stored in the cheapest exact form: small integers
+// (P < 2^31), doubles (P < 2^52, sums stay below 2^53), or base-2^48 words for anything larger.
+const B48 = 2 ** 48, B48n = 1n << 48n, TWO31 = 2n ** 31n, TWO52 = 2n ** 52n;
+const toLimbs = (x, k) => { const a = new Float64Array(k); for (let l = 0; l < k; l++) { a[l] = Number(x & (B48n - 1n)); x >>= 48n; } return a; };
+const limbsFor = (P) => Math.ceil(P.toString(2).length / 48);
+function buildScaled(N, P, Q) {
+  const total = N * (N + 1) / 2, q = Q % P;
+  if (P < TWO31) {
+    const p = Number(P), e = Number(q), t = p <= 65536 ? new Uint16Array(total) : new Uint32Array(total);
+    for (let r = 0; r < N; r++) {
+      const row = r * (r + 1) / 2, prev = row - r;
+      t[row] = e; t[row + r] = e;
+      for (let c = 1; c < r; c++) { const s = t[prev + c - 1] + t[prev + c]; t[row + c] = s - (p & -(s >= p)); }
+    }
+    return { kind: 'int', t, p, q: e, P, Q, k: 1 };
+  }
+  if (P < TWO52) {
+    const p = Number(P), e = Number(q), t = new Float64Array(total);
+    for (let r = 0; r < N; r++) {
+      const row = r * (r + 1) / 2, prev = row - r;
+      t[row] = e; t[row + r] = e;
+      for (let c = 1; c < r; c++) { const s = t[prev + c - 1] + t[prev + c]; t[row + c] = s >= p ? s - p : s; }
+    }
+    return { kind: 'f64', t, p, q: e, P, Q, k: 1 };
+  }
+  const k = limbsFor(P), Pl = toLimbs(P, k), ql = toLimbs(q, k), t = new Float64Array(total * k);
+  for (let r = 0; r < N; r++) {
+    const row = r * (r + 1) / 2, prev = row - r;
+    t.set(ql, row * k); t.set(ql, (row + r) * k);
+    for (let c = 1; c < r; c++) {
+      const a = (prev + c - 1) * k, b = a + k, o = (row + c) * k;
+      let carry = 0;
+      for (let l = 0; l < k; l++) { let v = t[a + l] + t[b + l] + carry; if (v >= B48) { v -= B48; carry = 1; } else carry = 0; t[o + l] = v; }
+      let ge = carry === 1;
+      if (!ge) { let l = k - 1; while (l >= 0 && t[o + l] === Pl[l]) l--; ge = l < 0 || t[o + l] > Pl[l]; }
+      if (ge) { let borrow = 0; for (let l = 0; l < k; l++) { let v = t[o + l] - Pl[l] - borrow; if (v < 0) { v += B48; borrow = 1; } else borrow = 0; t[o + l] = v; } }
+    }
+  }
+  const top = (a, o) => a[o + k - 1] * B48 + a[o + k - 2] + (k > 2 ? a[o + k - 3] / B48 : 0);
+  return { kind: 'limbs', t, k, Pl, ql, P, Q, pTop: top(Pl, 0), top };
+}
+// Exact value S at cell i, as a BigInt.
+function scaledBig(sc, i) {
+  if (sc.kind !== 'limbs') return typeof sc.t[i] === 'bigint' ? sc.t[i] : BigInt(sc.t[i]);
+  let v = 0n;
+  for (let l = sc.k - 1; l >= 0; l--) v = (v << 48n) + BigInt(sc.t[i * sc.k + l]);
+  return v;
+}
+// A BigInt target in the scaled representation, for exact comparisons (null if ≥ P).
+function scaledTarget(sc, x) {
+  if (x >= sc.P) return null;
+  return sc.kind === 'limbs' ? toLimbs(x, sc.k) : Number(x);
+}
+function scaledEq(sc, i, target) {
+  if (target === null) return false;
+  if (sc.kind !== 'limbs') return sc.t[i] === target;
+  const o = i * sc.k;
+  for (let l = 0; l < sc.k; l++) if (sc.t[o + l] !== target[l]) return false;
+  return true;
+}
+// Phase S/P = frac(C/μ) for cells from..from+n−1 (double precision).
+function scaledTheta(sc, from, n) {
+  const th = new Float64Array(n);
+  if (sc.kind !== 'limbs') { const inv = 1 / sc.p; for (let j = 0; j < n; j++) th[j] = sc.t[from + j] * inv; }
+  else for (let j = 0; j < n; j++) th[j] = sc.top(sc.t, (from + j) * sc.k) / sc.pTop;
+  return th;
+}
+// 1 where S = 0, i.e. μ divides C(n,k).
+function scaledZeros(sc, from, total) {
+  const z = new Uint8Array(total), zero = scaledTarget(sc, 0n);
+  for (let i = from; i < total; i++) z[i] = scaledEq(sc, i, zero) ? 1 : 0;
+  return z;
+}
+
+// ---- residue coloring that is continuous in μ ----
+// Level for the residue x = S/Q of μ = P/Q: 0 = zero, 1 = exactly 1 (white, spectral only),
+// 2..255 = palette position. At whole μ = m this is the familiar mapping: spectral spreads
+// 2..m−1 red→violet, other palettes spread 0..m−1.
+function residueLevel(r, P, Q, spectral) {
+  if (r === 0) return 0;
+  const x = r / Q, mu = P / Q;
+  let t;
+  if (spectral) { if (r === Q) return 1; t = (x - 2) / Math.max(1, mu - 3); }
+  else t = x / (mu - 1);
+  return 2 + Math.round(253 * (t < 0 ? 0 : t > 1 ? 1 : t));
+}
+// Levels for the window cells [from, total) of a scaled triangle, plus their phases.
+function residueLevels(sc, from, total, mu, spectral) {
+  const idx = new Uint8Array(total), n = total - from, theta = scaledTheta(sc, from, n);
+  const one = scaledTarget(sc, sc.Q), zero = scaledTarget(sc, 0n);
+  const m = mu, dS = Math.max(1, m - 3), dO = m - 1;
+  if (sc.kind !== 'limbs') {
+    const q = sc.q, t = sc.t;
+    if (sc.p <= Math.min(P_TABLE_CAP, n)) { // few residues: tabulate
+      const lv = new Uint8Array(sc.p);
+      for (let r = 0; r < sc.p; r++) lv[r] = residueLevel(r, sc.p, q, spectral);
+      for (let i = from; i < total; i++) idx[i] = lv[t[i]];
+    } else for (let i = from; i < total; i++) idx[i] = residueLevel(t[i], sc.p, q, spectral);
+    return { idx, theta };
+  }
+  for (let j = 0; j < n; j++) {
+    const i = from + j;
+    if (scaledEq(sc, i, zero)) continue;
+    if (spectral && scaledEq(sc, i, one)) { idx[i] = 1; continue; }
+    const x = theta[j] * m, t = spectral ? (x - 2) / dS : x / dO;
+    idx[i] = 2 + Math.round(253 * (t < 0 ? 0 : t > 1 ? 1 : t));
+  }
+  return { idx, theta };
+}
+
+// ---- lens fields ----
+// ν_p(j) for j = 0..N (ν_p(0) left at 0; it is never read).
+function valuations(N, p) {
+  const v = new Uint8Array(N + 1);
+  for (let q = p; q <= N; q *= p) for (let j = q; j <= N; j += q) v[j]++;
+  return v;
+}
+// ν_p(C(n,k)) along each row from C(n,k) = C(n,k−1)·(n−k+1)/k:
+//   ν(C(n,k)) = ν(C(n,k−1)) + ν(n−k+1) − ν(k)   — one table lookup per cell.
+function kummerField(N, p) {
+  const nu = valuations(N, p), out = new Uint8Array(N * (N + 1) / 2);
+  for (let r = 1; r < N; r++) {
+    const row = r * (r + 1) / 2;
+    for (let c = 1, e = 0; c <= r; c++) { e += nu[r - c + 1] - nu[c]; out[row + c] = e; }
+  }
+  return out;
+}
+
+// Bit f set where p_f^a_f divides C(n,k), i.e. ν_{p_f}(C(n,k)) ≥ a_f (up to 16 layers).
+function crtField(N, factors) {
+  const out = new Uint16Array(N * (N + 1) / 2);
+  factors.forEach(([p, a], f) => {
+    const nu = valuations(N, p), bit = 1 << f;
+    for (let r = 1; r < N; r++) {
+      const row = r * (r + 1) / 2;
+      for (let c = 1, e = 0; c <= r; c++) { e += nu[r - c + 1] - nu[c]; if (e >= a) out[row + c] |= bit; }
+    }
+  });
+  return out;
+}
+
+// 1-based base-p digit of the first carry adding k and n−k (0 = none). Once either addend
+// runs out of digits no carry can start, so the loop stops there.
+function firstCarry(n, k, p) {
+  let a = k, b = n - k;
+  for (let pos = 1; a > 0 && b > 0; pos++) {
+    const da = a % p, db = b % p;
+    if (da + db >= p) return pos;
+    a = (a - da) / p; b = (b - db) / p;
+  }
+  return 0;
+}
+function carryField(N, p) {
+  const out = new Uint8Array(N * (N + 1) / 2);
+  for (let r = 0; r < N; r++) {
+    const row = r * (r + 1) / 2;
+    if (p === 2) { // first carry = lowest bit set in both k and n−k
+      for (let c = 0; c <= r; c++) { const x = c & (r - c); out[row + c] = x ? 32 - Math.clz32(x & -x) : 0; }
+    } else {
+      for (let c = 0; c <= r; c++) out[row + c] = firstCarry(r, c, p);
+    }
+  }
+  return out;
+}
+
+// Lucas: C(n,k) ≡ ∏ C(n_i, k_i) (mod p). One factor: C(n_L, k_L) mod p.
+function lucasField(N, p, L) {
+  const T = tablesFor(p), pl = p ** L;
+  const out = p <= 65536 ? new Uint16Array(N * (N + 1) / 2) : new Uint32Array(N * (N + 1) / 2);
+  for (let r = 0; r < N; r++) {
+    const row = r * (r + 1) / 2, nd = Math.floor(r / pl) % p;
+    for (let c = 0; c <= r; c++) out[row + c] = binomModP(nd, Math.floor(c / pl) % p, T, p);
+  }
+  return out;
+}
+
+// Discrete log of (v mod p) to the primitive root, quantized onto 1..255; 0 = p divides.
+function phaseField(tri, p) {
+  const out = new Uint8Array(tri.length);
+  if (p === 2) { for (let i = 0; i < tri.length; i++) out[i] = tri[i] & 1; return out; }
+  const { ind } = tablesFor(p), s = 255 / (p - 1);
+  for (let i = 0; i < tri.length; i++) { const v = tri[i] % p; out[i] = v === 0 ? 0 : 1 + Math.floor(ind[v] * s); }
+  return out;
+}
+
+// p-adic digit j of C(n,k): floor(C / p^j) mod p, read from C mod p^(j+1).
+function digitField(tri, p, J) {
+  const pj = p ** J, out = p <= 65536 ? new Uint16Array(tri.length) : new Uint32Array(tri.length);
+  for (let i = 0; i < tri.length; i++) out[i] = Math.floor(tri[i] / pj) % p;
+  return out;
+}
+
+// ---- Grassmannian lens: the Gaussian binomial [n k]_q on the unit circle ----
+// [n k]_q counts k-dimensional subspaces of F_q^n (points of the Grassmannian Gr(k,n)) and is a
+// polynomial of degree dim Gr(k,n) = k(n−k) with [n k]_1 = C(n,k). On the unit circle,
+// q = e^{2πis}, s = 1/μ:
+//     [n k]_q = q^{k(n−k)/2} · R,   R = ∏_{i=1..k} sin(πs(n−k+i)) / sin(πs·i)   (real)
+// so each cell turns at a rate set by its Grassmannian's dimension, and R carries the rest.
+// R is built along each row in log form, R(n,k) = R(n,k−1)·sin(πs(n−k+1))/sin(πs·k), with exact
+// zeros of the sine counted separately: at μ = P/Q, q is a primitive P-th root of unity and
+// sin(πs·j) vanishes exactly when P | j; the limit of a matched pair is the ratio of the j's.
+// A net surplus of numerator zeros is a true zero — the q-Lucas zeros, k mod P > n mod P.
+const QLUT = (() => { const t = new Uint32Array(64 * 64); for (let h = 0; h < 64; h++) for (let b = 0; b < 64; b++) t[h * 64 + b] = pack(...hslRGB(h / 64 * 360, 0.85, 0.6 * b / 63)); return t; })();
+// show: 'full' = phase + magnitude; 'norot' = without the q^{k(n−k)/2} turn (sign + magnitude);
+// 'fringe' = only that turn, as interference fringes ½(1 + cos 2π·k(n−k)/2μ) — a zone plate whose
+// rings are the level curves of dim Gr(k,n), aliased against the cell lattice into moiré.
+function qField(N, r0, P, Q, show = 'full') {
+  const spin = show !== 'norot';
+  const total = N * (N + 1) / 2, base0 = r0 * (r0 + 1) / 2, n = total - base0;
+  const F = new Float64Array(N + 1), Sg = new Float64Array(N + 1), Z = new Int32Array(N + 1);
+  const twoP = 2n * P, Pd = Number(P);
+  for (let j = 1; j <= N; j++) {
+    const jq = (BigInt(j) * Q) % twoP;     // s·j = jq/P (mod 2), exact
+    const a = (2n * jq + P) / twoP;         // nearest integer to s·j
+    const rem = jq - a * P, odd = (a & 1n) === 1n;
+    if (rem === 0n) { Z[j] = 1; F[j] = Math.log(j); Sg[j] = odd ? -1 : 1; }
+    else { const sv = Math.sin(Math.PI * (Number(rem) / Pd)); F[j] = Math.log(Math.abs(sv)); Sg[j] = (sv < 0) !== odd ? -1 : 1; }
+  }
+  const s = Number(Q) / Pd;
+  const col = new Uint32Array(total), height = new Float32Array(total), theta = new Float64Array(n), lnAbs = new Float64Array(n);
+  const mag = new Float64Array(n); // ln(1 + |R|)
+  let top = 0;
+  for (let r = r0, j = 0; r < N; r++) {
+    let lr = 0, sg = 1, z = 0;
+    for (let c = 0; c <= r; c++, j++) {
+      if (c > 0) { lr += F[r - c + 1] - F[c]; sg *= Sg[r - c + 1] * Sg[c]; z += Z[r - c + 1] - Z[c]; }
+      if (z > 0) { lnAbs[j] = -Infinity; theta[j] = NaN; continue; }
+      lnAbs[j] = lr;
+      const m = mag[j] = lr > 30 ? lr : Math.log1p(Math.exp(lr));
+      if (m > top) top = m;
+      let ph = (sg < 0 ? 0.5 : 0) + (spin ? c * (r - c) * s * 0.5 : 0);
+      theta[j] = ph - Math.floor(ph);
+    }
+  }
+  if (show === 'fringe') {
+    const idx = new Uint8Array(total), ph = new Float64Array(n);
+    for (let r = r0, j = 0; r < N; r++) {
+      const row = r * (r + 1) / 2;
+      for (let c = 0; c <= r; c++, j++) {
+        let f = c * (r - c) * s * 0.5;
+        f -= Math.floor(f);
+        ph[j] = f;
+        idx[row + c] = lnAbs[j] === -Infinity ? 0 : Math.round(127.5 * (1 + Math.cos(2 * Math.PI * f)));
+      }
+    }
+    return { idx, theta: ph, lnAbs, space: 'ramp' };
+  }
+  // brightness = log-magnitude against the frame's largest, so structure reads at every μ
+  const inv = top > 0 ? 1 / top : 0;
+  for (let r = r0, j = 0; r < N; r++) {
+    const row = r * (r + 1) / 2;
+    for (let c = 0; c <= r; c++, j++) {
+      if (lnAbs[j] === -Infinity) { col[row + c] = VOID; continue; }
+      const b = Math.pow(mag[j] * inv, 0.6);
+      height[row + c] = b;
+      col[row + c] = QLUT[((theta[j] * 64) | 0) * 64 + ((b * 63.999) | 0)];
+    }
+  }
+  return { col, height, theta, lnAbs, space: 'rgb' };
+}
+
+// ---- quantum walk: Pascal's rule with waves instead of probabilities ----
+// The classical rule splits probability between (n+1,k+1) and (n+1,k): a random walk, whose
+// spread is diffusion and whose counts are C(n,k). Here each cell holds a two-component
+// amplitude — arrived stepping right (u) or left (d). A coin [[cos θ, sin θ], [sin θ, −cos θ]]
+// mixes them, then u moves to (n+1,k+1) and d to (n+1,k). The walk is unitary (each row's
+// probabilities |u|²+|d|² sum to 1), so instead of diffusing it interferes: two bright fronts
+// travel at ±cos θ with ripples between them. Start: (1, i)/√2, the symmetric state.
+// show: 'energy' = amplitude (per row) through the palette; 'phase' = hue phase, brightness amplitude.
+function walkField(N, r0, theta, show = 'energy') {
+  const total = N * (N + 1) / 2, base0 = r0 * (r0 + 1) / 2, n = total - base0;
+  const cs = Math.cos(theta), sn = Math.sin(theta);
+  let ar = new Float64Array(N), ai = new Float64Array(N), br = new Float64Array(N), bi = new Float64Array(N); // row r: u = a, d = b
+  let nr = new Float64Array(N), ni = new Float64Array(N), mr = new Float64Array(N), mi = new Float64Array(N);
+  ar[0] = Math.SQRT1_2; bi[0] = Math.SQRT1_2;
+  const energy = show !== 'phase';
+  const col = energy ? null : new Uint32Array(total), idx = energy ? new Uint8Array(total) : null;
+  const height = new Float32Array(total), ph = new Float64Array(n), prob = new Float64Array(n);
+  const p = new Float64Array(N), hue = new Float64Array(N);
+  for (let r = 0, j = 0; r < N; r++) {
+    if (r >= r0) {
+      let mx = 0;
+      for (let c = 0; c <= r; c++) {
+        p[c] = ar[c] * ar[c] + ai[c] * ai[c] + br[c] * br[c] + bi[c] * bi[c];
+        if (p[c] > mx) mx = p[c];
+        const h = Math.atan2(ai[c] + bi[c], ar[c] + br[c]) / (2 * Math.PI);
+        hue[c] = h < 0 ? h + 1 : h;
+      }
+      const row = r * (r + 1) / 2, inv = mx > 0 ? 1 / mx : 0;
+      for (let c = 0; c <= r; c++, j++) {
+        const b = Math.sqrt(p[c] * inv);
+        prob[j] = p[c]; ph[j] = hue[c]; height[row + c] = b;
+        if (energy) idx[row + c] = Math.round(255 * b);
+        else col[row + c] = QLUT[((hue[c] * 64) | 0) * 64 + ((b * 63.999) | 0)];
+      }
+    }
+    if (r + 1 >= N) break;
+    for (let c = 0; c <= r + 1; c++) { // coin at the parents, then shift
+      let ur = 0, ui = 0, dr = 0, di = 0;
+      if (c > 0) { ur = cs * ar[c - 1] + sn * br[c - 1]; ui = cs * ai[c - 1] + sn * bi[c - 1]; }
+      if (c <= r) { dr = sn * ar[c] - cs * br[c]; di = sn * ai[c] - cs * bi[c]; }
+      nr[c] = ur; ni[c] = ui; mr[c] = dr; mi[c] = di;
+    }
+    [ar, nr] = [nr, ar]; [ai, ni] = [ni, ai]; [br, mr] = [mr, br]; [bi, mi] = [mi, bi];
+  }
+  return energy ? { idx, height, theta: ph, prob, space: 'ramp' } : { col, height, theta: ph, prob, space: 'rgb' };
+}
+
+// ---- carries in a real base ----
+// Adding k and n−k in base b carries into digit j exactly when ⌊n/bʲ⌋ − ⌊k/bʲ⌋ − ⌊(n−k)/bʲ⌋ = 1.
+// That expression makes sense for any real b > 1, so the carry count does too. At a prime b it
+// is Kummer's ν_b(C(n,k)); at any whole b it counts carries in that base; between, every scale
+// b, b², b³… moves at its own rate.
+function baseCarryField(N, mu) {
+  const out = new Uint8Array(N * (N + 1) / 2), fl = [];
+  for (let d = mu; d <= N - 1 + 1e-9 && fl.length < 64; d *= mu) {
+    const f = new Int32Array(N);
+    for (let x = 0; x < N; x++) f[x] = Math.floor(x / d + 1e-9);
+    fl.push(f);
+  }
+  for (const f of fl) for (let r = 2; r < N; r++) {
+    const row = r * (r + 1) / 2, fr = f[r];
+    for (let c = 1; c < r; c++) { const e = fr - f[c] - f[r - c]; if (e > 0) out[row + c] += e; }
+  }
+  return { raw: out, scales: fl.length };
+}
+
+// ---- stripes: Pascal's rule doubling runs of similar residues ----
+// Two neighbours with nearly the same phase t (= C/μ mod 1) put t + t = 2t in the cell below
+// them, so a run of L similar cells seeds a downward triangle about L rows tall whose rows step
+// through the doubling map t → 2t (mod 1): a run near 1/3 alternates 1/3, 2/3, 1/3 … (two
+// shades), near 1/7 it cycles three. A cell is striped when it sits in a horizontal run of at
+// least minRun cells whose neighbour-to-neighbour phase steps are all below tol (turns).
+// theta: window phases (rows r0..N−1, NaN = no signal). depth = rows of stripe stacked above.
+const phaseClose = (a, b, tol) => { let d = a - b; if (d < 0) d = -d; if (d > 0.5) d = 1 - d; return d < tol; };
+function stripeField(theta, N, r0, tol, minRun) {
+  const n = theta.length, left = new Uint16Array(n), run = new Uint16Array(n), depth = new Uint16Array(n), flag = new Uint8Array(n);
+  for (let r = r0, j = 0; r < N; r++) for (let c = 0; c <= r; c++, j++) left[j] = c > 0 && phaseClose(theta[j - 1], theta[j], tol) ? left[j - 1] + 1 : 1;
+  for (let r = N - 1, j = n - 1; r >= r0; r--) {
+    let right = 1;
+    for (let c = r; c >= 0; c--, j--) {
+      if (c < r) right = phaseClose(theta[j], theta[j + 1], tol) ? right + 1 : 1;
+      run[j] = left[j] + right - 1;
+      flag[j] = run[j] >= minRun ? 1 : 0;
+    }
+  }
+  for (let r = r0, j = 0; r < N; r++) for (let c = 0; c <= r; c++, j++) {
+    if (!flag[j]) continue;
+    const pl = r > r0 && c > 0 ? j - r - 1 : -1, pr = r > r0 && c < r ? j - r : -1;
+    depth[j] = 1 + (pl >= 0 && pr >= 0 && flag[pl] && flag[pr] ? Math.min(depth[pl], depth[pr]) : 0);
+  }
+  return { flag, run, depth };
+}
+// Connected stripe patches (joined along rows and to the parents above), with centroid in
+// screen units (x = k − n/2 cell widths, y = n·√3/2), size, rows spanned and mean phase.
+function stripePatches(flag, theta, N, r0, minCells) {
+  const n = flag.length, up = new Int32Array(n).fill(-1);
+  const find = (a) => { while (up[a] !== a) { up[a] = up[up[a]]; a = up[a]; } return a; };
+  const join = (a, b) => { a = find(a); b = find(b); if (a !== b) up[a] = b; };
+  for (let r = r0, j = 0; r < N; r++) for (let c = 0; c <= r; c++, j++) {
+    if (!flag[j]) continue;
+    up[j] = j;
+    if (c > 0 && flag[j - 1]) join(j, j - 1);
+    if (r > r0 && c > 0 && flag[j - r - 1]) join(j, j - r - 1);
+    if (r > r0 && c < r && flag[j - r]) join(j, j - r);
+  }
+  const acc = new Map();
+  for (let r = r0, j = 0; r < N; r++) for (let c = 0; c <= r; c++, j++) {
+    if (!flag[j]) continue;
+    const root = find(j);
+    let s = acc.get(root);
+    if (!s) acc.set(root, s = { cells: 0, x: 0, y: 0, cs: 0, sn: 0, top: r, bottom: r });
+    s.cells++; s.x += c - r / 2; s.y += r * 0.8660254;
+    s.cs += Math.cos(2 * Math.PI * theta[j]); s.sn += Math.sin(2 * Math.PI * theta[j]);
+    if (r > s.bottom) s.bottom = r;
+  }
+  const out = [];
+  for (const s of acc.values()) {
+    if (s.cells < minCells) continue;
+    const ph = Math.atan2(s.sn, s.cs) / (2 * Math.PI);
+    out.push({ x: s.x / s.cells, y: s.y / s.cells, cells: s.cells, rows: s.bottom - s.top + 1, phase: ph < 0 ? ph + 1 : ph });
+  }
+  return out;
+}
+// For each patch in `from`, the nearest patch in `to` within radius R (spatial hash).
+function matchPatches(from, to, R) {
+  const grid = new Map(), key = (gx, gy) => gx * 100003 + gy;
+  to.forEach((p, i) => { const k = key(Math.floor(p.x / R), Math.floor(p.y / R)); (grid.get(k) || grid.set(k, []).get(k)).push(i); });
+  const out = [];
+  from.forEach((p, a) => {
+    const gx = Math.floor(p.x / R), gy = Math.floor(p.y / R);
+    let best = -1, bd = R * R;
+    for (let dx = -1; dx <= 1; dx++) for (let dy = -1; dy <= 1; dy++) for (const b of grid.get(key(gx + dx, gy + dy)) || []) {
+      const ex = to[b].x - p.x, ey = to[b].y - p.y, d = ex * ex + ey * ey;
+      if (d < bd) { bd = d; best = b; }
+    }
+    if (best >= 0) out.push({ a, b: best, dx: to[best].x - p.x, dy: to[best].y - p.y });
+  });
+  return out;
+}
+// Drift between consecutive frames, free of the pull toward denser regions that nearest-
+// neighbour matching has on its own: real motion v shows up as +v matching forward and −v
+// matching backward, while the density pull has the same sign both ways, so v = (fwd − bwd)/2.
+// Returns sums so several frame pairs can be pooled.
+function driftSums(prev, cur, R) {
+  const f = matchPatches(prev, cur, R), b = matchPatches(cur, prev, R), s = { nf: f.length, nb: b.length, fx: 0, fy: 0, fxx: 0, fyy: 0, bx: 0, by: 0, bxx: 0, byy: 0 };
+  for (const m of f) { s.fx += m.dx; s.fy += m.dy; s.fxx += m.dx * m.dx; s.fyy += m.dy * m.dy; }
+  for (const m of b) { s.bx += m.dx; s.by += m.dy; s.bxx += m.dx * m.dx; s.byy += m.dy * m.dy; }
+  return s;
+}
+// Pooled drift: velocity (cells per frame, screen axes), its standard error and z = |v|/SE.
+function driftFrom(list) {
+  const t = { nf: 0, nb: 0, fx: 0, fy: 0, fxx: 0, fyy: 0, bx: 0, by: 0, bxx: 0, byy: 0 };
+  for (const s of list) for (const k in t) t[k] += s[k];
+  if (t.nf < 3 || t.nb < 3) return null;
+  const mf = [t.fx / t.nf, t.fy / t.nf], mb = [t.bx / t.nb, t.by / t.nb];
+  const vf = [t.fxx / t.nf - mf[0] ** 2, t.fyy / t.nf - mf[1] ** 2], vb = [t.bxx / t.nb - mb[0] ** 2, t.byy / t.nb - mb[1] ** 2];
+  const vx = (mf[0] - mb[0]) / 2, vy = (mf[1] - mb[1]) / 2;
+  const se = Math.sqrt((vf[0] + vf[1]) / t.nf + (vb[0] + vb[1]) / t.nb) / 2 || 1e-9;
+  return { vx, vy, speed: Math.hypot(vx, vy), se, z: Math.hypot(vx, vy) / se, pairs: t.nf + t.nb };
+}
+
+// Census: per cell, how many distinct visited moduli divided C(n,k). Keyed to the row count.
+const newCensus = () => ({ N: 0, sum: null, count: 0, seen: new Set() });
+function censusField(cs, zeros, N, key) {
+  if (cs.N !== N) Object.assign(cs, newCensus(), { N, sum: new Uint32Array(zeros.length) });
+  if (!cs.seen.has(key)) {
+    cs.seen.add(key); cs.count++;
+    for (let i = 0; i < zeros.length; i++) cs.sum[i] += zeros[i];
+  }
+  return levels(cs.sum, cs.count);
+}
+
+// Scale an integer field onto 0..255 levels for a ramp palette.
+function levels(raw, max) {
+  if (max === undefined) { max = 0; for (let i = 0; i < raw.length; i++) if (raw[i] > max) max = raw[i]; }
+  const idx = new Uint8Array(raw.length);
+  if (max > 0) { const s = 255 / max; for (let i = 0; i < raw.length; i++) idx[i] = Math.round(raw[i] * s); }
+  return { idx, raw, max };
+}
+const unavailable = (total, why) => ({ idx: new Uint8Array(total), space: 'ramp', unavailable: why });
+const needP = (c, cap) => !c.p ? `μ’s numerator has no prime factor below ${c.fac.limit.toLocaleString()} to look at.`
+  : cap && c.p > cap ? `p = ${c.p} is too large for this lens (limit ${cap.toLocaleString()}).` : '';
+
+// space: which color table the lens indexes — 'res' residue levels (0 void, 1 white, 2..255
+// palette), 'p' residues mod p, 'ramp' 0..255 through the palette, 'cyclic' 0 void + hue wheel,
+// 'rgb' colors computed by the lens itself.
+const LENSES = [
+  { id: 'residue', name: 'Residue  C(n,k) mod μ', space: 'res', scaled: true,
+    note: 'The sieve itself. Dark cells are the zeros, where μ divides C(n,k). In the spectral palette 1 is white and the rest run red to violet.',
+    compute: (c) => residueLevels(c.scaled(), c.base0, c.total, c.mu.value, c.spectral),
+    describe: (o, i, c) => residueExact(c.scaled(), i, c.mu) },
+  { id: 'stripes', name: 'Stripes (doubling runs)', space: 'rgb', scaled: true, param: 'stripes',
+    note: 'Highlights runs of near-identical colors and the short stacks they make. Pascal’s rule adds the two cells above, so two neighbours with nearly the same phase t put 2t below them: a run of similar cells seeds a small downward triangle whose rows step through doubling, t → 2t → 4t. A run near ⅓ of the color cycle alternates ⅓, ⅔, ⅓ — two shades swapping row by row (blue/green in spectral); near ⅐ it cycles three. Each row doubles the small color differences too, so most stripes end within 1–3 rows. Everything else is dimmed. Hover a stripe for its doubling chain; trails follow stripe patches from frame to frame.',
+    compute: (c) => stripeLens(c),
+    describe: (o, i, c) => {
+      const j = i - c.base0, sf = o.sf, t = o.phase[j];
+      const chain = [t, 2 * t, 4 * t, 8 * t].map((v) => (v - Math.floor(v)).toFixed(3)).join(' → ');
+      return sf.flag[j] ? `run of ${sf.run[j]} similar cells, ${sf.depth[j]} row${sf.depth[j] > 1 ? 's' : ''} stacked; phase doubles downward: ${chain}`
+        : `not striped (run of ${sf.run[j]})`;
+    } },
+  { id: 'qbinom', name: 'Grassmannian  [n k]_q, q = e^{2πi/μ}', space: 'rgb', param: 'qshow',
+    note: 'The Gaussian binomial [n k]_q: the number of k-dimensional subspaces of an n-dimensional space over F_q, i.e. the point count of the Grassmannian Gr(k,n). C(n,k) is its value at q = 1. Here q walks the unit circle, q = e^{2πi/μ}, so it changes continuously as μ moves — no static. Hue = phase (each cell turns at a rate set by dim Gr(k,n) = k(n−k)); brightness = log of the magnitude |[n k]_q|, against the largest in view (hover for the exact value next to C(n,k)). At μ = P/Q, q is a primitive P-th root of unity and the zeros are exactly where k mod P > n mod P (q-Lucas). Fringes shows only the turn, as a zone plate: rings along k(n−k) = const that flow as μ moves.',
+    compute: (c) => qField(c.N, c.r0, c.mu.P, c.mu.Q, c.qshow),
+    describe: (o, i, c, n, k) => {
+      const j = i - c.base0, lr = o.lnAbs[j], lnC = LNF[n] - LNF[k] - LNF[n - k];
+      if (lr === -Infinity) return `0 — Φ${sub(c.mu.P)}(q) divides [n k]_q (k mod ${c.mu.P} > n mod ${c.mu.P})`;
+      return `|[n k]_q| ≈ ${expStr(lr)} of C(n,k) ≈ ${expStr(lnC)}, phase ${o.theta[j].toFixed(4)} turn, dim Gr = ${k * (n - k)}`;
+    } },
+  { id: 'qwalk', name: 'Quantum walk (Pascal’s rule as waves)', space: 'rgb', param: 'wshow',
+    note: 'Pascal’s rule with wave amplitudes instead of probabilities. The ordinary triangle is a random walk — probability splits left and right and diffuses. Here amplitude splits through a coin of angle θ = π/μ and interferes: two bright fronts run outward at ±cos θ, rippling fringes fill the cone between them, and nothing outside it. Every row still carries total probability 1. μ = 2 pins the walker to the middle, μ = 4 is the classic Hadamard walk, larger μ opens the cone toward the edges. Energy shows the amplitude (per row) through the palette; Phase colors it by the wave’s phase. Sweep μ with decimals to watch the cone breathe.',
+    compute: (c) => walkField(c.N, c.r0, Math.PI / c.mu.value, c.wshow),
+    describe: (o, i, c) => {
+      const j = i - c.base0;
+      return `probability ${o.prob[j].toExponential(3)}, phase ${o.theta[j].toFixed(4)} turn (θ = ${(180 / c.mu.value).toFixed(3)}°, fronts at ±${Math.cos(Math.PI / c.mu.value).toFixed(3)})`;
+    } },
+  { id: 'basecarry', name: 'Carries in base μ (any real μ)', space: 'ramp',
+    note: 'How many carries happen adding k and n−k written in base μ: Σⱼ ⌊n/μʲ⌋ − ⌊k/μʲ⌋ − ⌊(n−k)/μʲ⌋. At a prime μ this is exactly Kummer’s depth ν_p; at any whole μ it counts carries in that base; between whole numbers the base is real and every scale μ, μ², μ³… grows at its own rate, so nested triangles zoom outward together. Relief view turns it into flowing terraces.',
+    compute: (c) => { const { raw, scales } = baseCarryField(c.N, c.mu.value); return { ...levels(raw, Math.max(1, scales)), scales }; },
+    describe: (o, i) => `${o.raw[i]} carr${o.raw[i] === 1 ? 'y' : 'ies'} (${o.scales} scales below n)` },
+  { id: 'depth', name: 'Depth νp (Kummer)', space: 'ramp', usesP: true,
+    note: 'The power of p dividing C(n,k). By Kummer’s theorem it is the number of carries when adding k and n−k in base p, so this is how deep each zero goes. Relief view turns it into terraces.',
+    compute: (c) => needP(c) ? unavailable(c.total, needP(c)) : levels(kummerField(c.N, c.p)),
+    describe: (o, i, c) => `ν${sub(c.p)} = ${o.raw[i]}` },
+  { id: 'crt', name: 'Factor layers (CRT)', space: 'ramp',
+    note: 'Which prime-power factors pᵃ of the modulus divide C(n,k). The modulus divides C(n,k) exactly where every layer does. Up to four layers each combination gets its own color; with more, color counts how many divide.',
+    compute: (c) => {
+      const layers = c.fac.factors.filter(([p]) => p < c.N).slice(0, 16);
+      if (!layers.length) return unavailable(c.total, 'No prime factor of the modulus is below the row count, so no layer can divide anything here.');
+      const raw = crtField(c.N, layers);
+      let out;
+      if (layers.length <= 4) out = levels(raw, (1 << layers.length) - 1);
+      else { const pc = new Uint8Array(raw.length); for (let i = 0; i < raw.length; i++) { let x = raw[i], b = 0; while (x) { b += x & 1; x >>= 1; } pc[i] = b; } out = levels(pc, layers.length); out.raw = raw; }
+      return { ...out, layers };
+    },
+    describe: (o, i) => {
+      const d = o.layers.filter((f, b) => (o.raw[i] >> b) & 1).map(([p, a]) => p ** a);
+      return d.length ? 'divisible by ' + d.join(', ') : 'no layer divides';
+    } },
+  { id: 'lucas', name: 'Lucas factor at digit L', space: 'p', usesP: true, param: 'L',
+    note: 'Lucas’s theorem: C(n,k) ≡ ∏ C(nᵢ,kᵢ) mod p over the base-p digits of n and k. This shows the single factor C(n_L, k_L): the mod-p tile magnified p^L times. The product over every L is the residue picture.',
+    compute: (c) => needP(c, P_TABLE_CAP) ? unavailable(c.total, needP(c, P_TABLE_CAP)) : { idx: lucasField(c.N, c.p, c.L) },
+    describe: (o, i, c, n, k) => {
+      const pl = c.p ** c.L;
+      return `C(${Math.floor(n / pl) % c.p}, ${Math.floor(k / pl) % c.p}) ≡ ${o.idx[i]} (mod ${c.p})`;
+    } },
+  { id: 'phase', name: 'Phase (discrete log)', space: 'cyclic', usesP: true,
+    note: 'Discrete log of C(n,k) mod p to a primitive root g, on a hue wheel. Lucas’s products become sums of angles, so each magnified copy of the tile is a hue-rotated copy. Multiples of p have no log and stay dark.',
+    compute: (c) => {
+      if (needP(c, P_TABLE_CAP)) return unavailable(c.total, needP(c, P_TABLE_CAP));
+      const triP = buildTriangle(c.N, c.p);
+      return { idx: phaseField(triP, c.p), triP };
+    },
+    describe: (o, i, c) => {
+      const v = o.triP[i];
+      if (v === 0) return `${c.p} divides: no log`;
+      if (c.p === 2) return 'odd (the group mod 2 is trivial)';
+      const T = tablesFor(c.p);
+      return `log_${T.g}(${v}) = ${T.ind[v]} (mod ${c.p - 1})`;
+    } },
+  { id: 'carry', name: 'First carry digit', space: 'ramp', usesP: true,
+    note: 'Base-p digit where the first carry happens when adding k and n−k: the finest scale at which the cell becomes divisible by p. 0 = no carry, p does not divide.',
+    compute: (c) => needP(c) ? unavailable(c.total, needP(c)) : levels(carryField(c.N, c.p)),
+    describe: (o, i) => o.raw[i] ? `first carry at digit ${o.raw[i]}` : 'no carry' },
+  { id: 'digit', name: 'p-adic digit j of C(n,k)', space: 'p', usesP: true, param: 'J',
+    note: 'Digit j of C(n,k) written in base p. Digit 0 is the mod-p layer Lucas explains; higher digits are what prime-power moduli (9, 25, 27, 49 …) see beyond mod p.',
+    compute: (c) => {
+      const why = needP(c, P_TABLE_CAP) || (c.p ** (c.J + 1) >= 2 ** 31 ? `${c.p}^${c.J + 1} is too large to track.` : '');
+      return why ? unavailable(c.total, why) : { idx: digitField(buildTriangle(c.N, c.p ** (c.J + 1)), c.p, c.J) };
+    },
+    describe: (o, i, c) => `digit ${c.J} = ${o.idx[i]}` },
+  { id: 'census', name: 'Divisor census (sweep)', space: 'ramp', sweep: true, scaled: true,
+    note: 'Fraction of the moduli visited so far that divide C(n,k). Each modulus counts once; the tally restarts when the row count changes. Sweep to fill it in.',
+    compute: (c) => censusField(c.census || newCensus(), scaledZeros(c.scaled(), 0, c.total), c.N, c.mu.key),
+    describe: (o, i) => `${o.raw[i]} of ${o.max} visited moduli divide` },
+];
+const LENS = Object.fromEntries(LENSES.map((l) => [l.id, l]));
+// Stripe lens: residue colors with stripe cells kept bright (or colored by rows stacked) and
+// the rest dimmed; also returns the stripe patches the tracker follows.
+function stripeLens(c) {
+  const sc = c.scaled(), { idx, theta } = residueLevels(sc, c.base0, c.total, c.mu.value, c.spectral);
+  const sf = stripeField(theta, c.N, c.r0, c.stripeTol / 100, c.stripeRun);
+  const lut = resLUT(c.scheme, false), dl = c.stripeColor === 'depth' ? rampLUT(c.scheme) : null;
+  const col = new Uint32Array(c.total), height = new Float32Array(c.total), th = new Float64Array(theta.length);
+  let maxD = 1;
+  for (let j = 0; j < sf.depth.length; j++) if (sf.depth[j] > maxD) maxD = sf.depth[j];
+  for (let j = 0, i = c.base0; i < c.total; i++, j++) {
+    const base = lut[idx[i]];
+    if (sf.flag[j]) {
+      col[i] = dl ? dl[Math.round(255 * (0.25 + 0.75 * (sf.depth[j] - 1) / Math.max(1, maxD - 1)))] : base;
+      height[i] = sf.depth[j] / maxD; th[j] = theta[j];
+    } else {
+      col[i] = pack(((base & 255) * 0.16) | 0, (((base >>> 8) & 255) * 0.16) | 0, (((base >>> 16) & 255) * 0.16) | 0);
+      th[j] = NaN;
+    }
+  }
+  return { col, height, theta: th, phase: theta, idx, sf, space: 'rgb', patches: stripePatches(sf.flag, theta, c.N, c.r0, 3) };
+}
+const expStr = (ln) => { const e = ln / Math.LN10; return e < 4 ? Math.exp(ln).toPrecision(3) : `${(10 ** (e - Math.floor(e))).toFixed(2)}e${Math.floor(e)}`; };
+// C mod μ at one cell as an exact decimal (S/Q; Q divides 10^d so the expansion terminates).
+function residueExact(sc, i, mu) {
+  const S = scaledBig(sc, i);
+  if (mu.d === 0) return S.toString();
+  const N = S * (pow10(mu.d) / mu.Q), ip = N / pow10(mu.d);
+  const fr = (N % pow10(mu.d)).toString().padStart(mu.d, '0').replace(/0+$/, '');
+  return fr ? `${ip}.${fr}` : ip.toString();
+}
+
+// ---- moduli to visit ----
+const SEQUENCES = [
+  { id: 'all', name: 'every m', note: 'Every whole modulus.' },
+  { id: 'prime', name: 'primes', note: 'Prime moduli: Lucas and Kummer describe the whole picture exactly.' },
+  { id: 'composite', name: 'composites', note: 'Composite moduli: several prime structures overlap. Try the Factor layers lens.' },
+  { id: 'step', name: 'every Nth from range start', note: 'From the range start, in steps of N.' },
+  { id: 'pow2', name: '2ᵏ', note: 'Powers of 2: the zero sets nest, since 2ᵃ⁺¹ | C implies 2ᵃ | C. Each frame peels one carry layer.' },
+  { id: 'pow3', name: '3ᵏ', note: 'Powers of 3: nested zero sets, peeled one carry layer per frame.' },
+  { id: '2p', name: '2p', note: '2 × each prime. C mod 2p reduces to C mod 2, so the Sierpinski pattern persists in every frame (exactly, when p is odd).' },
+  { id: '3p', name: '3p', note: '3 × each prime. The mod-3 pattern persists in every frame.' },
+  { id: '6p', name: '6p', note: '6 × each prime. The mod-2 and mod-3 patterns persist together.' },
+  { id: 'pq', name: 'pq (two distinct primes)', note: 'Products of two distinct primes: two independent gaskets interfere.' },
+  { id: 'pqr', name: 'pqr (three distinct primes)', note: 'Products of three distinct primes.' },
+];
+const SEQ_CACHE = new Map();
+function sequenceList(id, anchor = 2, step = 1) {
+  const key = id === 'step' ? `step|${anchor}|${step}` : id;
+  let list = SEQ_CACHE.get(key);
+  if (list) return list;
+  const out = [];
+  const products = (depth) => {
+    const walk = (start, prod, left) => {
+      for (let i = start; i < PRIMES.length; i++) {
+        const v = prod * PRIMES[i];
+        if (v * PRIMES[i] ** (left - 1) > MOD_CAP) break; // remaining factors are larger still
+        if (left === 1) out.push(v); else walk(i + 1, v, left - 1);
+      }
+    };
+    walk(0, 1, depth);
+    out.sort((a, b) => a - b);
+  };
+  switch (id) {
+    case 'prime': out.push(...PRIMES); break;
+    case 'composite': for (let v = 4; v <= MOD_CAP; v++) if (!PRIME_RANK[v]) out.push(v); break;
+    case 'step': for (let v = Math.max(2, anchor); v <= MOD_CAP; v += Math.max(1, step)) out.push(v); break;
+    case 'pow2': for (let v = 2; v <= MOD_CAP; v *= 2) out.push(v); break;
+    case 'pow3': for (let v = 3; v <= MOD_CAP; v *= 3) out.push(v); break;
+    case '2p': case '3p': case '6p': {
+      const a = parseInt(id, 10);
+      for (const p of PRIMES) { if (a * p > MOD_CAP) break; out.push(a * p); }
+      break;
+    }
+    case 'pq': products(2); break;
+    case 'pqr': products(3); break;
+    default: for (let v = 2; v <= MOD_CAP; v++) out.push(v);
+  }
+  list = Int32Array.from(out);
+  if (SEQ_CACHE.size > 32) SEQ_CACHE.clear();
+  SEQ_CACHE.set(key, list);
+  return list;
+}
+const lowerBound = (a, v) => { let lo = 0, hi = a.length; while (lo < hi) { const mid = (lo + hi) >> 1; if (a[mid] < v) lo = mid + 1; else hi = mid; } return lo; };
+function nearestIndex(a, v) {
+  const i = lowerBound(a, v);
+  if (i >= a.length) return a.length - 1;
+  return i > 0 && v - a[i - 1] <= a[i] - v ? i - 1 : i;
+}
+// One step from position {m, sub} (m a member of `list`, μ = m + sub/10^d, sub a BigInt)
+// toward dir. Whole steps (d = 0) jump member to member; finer steps walk the gap in 10^-d
+// increments. Returns null past either end of the list.
+function stepMu(pos, dir, list, d) {
+  const Q = pow10(d), i = nearestIndex(list, pos.m);
+  if (dir > 0) {
+    if (i >= list.length - 1) return null;
+    const gap = BigInt(list[i + 1] - pos.m) * Q;
+    return d > 0 && pos.sub + 1n < gap ? { m: pos.m, sub: pos.sub + 1n } : { m: list[i + 1], sub: 0n };
+  }
+  if (pos.sub > 0n) return { m: pos.m, sub: pos.sub - 1n };
+  if (i <= 0) return null;
+  return d > 0 ? { m: list[i - 1], sub: BigInt(pos.m - list[i - 1]) * Q - 1n } : { m: list[i - 1], sub: 0n };
+}
+
+// Residue filter: integers, n (= m−1), n-k, and fractions a/b of the way from 0 to n.
+function parseIsolation(text, m) {
+  const n = m - 1, vals = [];
+  for (const part of String(text || '').split(',')) {
+    const t = part.trim().toLowerCase();
+    let mt;
+    if (!t) continue;
+    if (t === 'n') vals.push(n);
+    else if ((mt = t.match(/^n\s*-\s*(\d+)$/))) vals.push(n - Number(mt[1]));
+    else if ((mt = t.match(/^(\d+)\s*\/\s*(\d+)$/))) {
+      const b = Number(mt[2]);
+      if (b) { const x = Number(mt[1]) / b * n; vals.push(Math.floor(x), Math.ceil(x)); }
+    } else if (/^\d+$/.test(t)) vals.push(Number(t));
+  }
+  const keep = vals.filter((v) => v >= 0 && v <= n);
+  return keep.length ? new Set(keep) : null;
+}
+// Per-cell mask over [from, total): the residue C mod μ (= S/Q) is one of the listed integers.
+function maskFor(sc, from, total, iso) {
+  const mask = new Uint8Array(total), targets = [...iso].map((v) => scaledTarget(sc, BigInt(v) * sc.Q)).filter((t) => t !== null);
+  for (let i = from; i < total; i++) for (const t of targets) if (scaledEq(sc, i, t)) { mask[i] = 1; break; }
+  return mask;
+}
+
+// ---- color tables: packed RGBA for a little-endian Uint32 view of ImageData ----
+function pack(r, g, b) { return (255 << 24 | b << 16 | g << 8 | r) >>> 0; }
+const unpack = (c) => [c & 255, (c >>> 8) & 255, (c >>> 16) & 255];
+const BG = pack(10, 10, 10), VOID = BG, VOID_ISO = pack(46, 58, 40), LIGHT = pack(236, 236, 226);
+
+const CMAPS = {
+  viridis: [[68,1,84],[72,40,120],[62,74,137],[49,104,142],[38,130,142],[31,158,137],[53,183,121],[110,206,88],[181,222,43],[253,231,37]],
+  magma:   [[0,0,4],[28,16,68],[79,18,123],[129,37,129],[181,54,122],[229,80,100],[251,135,97],[254,194,135],[252,253,191]],
+  inferno: [[0,0,4],[31,12,72],[85,15,109],[136,34,106],[186,54,85],[227,89,51],[249,140,10],[249,201,50],[252,255,164]],
+  turbo:   [[48,18,59],[70,107,227],[40,174,227],[27,229,181],[124,253,90],[201,237,50],[252,184,49],[245,109,29],[191,40,9],[122,4,3]],
+  cividis: [[0,32,76],[0,42,102],[39,63,108],[75,82,107],[110,101,105],[146,120,99],[185,141,85],[223,164,65],[253,190,44],[255,233,69]],
+  coolwarm:[[59,76,192],[98,130,234],[141,176,254],[184,208,249],[221,221,221],[245,196,173],[244,154,123],[222,96,77],[180,4,38]],
+};
+const SCHEMES = [['spectral', 'spectral'], ['viridis', 'viridis'], ['magma', 'magma'], ['inferno', 'inferno'],
+  ['turbo', 'turbo'], ['cividis', 'cividis'], ['coolwarm', 'cool–warm'], ['mono', 'mono']];
+
+function hslRGB(h, s, l) {
+  const c = (1 - Math.abs(2 * l - 1)) * s, hp = (((h % 360) + 360) % 360) / 60, x = c * (1 - Math.abs(hp % 2 - 1));
+  const [r, g, b] = hp < 1 ? [c, x, 0] : hp < 2 ? [x, c, 0] : hp < 3 ? [0, c, x] : hp < 4 ? [0, x, c] : hp < 5 ? [x, 0, c] : [c, 0, x];
+  const m0 = l - c / 2;
+  return [Math.round((r + m0) * 255), Math.round((g + m0) * 255), Math.round((b + m0) * 255)];
+}
+function rampRGB(scheme, t) {
+  t = t < 0 ? 0 : t > 1 ? 1 : t;
+  const stops = CMAPS[scheme];
+  if (stops) {
+    const x = t * (stops.length - 1), i = Math.min(stops.length - 2, Math.floor(x)), f = x - i, a = stops[i], b = stops[i + 1];
+    return [Math.round(a[0] + (b[0] - a[0]) * f), Math.round(a[1] + (b[1] - a[1]) * f), Math.round(a[2] + (b[2] - a[2]) * f)];
+  }
+  if (scheme === 'spectral') return hslRGB(t * 300, 0.95, 0.55);
+  const g = Math.round(t * 255);
+  return [g, g, g];
+}
+// Residues mod `size` (lenses on a prime p): 0 = void; spectral pins 1 to white.
+function residueLUT(size, scheme) {
+  const lut = new Uint32Array(size);
+  lut[0] = VOID;
+  for (let v = 1; v < size; v++) {
+    lut[v] = scheme === 'spectral'
+      ? (v === 1 ? LIGHT : pack(...rampRGB('spectral', (v - 2) / ((size - 3) || 1))))
+      : pack(...rampRGB(scheme, v / (size - 1)));
+  }
+  return lut;
+}
+const resLUT = (scheme, isoZero) => Uint32Array.from({ length: 256 }, (_, i) =>
+  i === 0 ? (isoZero ? VOID_ISO : VOID) : i === 1 ? LIGHT : pack(...rampRGB(scheme, (i - 2) / 253)));
+const rampLUT = (scheme) => Uint32Array.from({ length: 256 }, (_, i) => pack(...rampRGB(scheme, i / 255)));
+const cyclicLUT = () => Uint32Array.from({ length: 256 }, (_, i) => i === 0 ? VOID : pack(...hslRGB(360 * (i - 1) / 255, 0.8, 0.55)));
+const heightLUT = (size) => Float32Array.from({ length: size }, (_, i) => i / ((size - 1) || 1));
+// Per-cell colors over [from, total); 0 marks a filtered-out cell (left undrawn).
+function cellColors(idx, lut, mask, from) {
+  const col = new Uint32Array(idx.length);
+  for (let i = from; i < idx.length; i++) col[i] = mask && !mask[i] ? 0 : lut[idx[i]];
+  return col;
+}
+
+// ---- motion detection: phase flow with temporal evidence ----
+// Every cell carries a phase θ (cycles) of what the lens shows — for the residue, frac(C/μ).
+// If a pattern moves with velocity v, its phase obeys θ_t(x) = θ_{t−1}(x − v), so to first
+// order  ω = −v·∇θ  with ω the per-frame phase change (wrapped to ±½) and ∇θ the spatial
+// phase gradient from the three lattice axes. Each frame contributes the vector −ω∇θ; the
+// detector keeps exponential moving averages of it, of |∇θ|² and of |ω|·|∇θ| (Lucas–Kanade
+// pooling, done over time). Motion that keeps going the same way adds up; static, whose
+// per-frame estimates point anywhere, cancels. Brightness = that consistency, hue = direction,
+// speed = |mean(−ω∇θ)| / mean|∇θ|² cells per frame.
+// The drift accumulator EMA[e^{2πiω}] instead asks only whether each cell's own value turns at
+// a steady rate — the deterministic spin hidden inside apparently random change.
+const TRIG_N = 4096;
+const COS_T = Float32Array.from({ length: TRIG_N }, (_, i) => Math.cos(2 * Math.PI * i / TRIG_N));
+const SIN_T = Float32Array.from({ length: TRIG_N }, (_, i) => Math.sin(2 * Math.PI * i / TRIG_N));
+const HUE_RGB = (() => { const t = new Uint8Array(768); for (let i = 0; i < 256; i++) t.set(hslRGB(360 * i / 256, 1, 0.5), 3 * i); return t; })();
+const newMotion = () => ({ key: '', mu: null, frames: 0, n: 0 });
+function motionAlloc(ms, key, n) {
+  const f = () => new Float32Array(n);
+  Object.assign(ms, { key, mu: null, frames: 0, n, mode: '', prev: null,
+    nx: f(), ny: f(), den: f(), mag: f(), ar: f(), ai: f(), T: f(), H: new Uint8Array(n) });
+}
+// Hexagonal-neighbourhood average over a window of rows r0..N−1 (window-local indices).
+function blurWin(src, N, r0, passes) {
+  let a = src, b = new Float32Array(src.length);
+  for (let p = 0; p < passes; p++) {
+    for (let r = r0, j = 0; r < N; r++) {
+      const up = r > r0, dn = r + 1 < N;
+      for (let c = 0; c <= r; c++, j++) {
+        let s = a[j], k = 1;
+        if (c > 0) { s += a[j - 1]; k++; }
+        if (c < r) { s += a[j + 1]; k++; }
+        if (up && c > 0) { s += a[j - r - 1]; k++; }
+        if (up && c < r) { s += a[j - r]; k++; }
+        if (dn) { s += a[j + r + 1] + a[j + r + 2]; k += 2; }
+        b[j] = s / k;
+      }
+    }
+    if (a === src) { a = b; b = new Float32Array(src.length); } else { const t = a; a = b; b = t; }
+  }
+  return a;
+}
+// Fold one frame into the detector. theta: phase in cycles per window cell (NaN = no signal).
+// o: { mode: 'flow' | 'drift', tau (frames averaged), trail (frames to fade), pool (passes) }.
+function motionStep(ms, theta, N, r0, o) {
+  const n = ms.n, a = 1 / o.tau, b = 1 - a, prev = ms.prev;
+  if (prev) {
+    const { nx, ny, den, mag, ar, ai } = ms;
+    for (let r = r0, j = 0; r < N; r++) {
+      const up = r > r0, dn = r + 1 < N;
+      for (let c = 0; c <= r; c++, j++) {
+        const t = theta[j], t0 = prev[j];
+        if (!(t === t && t0 === t0)) { nx[j] *= b; ny[j] *= b; den[j] *= b; mag[j] *= b; ar[j] *= b; ai[j] *= b; continue; }
+        // phases lie in [0,1), so every difference is in (−1,1) and wraps to ±½ with two compares
+        let w = t - t0; w -= (w > 0.5) - (w < -0.5);
+        // directional derivatives on the axes → (r,c±1), ↘ (r±1,c±1), ↙ (r±1,c): central where
+        // both neighbours carry signal (each half wrapped), one-sided at edges. Least squares for
+        // three unit vectors 60° apart: ∇θ = (2/3)·Σ g_a·u_a (screen axes, y down, cell = 1).
+        let gR = 0, gDR = 0, gDL = 0, d, hb, x;
+        if ((hb = c > 0 && (x = theta[j - 1]) === x)) { d = t - x; gR = d - ((d > 0.5) - (d < -0.5)); }
+        if (c < r && (x = theta[j + 1]) === x) { d = x - t; d -= (d > 0.5) - (d < -0.5); gR = hb ? (gR + d) / 2 : d; }
+        if ((hb = up && c > 0 && (x = theta[j - r - 1]) === x)) { d = t - x; gDR = d - ((d > 0.5) - (d < -0.5)); }
+        if (dn && (x = theta[j + r + 2]) === x) { d = x - t; d -= (d > 0.5) - (d < -0.5); gDR = hb ? (gDR + d) / 2 : d; }
+        if ((hb = up && c < r && (x = theta[j - r]) === x)) { d = t - x; gDL = d - ((d > 0.5) - (d < -0.5)); }
+        if (dn && (x = theta[j + r + 1]) === x) { d = x - t; d -= (d > 0.5) - (d < -0.5); gDL = hb ? (gDL + d) / 2 : d; }
+        const gx = (2 / 3) * (gR + 0.5 * (gDR - gDL)), gy = (2 / 3) * 0.8660254 * (gDR + gDL);
+        const g2 = gx * gx + gy * gy;
+        nx[j] = b * nx[j] - a * w * gx;
+        ny[j] = b * ny[j] - a * w * gy;
+        den[j] = b * den[j] + a * g2;
+        mag[j] = b * mag[j] + a * (w < 0 ? -w : w) * Math.sqrt(g2);
+        const k = Math.floor(w * TRIG_N) & (TRIG_N - 1);
+        ar[j] = b * ar[j] + a * COS_T[k];
+        ai[j] = b * ai[j] + a * SIN_T[k];
+      }
+    }
+  }
+  ms.prev = theta; ms.frames++;
+  if (ms.mode !== o.mode) { ms.T.fill(0); ms.mode = o.mode; }
+  if (ms.frames < 2) return;
+
+  // Evidence → strength E in 0..1 and a hue index H; random evidence is cut at twice the
+  // consistency it shows by chance over the averaging window.
+  const T = ms.T, H = ms.H, fade = o.trail > 0 ? 1 / o.trail : 1;
+  const thr = 2 * Math.sqrt(a / (2 - a)) / Math.sqrt(1 + 2 * o.pool);
+  const drift = o.mode === 'drift', HUE_PER_RAD = 256 / (2 * Math.PI);
+  const X = blurWin(drift ? ms.ar : ms.nx, N, r0, o.pool), Y = blurWin(drift ? ms.ai : ms.ny, N, r0, o.pool);
+  const M = drift ? null : blurWin(ms.mag, N, r0, o.pool);
+  for (let j = 0; j < n; j++) {
+    const x = X[j], y = Y[j], s = Math.sqrt(x * x + y * y);
+    const k = drift ? s : (M[j] > 1e-9 ? s / M[j] : 0);         // steadiness, or consistency of direction
+    const E = k > thr ? (k - thr) / (1 - thr) : 0, old = T[j] - fade;
+    if (E > 0 && E >= old) { T[j] = E; H[j] = (Math.floor(Math.atan2(y, x) * HUE_PER_RAD) + 256) & 255; }
+    else T[j] = old > 0 ? old : 0;
+  }
+}
+// Mean velocity (cells per frame) at a window cell, from the pooled flow evidence.
+const motionVelocity = (ms, j) => ms.den[j] > 1e-12 ? [ms.nx[j] / ms.den[j], ms.ny[j] / ms.den[j]] : [0, 0];
+// Mix the trails into per-cell colors: picture dimmed to `img`, plus hue H at brightness gain·T.
+function compositeMotion(col, base0, ms, gain, img) {
+  const { T, H, n } = ms;
+  for (let j = 0; j < n; j++) {
+    const i = base0 + j, c = col[i];
+    let s = gain * T[j];
+    if (s > 1) s = 1;
+    if (!c && s < 0.004) continue;
+    const h = 3 * H[j];
+    let r = HUE_RGB[h] * s, g = HUE_RGB[h + 1] * s, bl = HUE_RGB[h + 2] * s;
+    if (c) { r += (c & 255) * img; g += ((c >>> 8) & 255) * img; bl += ((c >>> 16) & 255) * img; }
+    col[i] = pack(r > 255 ? 255 : r | 0, g > 255 ? 255 : g | 0, bl > 255 ? 255 : bl | 0);
+  }
+}
+
+// ---- painters: one pixel buffer per frame, shared by the live view and every export ----
+// Flat: each cell is 2 half-units wide and 1 row tall; row r starts at x = N−1−r, so the
+// brick offset between rows is exact. Buffer: (2N) × (rows drawn). col: per-cell colors.
+function paintFlat(pix, N, r0, col) {
+  const W = 2 * N;
+  pix.fill(BG);
+  for (let r = r0; r < N; r++) {
+    const row = r * (r + 1) / 2;
+    let o = (r - r0) * W + (N - 1 - r);
+    for (let c = 0; c <= r; c++, o += 2) {
+      const v = col[row + c];
+      if (v) { pix[o] = v; pix[o + 1] = v; }
+    }
+  }
+}
+
+// Relief: every cell is a column rising from its row's ground line by height × zMax.
+// Rows are drawn front to back with a per-x horizon (voxel-space style), so each pixel is
+// written at most once instead of painting over hidden terrain. hgt: per-cell height 0..1.
+function reliefGeom(N, r0, u, elevPct) {
+  const R = N - r0, d = Math.max(1, Math.round(u * ROW_ASPECT / 2)), zMax = Math.round(R * d * elevPct / 100);
+  return { W: 2 * N * u, H: zMax + R * d, d, zMax, u };
+}
+function paintRelief(pix, g, N, r0, col, hgt) {
+  const { W, H, d, zMax, u } = g;
+  pix.fill(BG);
+  const horizon = new Int32Array(W).fill(H);
+  for (let r = N - 1; r >= r0; r--) {
+    const row = r * (r + 1) / 2, ground = zMax + (r - r0 + 1) * d;
+    for (let c = 0, x0 = (N - 1 - r) * u; c <= r; c++, x0 += 2 * u) {
+      const i = row + c, cv = col[i];
+      if (!cv) continue;
+      const sh = pack(((cv & 255) * 0.55) | 0, (((cv >>> 8) & 255) * 0.55) | 0, (((cv >>> 16) & 255) * 0.55) | 0);
+      const top = ground - d - Math.round(hgt[i] * zMax), face = top + d;
+      for (let x = x0; x < x0 + 2 * u; x++) {
+        const bottom = horizon[x] < ground ? horizon[x] : ground;
+        if (bottom <= top) continue;
+        horizon[x] = top;
+        for (let y = top, o = top * W + x; y < bottom; y++, o += W) pix[o] = y < face ? cv : sh;
+      }
+    }
+  }
+}
+
+// ---- minimal ZIP writer (stored entries: PNGs are already compressed) ----
+const CRC_TABLE = (() => {
+  const t = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; }
+  return t;
+})();
+function crc32(bytes) {
+  let c = 0xFFFFFFFF;
+  for (let i = 0; i < bytes.length; i++) c = CRC_TABLE[(c ^ bytes[i]) & 255] ^ (c >>> 8);
+  return (c ^ 0xFFFFFFFF) >>> 0;
+}
+// files: [{ name, data: Uint8Array }] -> array of Uint8Array parts (concatenate, or wrap in a Blob)
+function zipStore(files) {
+  const enc = new TextEncoder(), parts = [], central = [];
+  let offset = 0;
+  for (const f of files) {
+    const name = enc.encode(f.name), crc = crc32(f.data), size = f.data.length;
+    const h = new DataView(new ArrayBuffer(30));
+    h.setUint32(0, 0x04034b50, true); h.setUint16(4, 20, true); h.setUint16(12, 33, true); // date 1980-01-01
+    h.setUint32(14, crc, true); h.setUint32(18, size, true); h.setUint32(22, size, true); h.setUint16(26, name.length, true);
+    parts.push(new Uint8Array(h.buffer), name, f.data);
+    const cd = new DataView(new ArrayBuffer(46));
+    cd.setUint32(0, 0x02014b50, true); cd.setUint16(4, 20, true); cd.setUint16(6, 20, true); cd.setUint16(14, 33, true);
+    cd.setUint32(16, crc, true); cd.setUint32(20, size, true); cd.setUint32(24, size, true); cd.setUint16(28, name.length, true);
+    cd.setUint32(42, offset, true);
+    central.push(new Uint8Array(cd.buffer), name);
+    offset += 30 + name.length + size;
+  }
+  const cdSize = central.reduce((s, b) => s + b.length, 0);
+  const end = new DataView(new ArrayBuffer(22));
+  end.setUint32(0, 0x06054b50, true); end.setUint16(8, files.length, true); end.setUint16(10, files.length, true);
+  end.setUint32(12, cdSize, true); end.setUint32(16, offset, true);
+  return [...parts, ...central, new Uint8Array(end.buffer)];
+}
+// </core>
+
+// ======================================================================
+// App
+// ======================================================================
+const $ = (id) => document.getElementById(id);
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+
+const DEFAULTS = {
+  m: 5, sub: 0n, fine: 0, visit: 'all', step: 3, from: 2, to: 128,
+  rows: 128, link: false, first: 0,
+  lens: 'residue', pPref: 0, L: 0, J: 1, qshow: 'full', wshow: 'energy', stripeTol: 4, stripeRun: 3, stripeColor: 'true', stripeTrack: true, iso: '',
+  scheme: 'spectral', view: 'flat', elev: 35, nums: true,
+  motion: 'off', tau: 8, trail: 16, pool: 1, gain: 12, img: 30,
+  dir: 1, loop: true, speed: 150, scale: 2,
+};
+const S = { ...DEFAULTS };
+
+const EXAMPLES = [
+  { g: 'Energy & art (press Play)', name: 'Quantum walk — Hadamard (μ = 4)', set: { m: 4, rows: 240, lens: 'qwalk', scheme: 'inferno' } },
+  { g: 'Energy & art (press Play)', name: 'Quantum walk — the cone breathes, μ 2 → 12', set: { m: 2, fine: 2, from: 2, to: 12, rows: 240, lens: 'qwalk', scheme: 'magma', speed: 30 } },
+  { g: 'Energy & art (press Play)', name: 'Base-μ carries — fractal dive 2 → 3, relief', set: { m: 2, fine: 3, from: 2, to: 3, rows: 256, lens: 'basecarry', view: 'relief', scheme: 'magma', elev: 25, speed: 16 } },
+  { g: 'Energy & art (press Play)', name: 'Base-μ carries — flat, 2 → 7', set: { m: 2, fine: 2, from: 2, to: 7, rows: 320, lens: 'basecarry', scheme: 'turbo', speed: 30 } },
+  { g: 'Energy & art (press Play)', name: 'Zone plate — Grassmannian fringes, μ 30 → 40', set: { m: 30, fine: 2, from: 30, to: 40, rows: 320, lens: 'qbinom', qshow: 'fringe', scheme: 'inferno', speed: 30 } },
+  { g: 'Energy & art (press Play)', name: 'Grassmannian waves — μ 10 → 11', set: { m: 10, fine: 3, from: 10, to: 11, rows: 200, speed: 30, lens: 'qbinom' } },
+  { name: 'Sierpinski — mod 2', set: { m: 2, rows: 256 } },
+  { name: 'Five-fold — mod 5', set: { m: 5, rows: 125 } },
+  { name: 'Self-similar — mod 7, 343 rows', set: { m: 7, rows: 343 } },
+  { name: 'Divisible by 4 — mod 4, zeros only', set: { m: 4, rows: 256, iso: '0' } },
+  { name: 'Lucas factor — mod 5, digit 1', set: { m: 5, rows: 125, lens: 'lucas', L: 1 } },
+  { name: 'Multiplicative phase — mod 7', set: { m: 7, rows: 343, lens: 'phase' } },
+  { name: 'Carry terraces — mod 8, relief', set: { m: 8, rows: 128, lens: 'depth', view: 'relief', scheme: 'viridis' } },
+  { name: 'Factor layers — mod 30', set: { m: 30, rows: 180, lens: 'crt', scheme: 'turbo' } },
+  { name: 'p-adic digit 1 — mod 25', set: { m: 25, rows: 250, lens: 'digit', J: 1, scheme: 'viridis' } },
+  { name: 'Travel: 10 → 11 in steps of 0.01', set: { m: 10, fine: 2, from: 10, to: 11, rows: 160, speed: 60 } },
+  { name: 'Deep travel: 40 decimals (a band ~row 130 moves)', set: { m: 10, fine: 40, from: 10, to: 11, rows: 200, speed: 16, motion: 'flow', img: 35 } },
+  { name: 'Travel + coherent motion: 10 → 12 by 0.001', set: { m: 10, fine: 3, from: 10, to: 12, rows: 200, speed: 16, motion: 'flow', img: 25 } },
+  { name: 'Travel + steady drift: 30 → 31 by 0.001', set: { m: 30, fine: 3, from: 30, to: 31, rows: 240, speed: 16, motion: 'drift', img: 20, trail: 0 } },
+  { name: 'Grassmannian q-lens at μ = 6 (period-6 blocks)', set: { m: 6, rows: 216, lens: 'qbinom' } },
+  { name: 'Grassmannian q-lens: travel 10 → 11, no static', set: { m: 10, fine: 3, from: 10, to: 11, rows: 200, speed: 30, lens: 'qbinom' } },
+  { name: 'Grassmannian q-lens, rotation removed + motion', set: { m: 7, fine: 3, from: 7, to: 8, rows: 200, speed: 16, lens: 'qbinom', qshow: 'norot', motion: 'flow', img: 30 } },
+  { name: 'Whole-modulus sweep + coherent motion', set: { m: 2, from: 2, to: 300, rows: 256, speed: 40, motion: 'flow', trail: 40, img: 20 } },
+  { name: 'Sweep: peel 2-adic layers (2ᵏ, zeros)', set: { m: 2, rows: 256, visit: 'pow2', from: 2, to: 256, iso: '0', speed: 700 } },
+  { name: 'Sweep: doubled primes (2p)', set: { m: 4, rows: 256, visit: '2p', from: 4, to: 254, speed: 250 } },
+  { name: 'Sweep: divisor census (every m)', set: { m: 2, rows: 256, lens: 'census', from: 2, to: 256, scheme: 'magma', speed: 60 } },
+  { g: 'Stripe tracker', name: 'Stripes — primes 197 → 541 (your sweep)', set: { m: 199, visit: 'prime', from: 197, to: 541, rows: 128, lens: 'stripes', speed: 120 } },
+  { g: 'Stripe tracker', name: 'Stripes — slow travel 199 → 200 by 0.01', set: { m: 199, fine: 2, from: 199, to: 200, rows: 128, lens: 'stripes', speed: 60 } },
+  { g: 'Stripe tracker', name: 'Stripes — colored by rows stacked, mod 199', set: { m: 199, rows: 128, lens: 'stripes', stripeColor: 'depth', scheme: 'turbo' } },
+];
+
+// ---- the modulus μ = m + sub/10^fine (sub a BigInt) ----
+function muOf(m, sub, d) {
+  const units = BigInt(m) * pow10(d) + sub, { P, Q } = rational(units, d);
+  const str = d ? (() => { const s = units.toString().padStart(d + 1, '0'); return `${s.slice(0, -d)}.${s.slice(-d)}`; })() : String(m);
+  return { m, sub, d, units, P, Q, str, value: parseFloat(str), floor: Number(units / pow10(d)), key: P + '/' + Q };
+}
+const curMu = () => muOf(S.m, S.sub, S.fine);
+const fmtMu = (mu) => mu.str;
+// Short form for labels: long expansions keep their first and last digits.
+const fmtShort = (mu) => mu.d <= 12 ? mu.str : `${mu.str.slice(0, mu.str.length - mu.d + 6)}…${mu.str.slice(-4)} (${mu.d} places)`;
+const bigShort = (x) => { const s = x.toString(); return s.length <= 18 ? s : `${s.slice(0, 6)}…${s.slice(-4)} (${s.length} digits)`; };
+function describeP(P) {
+  const f = factorP(P), parts = f.factors.map(([p, a]) => a === 1 ? String(p) : p + sup(a));
+  if (f.rest > 1n) parts.push(`R (${f.rest.toString().length} digits, no prime factor below ${f.limit.toLocaleString()})`);
+  const prime = f.rest === 1n && f.factors.length === 1 && f.factors[0][1] === 1;
+  return prime ? 'prime' : parts.join('·');
+}
+
+// ---- frame building: the one path every view and export goes through ----
+const rowsFor = (st, mu) => st.link ? clamp(mu.floor, 2, MAX_ROWS) : st.rows;
+const needsScaled = (st) => LENS[st.lens].scaled || String(st.iso).trim() !== '';
+// Rows window; multi-word residues are kept below LIMB_CAP words in total.
+function windowFor(st, mu) {
+  let r0 = Math.min(st.first, ROW_CAP - 2), N = Math.min(ROW_CAP, r0 + rowsFor(st, mu)), limited = false;
+  if (needsScaled(st) && mu.P >= TWO52) {
+    const cap = Math.floor((Math.sqrt(1 + 8 * LIMB_CAP / limbsFor(mu.P)) - 1) / 2);
+    if (N > cap) { N = cap; r0 = Math.min(r0, N - 2); limited = true; }
+  }
+  return { r0, N, limited };
+}
+const reliefUnit = (N) => clamp(Math.floor(1600 / N), 1, 6);
+const rowPx = (k) => Math.max(1, Math.round(k * ROW_ASPECT));
+const motionOpts = (st) => ({ mode: st.motion, tau: st.tau, trail: st.trail, pool: st.pool });
+
+const scCache = { key: '', sc: null };
+function scaledFor(N, mu, cached) {
+  if (!cached) return buildScaled(N, mu.P, mu.Q);
+  const key = N + ':' + mu.key;
+  if (scCache.key !== key) { scCache.sc = buildScaled(N, mu.P, mu.Q); scCache.key = key; }
+  return scCache.sc;
+}
+const TABLES = new Map();
+function table(key, make) {
+  let v = TABLES.get(key);
+  if (v === undefined) { if (TABLES.size > 48) TABLES.clear(); v = make(); TABLES.set(key, v); }
+  return v;
+}
+
+// Phase (cycles) of what the lens shows, per window cell, for the motion detector.
+function thetaFor(out, space, p, mask, base0, n) {
+  let th;
+  if (out.theta) th = out.theta;
+  else {
+    th = new Float64Array(n);
+    const idx = out.idx;
+    if (space === 'cyclic') for (let j = 0; j < n; j++) { const v = idx[base0 + j]; th[j] = v ? (v - 1) / 255 : NaN; }
+    else { const s = space === 'p' ? 1 / p : 1 / 510; for (let j = 0; j < n; j++) th[j] = idx[base0 + j] * s; } // ramp: half a turn
+  }
+  if (mask) { th = th.slice(); for (let j = 0; j < n; j++) if (!mask[base0 + j]) th[j] = NaN; }
+  return th;
+}
+
+function buildFrame(st, mu, { census, motion, unit, live, reuse, noPaint } = {}) {
+  const t0 = performance.now();
+  const { r0, N, limited } = windowFor(st, mu);
+  const total = N * (N + 1) / 2, base0 = r0 * (r0 + 1) / 2, n = total - base0;
+  const fac = factorP(mu.P), primes = fac.factors.map((f) => f[0]);
+  const p = primes.includes(st.pPref) ? st.pPref : primes[0];
+  const lens = LENS[st.lens] || LENS.residue;
+  let sc = null;
+  const scaled = () => sc || (sc = scaledFor(N, mu, live));
+  const ctx = { N, r0, base0, total, mu, p, fac, L: st.L, J: st.J, qshow: st.qshow, wshow: st.wshow, census, scheme: st.scheme, spectral: st.scheme === 'spectral', scaled,
+    stripeTol: st.stripeTol, stripeRun: st.stripeRun, stripeColor: st.stripeColor };
+  const out = lens.compute(ctx);
+  const space = out.space || lens.space;
+
+  const iso = parseIsolation(st.iso, Math.ceil(mu.value));
+  const mask = iso ? maskFor(scaled(), base0, total, iso) : null;
+  let col;
+  if (space === 'rgb') {
+    col = out.col;
+    if (mask) { col = col.slice(); for (let i = base0; i < total; i++) if (!mask[i]) col[i] = 0; }
+  } else {
+    const isoZero = !!iso && iso.has(0);
+    const size = space === 'p' ? p : 256;
+    const lut = table(`${space}|${size}|${st.scheme}|${isoZero}`, () =>
+      space === 'res' ? resLUT(st.scheme, isoZero) : space === 'cyclic' ? cyclicLUT()
+        : space === 'ramp' ? rampLUT(st.scheme) : residueLUT(size, st.scheme));
+    col = cellColors(out.idx, lut, mask, base0);
+  }
+
+  // motion: step the detector once per new μ (parameter edits only re-composite)
+  let motionInfo = null;
+  if (motion && st.motion !== 'off') {
+    if (n > MOTION_CELL_CAP) motionInfo = { tooBig: true };
+    else {
+      const key = `${N}|${r0}|${st.lens}|${st.pPref}|${st.L}|${st.J}|${st.qshow}|${st.wshow}|${st.stripeTol}|${st.stripeRun}`;
+      if (motion.key !== key) motionAlloc(motion, key, n);
+      if (motion.mode !== st.motion) { motion.T.fill(0); motion.mode = st.motion; }
+      if (motion.mu !== mu.key) {
+        motionStep(motion, thetaFor(out, space, p, mask, base0, n), N, r0, motionOpts(st));
+        motion.mu = mu.key;
+      }
+      compositeMotion(col, base0, motion, st.gain / 4, st.img / 100);
+      motionInfo = { frames: motion.frames };
+    }
+  }
+  if (noPaint) return null;
+
+  let W, H, aspect, img;
+  const image = (w, h) => reuse && reuse.img.width === w && reuse.img.height === h ? reuse.img : new ImageData(w, h);
+  if (st.view === 'relief') {
+    const g = reliefGeom(N, r0, unit || reliefUnit(N), st.elev);
+    ({ W, H } = g); aspect = 1; img = image(W, H);
+    let hgt = out.height;
+    if (!hgt) {
+      const size = space === 'p' ? p : 256, hl = table(`h|${size}`, () => heightLUT(size));
+      hgt = new Float32Array(total);
+      for (let i = base0; i < total; i++) hgt[i] = hl[out.idx[i]];
+    }
+    paintRelief(new Uint32Array(img.data.buffer), g, N, r0, col, hgt);
+  } else {
+    W = 2 * N; H = N - r0; aspect = ROW_ASPECT; img = image(W, H);
+    paintFlat(new Uint32Array(img.data.buffer), N, r0, col);
+  }
+
+  let distinct = null;
+  if (sc && sc.kind === 'int' && sc.p <= 1e7) {
+    const seen = new Uint8Array(sc.p);
+    distinct = 0;
+    for (let i = base0; i < total; i++) if (!seen[sc.t[i]]) { seen[sc.t[i]] = 1; distinct++; }
+  }
+  return { mu, N, r0, base0, total, p, fac, lens, out, ctx, sc, col, view: st.view, W, H, aspect, img, distinct, motionInfo, limited,
+    ms: performance.now() - t0 };
+}
+
+// Frame -> canvas at export scale k (half-cell = k px).
+function frameCanvas(f, k) {
+  const raw = document.createElement('canvas');
+  raw.width = f.W; raw.height = f.H;
+  raw.getContext('2d').putImageData(f.img, 0, 0);
+  if (f.view === 'relief') return raw;
+  const c = document.createElement('canvas');
+  c.width = f.W * k; c.height = f.H * rowPx(k);
+  const x = c.getContext('2d');
+  x.imageSmoothingEnabled = false;
+  x.drawImage(raw, 0, 0, c.width, c.height);
+  return c;
+}
+function exportDims(st, mu, k) {
+  const { r0, N } = windowFor(st, mu);
+  if (st.view === 'relief') { const g = reliefGeom(N, r0, k, st.elev); return { w: g.W, h: g.H }; }
+  return { w: 2 * N * k, h: (N - r0) * rowPx(k) };
+}
+
+// ---- live state ----
+const canvas = $('view'), g2d = canvas.getContext('2d');
+const buf = document.createElement('canvas');
+let frame = null, liveCensus = newCensus(), liveMotion = newMotion();
+let cw = 1, ch = 1;
+const view = { s: 1, x: 0, y: 0 };
+let autoFit = true, hover = null;
+
+const currentList = () => sequenceList(S.visit, clamp(S.from, 2, MOD_CAP), S.step);
+const snapM = (v) => { const a = currentList(); return a[nearestIndex(a, clamp(Math.round(v), 2, MOD_CAP))]; };
+function rangeIdx() {
+  const a = currentList(), lo = Math.min(S.from, S.to), hi = Math.max(S.from, S.to);
+  return { a, i0: lowerBound(a, lo), i1: lowerBound(a, hi + 1) - 1 };
+}
+// Frames in the sweep range: every fine step between its first and last member (BigInt).
+function rangeFrames() {
+  const { a, i0, i1 } = rangeIdx();
+  return i1 < i0 ? 0n : BigInt(a[i1] - a[i0]) * pow10(S.fine) + 1n;
+}
+const countStr = (x) => x < 10n ** 15n ? Number(x).toLocaleString() : `~10^${x.toString().length - 1}`;
+
+function rebuild() {
+  const prev = frame;
+  frame = buildFrame(S, curMu(), { census: liveCensus, motion: liveMotion, live: true, reuse: prev });
+  if (buf.width !== frame.W || buf.height !== frame.H) { buf.width = frame.W; buf.height = frame.H; }
+  buf.getContext('2d').putImageData(frame.img, 0, 0);
+  if (autoFit || !prev || prev.view !== frame.view) fit();
+  else if (prev.W !== frame.W) view.x += (prev.W - frame.W) * view.s / 2; // keep the apex in place
+  if (hover && (hover.n >= frame.N || hover.n < frame.r0 || frame.view !== 'flat')) hover = null;
+  if (frame.lens.id === 'stripes' && S.stripeTrack && frame.out.patches)
+    trackStep(tracker, frame.out.patches, `${frame.N}|${frame.r0}|${S.stripeTol}|${S.stripeRun}`, frame.mu.key);
+}
+
+// ---- stripe tracker: follows stripe patches from frame to frame ----
+// Each new frame, every patch continues the track of the nearest patch of the previous frame
+// (within TRACK_R cells, nearest claim wins) or starts a new one. The drift readout pools the
+// last 40 frame pairs, matched both forward and backward so the pull toward denser regions
+// cancels (see driftSums), and reports z = |v| / standard error: z ≥ 3 is a real direction.
+const TRACK_R = 6;
+const newTracker = () => ({ key: '', mu: null, prev: null, prevTracks: [], tracks: [], sums: [], nextId: 1, frames: 0, drift: null });
+let tracker = newTracker();
+function trackStep(tr, patches, key, muKey) {
+  if (tr.key !== key) Object.assign(tr, newTracker(), { key });
+  if (tr.mu === muKey) return; // same frame re-rendered: nothing moved
+  tr.mu = muKey; tr.frames++;
+  const next = [];
+  if (tr.prev) {
+    tr.sums.push(driftSums(tr.prev, patches, TRACK_R));
+    if (tr.sums.length > 40) tr.sums.shift();
+    const claim = new Map();
+    for (const m of matchPatches(patches, tr.prev, TRACK_R)) {
+      const d = m.dx * m.dx + m.dy * m.dy, c = claim.get(m.b);
+      if (!c || d < c.d) claim.set(m.b, { a: m.a, d });
+    }
+    const from = new Map();
+    for (const [b, c] of claim) from.set(c.a, b);
+    patches.forEach((p, a) => {
+      const b = from.get(a), t = b !== undefined ? tr.prevTracks[b] : { id: tr.nextId++, pts: [] };
+      t.pts.push([p.x, p.y]);
+      if (t.pts.length > 24) t.pts.shift();
+      next.push(t);
+    });
+  } else patches.forEach((p) => next.push({ id: tr.nextId++, pts: [[p.x, p.y]] }));
+  tr.prev = patches; tr.prevTracks = next; tr.tracks = next;
+  tr.drift = driftFrom(tr.sums);
+}
+const DIRS = ['right', 'down-right', 'down', 'down-left', 'left', 'up-left', 'up', 'up-right'];
+const dirWord = (vx, vy) => DIRS[(Math.round(Math.atan2(vy, vx) / (Math.PI / 4)) + 8) % 8];
+function trackerSummary() {
+  const tr = tracker, nNow = tr.prev ? tr.prev.length : 0;
+  if (!tr.frames) return '';
+  const long = tr.tracks.filter((t) => t.pts.length >= 3).length;
+  let s = `${nNow} stripe patches now, ${long} followed for 3+ frames.`;
+  const d = tr.drift;
+  if (!d) return s + ' Play or step to measure drift.';
+  s += ` Drift ${d.speed.toFixed(2)} cells/frame ${dirWord(d.vx, d.vy)}, z = ${d.z.toFixed(1)} over ${tr.sums.length} frame pairs: `;
+  return s + (d.z >= 3 ? 'a consistent direction.' : 'no consistent direction (z < 3).');
+}
+// Trails in screen space: cell (n, k) has x = k − n/2, y = n·√3/2 (cell widths).
+function drawTracks() {
+  const f = frame, sx = view.s, sy = view.s * f.aspect;
+  const scr = (p) => [view.x + (f.N + 2 * p[0]) * sx, view.y + (p[1] / 0.8660254 - f.r0 + 0.5) * sy];
+  g2d.lineCap = 'round'; g2d.lineJoin = 'round';
+  for (const t of tracker.tracks) {
+    const pts = t.pts, last = scr(pts[pts.length - 1]);
+    let hue = null;
+    if (pts.length > 1) {
+      const a = pts[0], b = pts[pts.length - 1];
+      if (Math.hypot(b[0] - a[0], b[1] - a[1]) > 0.5) hue = (Math.atan2(b[1] - a[1], b[0] - a[0]) * 180 / Math.PI + 360) % 360;
+      g2d.beginPath();
+      pts.forEach((p, i) => { const [X, Y] = scr(p); if (i) g2d.lineTo(X, Y); else g2d.moveTo(X, Y); });
+      g2d.lineWidth = 4; g2d.strokeStyle = 'rgba(0,0,0,.6)'; g2d.stroke();
+      g2d.lineWidth = 2; g2d.strokeStyle = hue === null ? 'rgba(255,255,255,.9)' : `hsl(${hue},100%,60%)`; g2d.stroke();
+    }
+    g2d.beginPath(); g2d.arc(last[0], last[1], 3, 0, 2 * Math.PI);
+    g2d.fillStyle = hue === null ? '#fff' : `hsl(${hue},100%,60%)`; g2d.strokeStyle = '#000'; g2d.lineWidth = 1.5;
+    g2d.fill(); g2d.stroke();
+  }
+  const d = tracker.drift;
+  if (d && d.z >= 3) { // pooled drift arrow, scaled so 1 cell/frame = 60 px
+    const cx = cw / 2, cy = ch - 70, L = clamp(60 * d.speed, 24, 120), a = Math.atan2(d.vy, d.vx);
+    g2d.strokeStyle = '#fff'; g2d.fillStyle = '#fff'; g2d.lineWidth = 3;
+    g2d.beginPath(); g2d.moveTo(cx - Math.cos(a) * L / 2, cy - Math.sin(a) * L / 2); g2d.lineTo(cx + Math.cos(a) * L / 2, cy + Math.sin(a) * L / 2); g2d.stroke();
+    g2d.beginPath(); g2d.moveTo(cx + Math.cos(a) * L / 2, cy + Math.sin(a) * L / 2);
+    g2d.lineTo(cx + Math.cos(a) * L / 2 - Math.cos(a - 0.5) * 12, cy + Math.sin(a) * L / 2 - Math.sin(a - 0.5) * 12);
+    g2d.lineTo(cx + Math.cos(a) * L / 2 - Math.cos(a + 0.5) * 12, cy + Math.sin(a) * L / 2 - Math.sin(a + 0.5) * 12); g2d.fill();
+  }
+}
+
+function fit() {
+  if (!frame) return;
+  const pad = 12, aw = cw - 2 * pad, ah = ch - 2 * pad - 18;
+  view.s = Math.max(1e-4, Math.min(aw / frame.W, ah / (frame.H * frame.aspect)));
+  view.x = (cw - frame.W * view.s) / 2;
+  view.y = pad;
+  autoFit = true;
+}
+
+function draw() {
+  const dpr = window.devicePixelRatio || 1;
+  g2d.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g2d.fillStyle = '#0a0a0a';
+  g2d.fillRect(0, 0, cw, ch);
+  if (!frame) return;
+  const f = frame, sx = view.s, sy = view.s * f.aspect;
+  // blit only the visible part of the buffer
+  const x0 = Math.max(0, Math.floor(-view.x / sx)), x1 = Math.min(f.W, Math.ceil((cw - view.x) / sx));
+  const y0 = Math.max(0, Math.floor(-view.y / sy)), y1 = Math.min(f.H, Math.ceil((ch - view.y) / sy));
+  if (x1 > x0 && y1 > y0) {
+    g2d.imageSmoothingEnabled = sx * dpr < 1;
+    g2d.imageSmoothingQuality = 'high';
+    g2d.drawImage(buf, x0, y0, x1 - x0, y1 - y0, view.x + x0 * sx, view.y + y0 * sy, (x1 - x0) * sx, (y1 - y0) * sy);
+  }
+  if (S.motion !== 'off' && f.motionInfo && !f.motionInfo.tooBig) drawWheel(S.motion === 'drift' ? 'rate' : 'dir');
+  else if ((f.lens.id === 'qbinom' && S.qshow !== 'fringe') || (f.lens.id === 'qwalk' && S.wshow === 'phase')) drawWheel('phase');
+  if (f.view !== 'flat') return;
+
+  if (S.nums && 2 * sx >= 18 && x1 > x0 && y1 > y0) {
+    g2d.font = `${Math.min(2 * sx * 0.34, sy * 0.55).toFixed(1)}px ui-monospace, Consolas, monospace`;
+    g2d.textAlign = 'center'; g2d.textBaseline = 'middle';
+    const space = f.out.space || f.lens.space, voidAt0 = space !== 'ramp' && space !== 'rgb';
+    for (let n = f.r0 + y0; n < f.r0 + y1; n++) {
+      const lead = f.N - 1 - n, row = n * (n + 1) / 2, cy = view.y + (n - f.r0 + 0.5) * sy;
+      for (let k = Math.max(0, Math.floor((x0 - lead - 1) / 2)); k <= Math.min(n, Math.ceil((x1 - lead) / 2)); k++) {
+        const i = row + k, c = f.col[i];
+        if (!c || (voidAt0 && f.out.idx[i] === 0)) continue;
+        const [r, g, b] = unpack(c);
+        g2d.fillStyle = 0.299 * r + 0.587 * g + 0.114 * b > 140 ? '#000' : '#fff';
+        g2d.fillText(numberAt(i), view.x + (lead + 2 * k + 1) * sx, cy);
+      }
+    }
+  }
+  if (hover) {
+    const hx = view.x + (f.N - 1 - hover.n + 2 * hover.k) * sx, hy = view.y + (hover.n - f.r0) * sy;
+    const w = Math.max(2 * sx, 3), h = Math.max(sy, 3);
+    g2d.lineWidth = 3; g2d.strokeStyle = '#000'; g2d.strokeRect(hx, hy, w, h);
+    g2d.lineWidth = 1.5; g2d.strokeStyle = '#fff'; g2d.strokeRect(hx, hy, w, h);
+  }
+  if (f.lens.id === 'stripes' && S.stripeTrack) drawTracks();
+}
+// Hue legend: the ring's color at each angle is the color of that direction / rate / phase.
+function drawWheel(label) {
+  const R = 15, cx = cw - R - 12, cy = ch - R - 28;
+  g2d.lineWidth = 6;
+  for (let i = 0; i < 64; i++) {
+    const a0 = i / 64 * 2 * Math.PI, a1 = (i + 1.2) / 64 * 2 * Math.PI;
+    g2d.strokeStyle = `hsl(${i / 64 * 360}, 100%, 50%)`;
+    g2d.beginPath(); g2d.arc(cx, cy, R, a0, a1); g2d.stroke();
+  }
+  g2d.fillStyle = '#bbb'; g2d.font = '9px ui-monospace, Consolas, monospace'; g2d.textAlign = 'center'; g2d.textBaseline = 'middle';
+  g2d.fillText(label, cx, cy);
+}
+function numberAt(i) {
+  const f = frame, id = f.lens.id, o = f.out;
+  if (o.unavailable) return '';
+  if (id === 'residue' || id === 'stripes') {
+    if (f.sc.kind !== 'limbs' && f.mu.Q === 1n) return String(f.sc.t[i]);
+    const th = f.sc.kind === 'limbs' ? f.sc.top(f.sc.t, i * f.sc.k) / f.sc.pTop : f.sc.t[i] / f.sc.p;
+    return (th * f.mu.value).toFixed(Math.min(3, f.mu.d));
+  }
+  if (id === 'qbinom') { const lr = o.lnAbs[i - f.base0]; return lr === -Infinity ? '0' : expStr(lr); }
+  if (id === 'qwalk') return o.prob[i - f.base0].toPrecision(2);
+  if (id === 'basecarry') return String(o.raw[i]);
+  if (id === 'depth' || id === 'carry' || id === 'census') return String(o.raw[i]);
+  if (id === 'lucas' || id === 'digit') return String(o.idx[i]);
+  if (id === 'phase') return String(o.triP[i]);
+  return '';
+}
+
+// ---- inspector ----
+function inspectText(n, k) {
+  const f = frame, i = n * (n + 1) / 2 + k, { P, Q } = f.mu, L = [];
+  L.push(`n = ${n}, k = ${k}`);
+  if (n <= 400) {
+    const b = binomBig(n, k).toString();
+    L.push(b.length <= 34 ? `C(n,k) = ${b}` : `C(n,k) has ${b.length} digits`);
+  } else {
+    L.push(`C(n,k) ≈ ${expStr(LNF[n] - LNF[k] - LNF[n - k])}`);
+  }
+  // C mod μ exactly: from the scaled triangle when this frame built one, else straight from C(n,k)
+  let S0 = null;
+  if (f.sc) S0 = scaledBig(f.sc, i);
+  else if (n <= 600) S0 = (Q * binomBig(n, k)) % P;
+  if (S0 !== null) {
+    const x = residueExact({ kind: 'int', t: [S0] }, 0, f.mu);
+    L.push(`C mod ${fmtShort(f.mu)} = ${x.length > 60 ? x.slice(0, 60) + '…' : x}${S0 === 0n ? '   μ divides C' : ''}`);
+    if (Q !== 1n) L.push(`phase frac(C/μ) = ${(Number((S0 << 64n) / P) / 2 ** 64).toFixed(6)}`);
+  }
+  if (f.lens.id !== 'residue') L.push(f.out.unavailable ? `${f.lens.name}: —` : `${f.lens.name}: ${f.lens.describe(f.out, i, f.ctx, n, k)}`);
+  for (const [p, a] of f.fac.factors) {
+    if (p > ROW_CAP) continue;
+    const nu = carries(n, k, p);
+    L.push(`ν${sub(p)} = ${nu}${a > 1 || f.fac.factors.length > 1 ? `   (${p}${a > 1 ? sup(a) : ''} ${nu >= a ? 'divides' : 'does not divide'})` : ''}`);
+  }
+  if (f.p && f.p <= P_TABLE_CAP) { // Lucas, base p: digits high to low
+    const p = f.p, T = tablesFor(p), terms = [];
+    let prod = 1;
+    for (let a = n, b = k; a > 0; a = Math.floor(a / p), b = Math.floor(b / p)) {
+      const da = a % p, db = b % p;
+      terms.unshift(`C(${da},${db})`);
+      prod = prod * binomModP(da, db, T, p) % p;
+    }
+    if (terms.length && terms.length <= 14) L.push(`Lucas: ${terms.join('·')} ≡ ${prod} (mod ${p})`);
+  }
+  if (f.motionInfo && !f.motionInfo.tooBig && liveMotion.n) {
+    const j = i - f.base0, ms = liveMotion;
+    if (S.motion === 'drift') {
+      L.push(`drift: ${(Math.atan2(ms.ai[j], ms.ar[j]) / (2 * Math.PI)).toFixed(4)} turn/frame, steadiness ${Math.hypot(ms.ar[j], ms.ai[j]).toFixed(2)}`);
+    } else {
+      const [vx, vy] = motionVelocity(ms, j), kk = ms.mag[j] > 1e-9 ? Math.hypot(ms.nx[j], ms.ny[j]) / ms.mag[j] : 0;
+      L.push(`flow: ${Math.hypot(vx, vy).toFixed(3)} cells/frame at ${Math.round(Math.atan2(vy, vx) * 180 / Math.PI)}°, consistency ${kk.toFixed(2)}`);
+    }
+  }
+  return L.join('\n');
+}
+function setHover(h) {
+  if (h && hover && h.n === hover.n && h.k === hover.k) return;
+  hover = h;
+  $('inspect').textContent = hover ? inspectText(hover.n, hover.k) : '';
+  requestDraw();
+}
+function cellAt(px, py) {
+  if (!frame || frame.view !== 'flat') return null;
+  const bx = (px - view.x) / view.s, by = (py - view.y) / (view.s * frame.aspect);
+  const n = frame.r0 + Math.floor(by);
+  if (by < 0 || n >= frame.N) return null;
+  const k = Math.floor((bx - (frame.N - 1 - n)) / 2);
+  return k >= 0 && k <= n ? { n, k } : null;
+}
+
+// ---- scheduling ----
+let pendingBuild = false, pendingDraw = false;
+function invalidate() { if (!pendingBuild) { pendingBuild = true; requestAnimationFrame(flush); } }
+function requestDraw() { if (!pendingDraw) { pendingDraw = true; requestAnimationFrame(flush); } }
+function flush() {
+  if (pendingBuild) { pendingBuild = false; rebuild(); syncUI(); if (hover) $('inspect').textContent = inspectText(hover.n, hover.k); }
+  if (pendingDraw || frame) { pendingDraw = false; draw(); }
+}
+
+// ---- modulus, rows, sweep ----
+function setPos(m, sub = 0n) { S.m = m; S.sub = sub; invalidate(); }
+function setM(v) { setPos(snapM(v), 0n); }
+// Typed μ, exactly: the whole part snaps to the visit list; extra decimals raise the precision.
+function setMuText(text) {
+  const mt = String(text).trim().match(/^(\d+)(?:\.(\d*))?$/);
+  if (!mt) return;
+  let frac = (mt[2] || '').replace(/0+$/, '');
+  if (frac.length > S.fine) S.fine = Math.min(MAX_FINE, frac.length);
+  const d = S.fine, Q0 = pow10(d);
+  frac = frac.slice(0, d).padEnd(d, '0');
+  let units = BigInt(mt[1]) * Q0 + (d ? BigInt(frac) : 0n);
+  if (units < 2n * Q0) units = 2n * Q0;
+  if (units > BigInt(MOD_CAP) * Q0) units = BigInt(MOD_CAP) * Q0;
+  const ip = Number(units / Q0);
+  if (!d) return setM(ip);
+  const a = currentList(), i = lowerBound(a, ip + 1) - 1;
+  if (i < 0) return setPos(a[0], 0n);
+  const gap = i < a.length - 1 ? BigInt(a[i + 1] - a[i]) * Q0 : 1n;
+  let s = units - BigInt(a[i]) * Q0;
+  if (s >= gap) s = gap - 1n;
+  setPos(a[i], s < 0n ? 0n : s);
+}
+function stepBy(n) {
+  const a = currentList();
+  let pos = { m: S.m, sub: S.sub };
+  for (let s = 0; s < Math.abs(n); s++) { const nx = stepMu(pos, Math.sign(n), a, S.fine); if (!nx) break; pos = nx; }
+  setPos(pos.m, pos.sub);
+}
+function stepWhole(n) {
+  const a = currentList();
+  const i = nearestIndex(a, S.m) + (n < 0 && S.sub > 0n ? n + 1 : n);
+  setPos(a[clamp(i, 0, a.length - 1)], 0n);
+}
+function setRows(v) { S.rows = clamp(Math.round(v) || S.rows, 2, MAX_ROWS); S.link = false; invalidate(); }
+function setFine(d) {
+  d = clamp(d | 0, 0, MAX_FINE);
+  S.sub = d >= S.fine ? S.sub * pow10(d - S.fine) : S.sub / pow10(S.fine - d); // keep μ, truncated to the new grid
+  S.fine = d;
+  invalidate();
+}
+
+let playing = false, lastStep = 0;
+function advance() {
+  const { a, i0, i1 } = rangeIdx();
+  if (i0 > i1) { stop(); $('sweepNote').textContent = 'No moduli of this kind in the range.'; return; }
+  const Q0 = pow10(S.fine), lo = BigInt(a[i0]) * Q0, hi = BigInt(a[i1]) * Q0, u = BigInt(S.m) * Q0 + S.sub;
+  const member = a[nearestIndex(a, S.m)] === S.m;
+  if (!member || u < lo || u > hi) return setPos(S.dir > 0 ? a[i0] : a[i1], 0n);
+  if ((S.dir > 0 && u >= hi) || (S.dir < 0 && u <= lo)) {
+    if (!S.loop) return stop();
+    return setPos(S.dir > 0 ? a[i0] : a[i1], 0n);
+  }
+  const nx = stepMu({ m: S.m, sub: S.sub }, S.dir, a, S.fine);
+  if (nx) setPos(nx.m, nx.sub);
+}
+function tick(now) {
+  if (!playing) return;
+  if (now - lastStep >= S.speed) { lastStep = now; advance(); flush(); }
+  requestAnimationFrame(tick);
+}
+function play() { if (playing) return; playing = true; lastStep = 0; requestAnimationFrame(tick); syncUI(); }
+function stop() { playing = false; syncUI(); }
+const togglePlay = () => playing ? stop() : play();
+
+// ---- export ----
+function download(blob, name) {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+}
+const muTag = (mu) => mu.d <= 12 ? mu.str : `${mu.str.slice(0, mu.str.length - mu.d + 4)}x${mu.str.slice(-6)}-d${mu.d}`;
+const baseName = (mu) => `pascal_${S.lens}${S.lens === 'lucas' ? S.L : S.lens === 'digit' ? S.J : ''}_m${muTag(mu)}_rows${rowsFor(S, mu)}${S.first ? '@' + S.first : ''}_${S.scheme}${S.view === 'relief' ? '_relief' : ''}${S.motion !== 'off' ? '_' + S.motion : ''}${S.iso ? '_filtered' : ''}`;
+
+function savePng() {
+  const f = buildFrame(S, curMu(), { census: liveCensus, motion: liveMotion, unit: S.scale });
+  frameCanvas(f, S.scale).toBlob((b) => b && download(b, baseName(f.mu) + '.png'), 'image/png');
+}
+
+const EXPORT_CAP = 3000;
+let exporting = null;
+async function exportSweep() {
+  if (exporting) { exporting.cancel = true; return; }
+  const note = (t) => { $('expNote').textContent = t; };
+  const { a, i0, i1 } = rangeIdx();
+  const count = rangeFrames();
+  if (!count) return note('No moduli of this kind in the range.');
+  if (count > BigInt(EXPORT_CAP)) return note(`${countStr(count)} frames — narrow the range or use fewer decimals (${EXPORT_CAP} max).`);
+  const frames = [];
+  for (let pos = { m: a[i0], sub: 0n }; pos; pos = stepMu(pos, 1, a, S.fine)) {
+    frames.push(muOf(pos.m, pos.sub, S.fine));
+    if (pos.m === a[i1] && pos.sub === 0n) break;
+  }
+  if (S.dir < 0) frames.reverse();
+  let Wout = 0, Hout = 0;
+  for (const mu of frames) { const d = exportDims(S, mu, S.scale); Wout = Math.max(Wout, d.w); Hout = Math.max(Hout, d.h); }
+  if (Math.max(Wout, Hout) > 16384) return note(`Frames would be ${Wout}×${Hout}px — lower the scale or rows.`);
+
+  const job = exporting = { cancel: false };
+  stop();
+  $('saveZip').textContent = 'Cancel export';
+  const out = document.createElement('canvas');
+  out.width = Wout; out.height = Hout;
+  const octx = out.getContext('2d');
+  const census = newCensus(), motion = newMotion(), files = [], csv = ['frame,modulus,P,Q,first_row,rows'];
+  const pad = Math.max(4, String(frames.length - 1).length);
+  try {
+    if (S.motion !== 'off') { // warm the detector up on the frames just before the range
+      const pre = [];
+      for (let pos = { m: frames[0].m, sub: frames[0].sub }; pre.length < Math.min(64, 3 * S.tau);) {
+        pos = stepMu(pos, -S.dir, a, S.fine);
+        if (!pos) break;
+        pre.unshift(muOf(pos.m, pos.sub, S.fine));
+      }
+      for (const mu of pre) buildFrame(S, mu, { motion, noPaint: true });
+    }
+    for (let i = 0; i < frames.length; i++) {
+      if (job.cancel) throw new Error('cancelled');
+      const f = buildFrame(S, frames[i], { census, motion, unit: S.scale });
+      const src = frameCanvas(f, S.scale);
+      octx.fillStyle = '#0a0a0a';
+      octx.fillRect(0, 0, Wout, Hout);
+      octx.drawImage(src, Math.floor((Wout - src.width) / 2), 0); // apex pinned top-center
+      const blob = await new Promise((res) => out.toBlob(res, 'image/png'));
+      if (!blob) throw new Error(`frame ${i} (μ = ${fmtShort(frames[i])}) failed to encode`);
+      files.push({ name: `${String(i).padStart(pad, '0')}.png`, data: new Uint8Array(await blob.arrayBuffer()) });
+      csv.push(`${i},${frames[i].str},${frames[i].P},${frames[i].Q},${f.r0},${f.N - f.r0}`);
+      note(`Rendering ${i + 1} / ${frames.length}  (μ = ${fmtShort(frames[i])})`);
+    }
+    files.push({ name: 'frames.csv', data: new TextEncoder().encode(csv.join('\n') + '\n') });
+    download(new Blob(zipStore(files), { type: 'application/zip' }),
+      `${baseName(frames[0])}_sweep-${S.visit}${S.fine ? '-d' + S.fine : ''}_${frames.length}f.zip`);
+    note(`Exported ${frames.length} frames at ${Wout}×${Hout}px, with frames.csv listing each μ exactly.`);
+  } catch (e) {
+    note(e.message === 'cancelled' ? 'Export cancelled.' : 'Export failed: ' + e.message);
+  } finally {
+    exporting = null;
+    $('saveZip').textContent = 'Export sweep (ZIP)';
+  }
+}
+
+// ---- UI ----
+const fill = (sel, items) => { sel.innerHTML = ''; for (const [v, t] of items) sel.add(new Option(t, v)); };
+fill($('visit'), SEQUENCES.map((q) => [q.id, q.name]));
+fill($('lens'), LENSES.map((l) => [l.id, l.name]));
+fill($('scheme'), SCHEMES);
+{
+  const groups = new Map();
+  EXAMPLES.forEach((e, i) => {
+    const g = e.g || 'Structure, travel and sweeps';
+    if (!groups.has(g)) { const og = document.createElement('optgroup'); og.label = g; $('example').append(og); groups.set(g, og); }
+    groups.get(g).append(new Option(e.name, String(i)));
+  });
+}
+
+const MOTION_NOTES = {
+  off: 'Find coherent movement inside the static of a sweep. Turn on, then Play or step.',
+  flow: 'Phase flow: each frame, every cell estimates which way its colour front is moving (phase change ÷ phase gradient). Estimates are averaged over the evidence window — static points every which way and cancels; movement that keeps its direction adds up and leaves a fading trail. Brightness = how consistent, hue = direction (wheel), however slow. Hover a cell for its speed.',
+  drift: 'Steadiness: how evenly each cell’s own value turns from frame to frame. Cells that look like static but are really spinning at a fixed rate light up; truly incoherent cells stay dark. Hue = turn per frame (red ≈ barely turning).',
+};
+
+let expMemo = { key: '', text: '' };
+function syncUI() {
+  const active = document.activeElement;
+  const put = (id, v) => { const el = $(id); if (el !== active) el.value = v; };
+  const f = frame, mu = curMu();
+  const list = currentList();
+  put('m', fmtMu(mu));
+  $('mSlider').max = list.length - 1;
+  put('mSlider', nearestIndex(list, S.m));
+  const fac = factorP(mu.P), maxF = Math.max(0, ...fac.factors.map(([p]) => p));
+  const N = f ? f.N : rowsFor(S, mu);
+  const noZeros = fac.rest > 1n || maxF >= N;
+  const dP = describeP(mu.P);
+  $('mInfo').textContent = (mu.Q === 1n ? (dP === 'prime' ? `${mu.P} is prime` : `${mu.P} = ${dP}`)
+    : `μ = ${bigShort(mu.P)} / ${bigShort(mu.Q)}; P ${dP === 'prime' ? 'is prime' : '= ' + dP}`)
+    + (noZeros ? `. No zeros in these rows: P has a prime factor ≥ ${N}, and no prime above n divides C(n,k).` : '');
+  put('visit', S.visit);
+  $('stepRow').hidden = S.visit !== 'step';
+  put('step', S.step);
+  put('fine', S.fine);
+  $('fineOut').textContent = S.fine ? `step 10${sup(S.fine).replace(/^/, '⁻')}` : 'whole moduli';
+  $('visitNote').textContent = SEQUENCES.find((q) => q.id === S.visit).note;
+  $('fineNote').textContent = S.fine
+    ? `Exact at any depth: μ = P/Q and C mod μ = (Q·C mod P)/Q, computed in whole numbers (multi-word past 2⁵²). A cell turns by about C(n,k)·10⁻ᵈ/μ² per step, so each decimal moves the smoothly-gliding band about 3.3 rows deeper: shallower rows barely move, deeper rows read as static.`
+    : '';
+
+  put('from', S.from); put('to', S.to);
+  $('play').textContent = playing ? 'Pause' : 'Play';
+  $('dir').textContent = S.dir > 0 ? 'forward →' : '← reverse';
+  $('loop').checked = S.loop;
+  put('speed', S.speed);
+  $('speedOut').textContent = `${S.speed} ms`;
+  if (!playing) {
+    const nf = rangeFrames();
+    $('sweepNote').textContent = nf ? `${countStr(nf)} frames in range.` : 'No moduli of this kind in the range.';
+  }
+
+  put('motion', S.motion);
+  $('motionCtl').hidden = S.motion === 'off';
+  put('tau', S.tau); put('trail', S.trail); put('pool', S.pool);
+  put('gain', S.gain); $('gainOut').textContent = `×${(S.gain / 4).toFixed(2)}`;
+  put('img', S.img); $('imgOut').textContent = `${S.img}%`;
+  $('motionNote').textContent = MOTION_NOTES[S.motion];
+  const mi = f && f.motionInfo;
+  $('motionOut').textContent = mi && !mi.tooBig ? `${mi.frames} frames of evidence` : '';
+  $('motionWarn').textContent = S.motion === 'off' ? ''
+    : mi && mi.tooBig ? 'Too many cells for motion detection here (1.2M max): reduce rows.'
+    : mi && mi.frames < 3 ? 'Needs frames: press Play or step with ← →.' : '';
+
+  const rows = rowsFor(S, mu);
+  put('rows', rows); put('rowsSlider', rows);
+  $('rows').disabled = $('rowsSlider').disabled = S.link;
+  $('link').checked = S.link;
+  put('first', S.first);
+
+  const lens = LENS[S.lens];
+  put('lens', S.lens);
+  const primes = fac.factors.map((x) => x[0]);
+  const p = f ? f.p : primes[0];
+  $('pRow').hidden = !lens.usesP || primes.length < 2;
+  if ($('p').dataset.P !== mu.key) { fill($('p'), primes.map((q) => [q, String(q)])); $('p').dataset.P = mu.key; }
+  if (p) put('p', p);
+  $('LRow').hidden = lens.param !== 'L'; put('L', S.L);
+  $('JRow').hidden = lens.param !== 'J'; put('J', S.J);
+  $('qshowRow').hidden = lens.param !== 'qshow'; put('qshow', S.qshow);
+  $('wshowRow').hidden = lens.param !== 'wshow'; put('wshow', S.wshow);
+  $('stripeCtl').hidden = lens.param !== 'stripes';
+  put('stol', S.stripeTol); put('srun', S.stripeRun); put('scolor', S.stripeColor); $('strack').checked = S.stripeTrack;
+  $('stripeOut').textContent = S.lens === 'stripes' && S.stripeTrack ? trackerSummary() : '';
+  $('censusRow').hidden = S.lens !== 'census';
+  $('censusOut').textContent = `${liveCensus.count} moduli tallied`;
+  $('lensNote').textContent = lens.note + (lens.usesP && primes.length === 1 ? ` Here p = ${p}.` : '');
+  let warn = '';
+  if (f && f.out.unavailable) warn = f.out.unavailable;
+  else if (S.lens === 'lucas' && f && p && p ** S.L >= f.N) warn = `${p}^${S.L} ≥ the row count, so this factor is C(0,0) = 1 everywhere.`;
+  else if (lens.sweep && !playing && liveCensus.count < 2) warn = 'Needs a sweep: press Play.';
+  if (f && f.limited) warn = (warn ? warn + ' ' : '') + `At ${S.fine} decimals the residues take ${limbsFor(mu.P)} words each, so rows are limited to ${f.N - f.r0}.`;
+  $('lensWarn').textContent = warn;
+
+  put('iso', S.iso);
+  put('scheme', S.scheme);
+  put('viewMode', S.view);
+  $('elevRow').hidden = S.view !== 'relief';
+  put('elev', S.elev);
+  $('elevOut').textContent = `${S.elev}%`;
+  $('nums').checked = S.nums;
+  put('scale', S.scale);
+
+  if (!exporting && !playing) {
+    const key = [S.visit, S.from, S.to, S.step, S.fine, S.rows, S.link, S.first, S.view, S.elev, S.scale, S.lens].join('|');
+    if (expMemo.key !== key) {
+      const { a, i0, i1 } = rangeIdx(), nf = rangeFrames();
+      let w = 0, h = 0;
+      for (let i = i0; i <= i1; i++) { const d = exportDims(S, { floor: a[i], P: BigInt(a[i]) }, S.scale); w = Math.max(w, d.w); h = Math.max(h, d.h); }
+      const d = exportDims(S, mu, S.scale);
+      expMemo = { key, text: `PNG: ${d.w}×${d.h}px. Sweep: ${countStr(nf)} frames at ${w}×${h}px${nf > BigInt(EXPORT_CAP) ? ` — over the ${EXPORT_CAP} limit` : ''}.` };
+    }
+    $('expNote').textContent = expMemo.text;
+  }
+
+  if (f) {
+    $('status').textContent = [
+      f.mu.Q === 1n ? `m = ${f.mu.P}` : `μ = ${fmtShort(f.mu)}`,
+      `rows ${f.r0}–${f.N - 1}`,
+      `${(f.total - f.base0).toLocaleString()} cells`,
+      f.sc ? (f.sc.kind === 'limbs' ? `${f.sc.k}-word residues` : null) : null,
+      f.distinct === null ? null : `${f.distinct.toLocaleString()} of ${f.sc.p.toLocaleString()} residues`,
+      `${f.ms.toFixed(1)} ms`,
+    ].filter(Boolean).join('  ·  ');
+  }
+}
+
+// Bind a numeric field: commit on change (Enter or blur), clamped.
+function bindNum(id, key, lo, hi, after) {
+  $(id).addEventListener('change', (e) => {
+    const v = parseInt(e.target.value, 10);
+    if (Number.isFinite(v)) S[key] = clamp(v, lo, hi);
+    if (after) after(); else invalidate();
+    syncUI();
+  });
+}
+$('m').addEventListener('change', (e) => { setMuText(e.target.value); syncUI(); });
+$('m').addEventListener('keydown', (e) => { if (e.key === 'Enter') e.target.blur(); });
+$('mSlider').addEventListener('input', (e) => { stop(); setPos(currentList()[+e.target.value], 0n); });
+$('mPrev').onclick = () => stepBy(-1);
+$('mNext').onclick = () => stepBy(1);
+$('visit').onchange = (e) => { S.visit = e.target.value; setM(S.m); };
+bindNum('step', 'step', 1, 10000, () => setM(S.m));
+$('fine').addEventListener('change', (e) => { const v = parseInt(e.target.value, 10); if (Number.isFinite(v)) setFine(v); syncUI(); });
+bindNum('from', 'from', 2, MOD_CAP, () => setM(S.m));
+bindNum('to', 'to', 2, MOD_CAP);
+$('play').onclick = togglePlay;
+$('dir').onclick = () => { S.dir = -S.dir; syncUI(); };
+$('toStart').onclick = () => { stop(); const { a, i0, i1 } = rangeIdx(); if (i0 <= i1) setPos(a[S.dir > 0 ? i0 : i1], 0n); };
+$('loop').onchange = (e) => { S.loop = e.target.checked; };
+$('speed').addEventListener('input', (e) => { S.speed = +e.target.value; syncUI(); });
+
+$('motion').onchange = (e) => { S.motion = e.target.value; invalidate(); };
+bindNum('tau', 'tau', 2, 64);
+bindNum('trail', 'trail', 0, 240);
+bindNum('pool', 'pool', 0, 4);
+$('gain').addEventListener('input', (e) => { S.gain = +e.target.value; invalidate(); });
+$('img').addEventListener('input', (e) => { S.img = +e.target.value; invalidate(); });
+$('motionReset').onclick = () => { liveMotion = newMotion(); invalidate(); };
+
+bindNum('rows', 'rows', 2, MAX_ROWS);
+$('rowsSlider').addEventListener('input', (e) => setRows(+e.target.value));
+$('link').onchange = (e) => { S.link = e.target.checked; if (!S.link) S.rows = rowsFor({ ...S, link: true }, curMu()); invalidate(); };
+bindNum('first', 'first', 0, ROW_CAP - 2);
+
+$('lens').onchange = (e) => { S.lens = e.target.value; invalidate(); };
+$('p').onchange = (e) => { S.pPref = +e.target.value; invalidate(); };
+bindNum('L', 'L', 0, 12);
+bindNum('J', 'J', 0, 12);
+$('qshow').onchange = (e) => { S.qshow = e.target.value; invalidate(); };
+$('wshow').onchange = (e) => { S.wshow = e.target.value; invalidate(); };
+bindNum('stol', 'stripeTol', 1, 20);
+bindNum('srun', 'stripeRun', 2, 12);
+$('scolor').onchange = (e) => { S.stripeColor = e.target.value; invalidate(); };
+$('strack').onchange = (e) => { S.stripeTrack = e.target.checked; tracker = newTracker(); invalidate(); };
+$('strackReset').onclick = () => { tracker = newTracker(); invalidate(); };
+$('censusReset').onclick = () => { liveCensus = newCensus(); invalidate(); };
+
+$('iso').addEventListener('input', (e) => { S.iso = e.target.value; invalidate(); });
+$('isoClear').onclick = () => { S.iso = ''; $('iso').value = ''; invalidate(); };
+$('scheme').onchange = (e) => { S.scheme = e.target.value; invalidate(); };
+$('viewMode').onchange = (e) => { S.view = e.target.value; if (S.view !== 'flat') setHover(null); invalidate(); };
+$('elev').addEventListener('input', (e) => { S.elev = +e.target.value; invalidate(); });
+$('nums').onchange = (e) => { S.nums = e.target.checked; requestDraw(); };
+$('example').onchange = (e) => {
+  const ex = EXAMPLES[+e.target.value];
+  e.target.value = '';
+  if (!ex) return;
+  stop();
+  Object.assign(S, DEFAULTS, { scale: S.scale }, ex.set);
+  S.m = snapM(S.m);
+  liveCensus = newCensus();
+  liveMotion = newMotion();
+  tracker = newTracker();
+  autoFit = true;
+  setHover(null);
+  invalidate();
+};
+bindNum('scale', 'scale', 1, 12, () => syncUI());
+$('savePng').onclick = savePng;
+$('saveZip').onclick = exportSweep;
+
+// ---- canvas interaction ----
+let drag = null;
+const local = (e) => { const r = canvas.getBoundingClientRect(); return [e.clientX - r.left, e.clientY - r.top]; };
+function zoomAt(px, py, factor) {
+  const s = clamp(view.s * factor, 1e-4, 400);
+  factor = s / view.s;
+  view.x = px - (px - view.x) * factor;
+  view.y = py - (py - view.y) * factor;
+  view.s = s;
+  autoFit = false;
+  requestDraw();
+}
+canvas.addEventListener('pointerdown', (e) => {
+  canvas.setPointerCapture(e.pointerId);
+  const [x, y] = local(e);
+  drag = { x, y, vx: view.x, vy: view.y, moved: false };
+});
+canvas.addEventListener('pointermove', (e) => {
+  const [x, y] = local(e);
+  if (drag) {
+    if (Math.abs(x - drag.x) + Math.abs(y - drag.y) > 4) drag.moved = true;
+    if (drag.moved) { view.x = drag.vx + x - drag.x; view.y = drag.vy + y - drag.y; autoFit = false; requestDraw(); }
+    return;
+  }
+  if (e.pointerType === 'mouse') setHover(cellAt(x, y));
+});
+canvas.addEventListener('pointerup', (e) => {
+  const [x, y] = local(e);
+  if (drag && !drag.moved) setHover(cellAt(x, y));
+  drag = null;
+});
+canvas.addEventListener('pointerleave', (e) => { if (e.pointerType === 'mouse' && !drag) setHover(null); });
+canvas.addEventListener('wheel', (e) => { e.preventDefault(); const [x, y] = local(e); zoomAt(x, y, Math.exp(-e.deltaY * 0.0015)); }, { passive: false });
+canvas.addEventListener('dblclick', () => { fit(); requestDraw(); });
+$('zoomIn').onclick = () => zoomAt(cw / 2, ch / 2, 1.4);
+$('zoomOut').onclick = () => zoomAt(cw / 2, ch / 2, 1 / 1.4);
+$('fitBtn').onclick = () => { fit(); requestDraw(); };
+
+addEventListener('keydown', (e) => {
+  const t = e.target;
+  if (t.closest && t.closest('input, select, textarea')) return;
+  if (e.key === ' ' && t.tagName === 'BUTTON') return;
+  const big = e.shiftKey ? 10 : 1;
+  switch (e.key) {
+    case 'ArrowRight': stepBy(big); break;
+    case 'ArrowLeft': stepBy(-big); break;
+    case 'PageUp': stepWhole(big); break;
+    case 'PageDown': stepWhole(-big); break;
+    case 'ArrowUp': setRows(rowsFor(S, curMu()) + big); break;
+    case 'ArrowDown': setRows(rowsFor(S, curMu()) - big); break;
+    case ' ': togglePlay(); break;
+    case 'f': case 'F': fit(); requestDraw(); break;
+    default: return;
+  }
+  e.preventDefault();
+});
+
+new ResizeObserver(() => {
+  const r = canvas.getBoundingClientRect(), dpr = window.devicePixelRatio || 1;
+  cw = Math.max(1, r.width); ch = Math.max(1, r.height);
+  canvas.width = Math.round(cw * dpr); canvas.height = Math.round(ch * dpr);
+  if (autoFit) fit();
+  requestDraw();
+}).observe(canvas);
+
+S.m = snapM(S.m);
+invalidate();
+</script>
+</body>
+</html>
