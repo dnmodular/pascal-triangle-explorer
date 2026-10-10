@@ -171,27 +171,49 @@ pub fn residue_level(r: u32, m: u32, spectral: bool) -> u8 {
     2 + js_round(253.0 * t.clamp(0.0, 1.0)) as u8
 }
 
-/// Palette positions a color offset rotates: levels 2..=255 (0 is the void of a zero
-/// residue and 1 the white of residue 1 in spectral; both stay put).
-pub const RAMP_LEVELS: u32 = 254;
-
-/// The level shift for a fractional color offset (the square scanner's "fractional
-/// offset": colors move by `offset` of the ramp, wrapping around), in 0..RAMP_LEVELS.
-pub fn offset_shift(offset: f32) -> u32 {
-    if !offset.is_finite() {
-        return 0;
+/// The color offset (the square scanner's "fractional offset") as a map of palette
+/// levels: `map[level]` is the level painted instead. The colored levels 2..=255 slide
+/// along the ramp cyclically. The period is one residue step longer than the ramp, so
+/// the residues keep their spacing and wrap one at a time, as the scanner's
+/// frac(r/m + offset) does: an offset of k/m (non-spectral) or k/(m − 2) (spectral)
+/// moves every residue k steps (to within one of the 254 levels: the map works on the
+/// levels, which are already rounded). A single colored residue (m = 2, or spectral
+/// m = 3) bounces between the ends instead. Level 0 (zero's void) and 1 (spectral's
+/// white) stay put. Offset 0 is the identity.
+pub fn level_map(m: u32, spectral: bool, offset: f32) -> [u8; 256] {
+    let mut map = [0u8; 256];
+    for (i, v) in map.iter_mut().enumerate() {
+        *v = i as u8;
     }
-    let s = (offset.rem_euclid(1.0) * RAMP_LEVELS as f32).round() as u32;
-    s % RAMP_LEVELS
+    let o = if offset.is_finite() { offset.rem_euclid(1.0) as f64 } else { 0.0 };
+    // colored residues and their spacing on the ramp (see residue_level): non-spectral
+    // puts 1..m−1 at r/(m−1), leaving the slot at 0 to the void; spectral spreads 2..m−1
+    // over the whole ramp
+    let (count, step) = if spectral { (m.saturating_sub(2), 1.0 / m.saturating_sub(3).max(1) as f64) } else { (m.saturating_sub(1), 1.0 / m.saturating_sub(1).max(1) as f64) };
+    if o == 0.0 || o >= 1.0 || count == 0 {
+        return map;
+    }
+    for (lvl, v) in map.iter_mut().enumerate().skip(2) {
+        let t = (lvl - 2) as f64 / 253.0;
+        let t2 = if count == 1 {
+            let x = (t + 2.0 * o).rem_euclid(2.0);
+            if x > 1.0 { 2.0 - x } else { x }
+        } else {
+            let period = 1.0 + step;
+            (t + o * period).rem_euclid(period).min(1.0)
+        };
+        *v = 2 + js_round(253.0 * t2.clamp(0.0, 1.0)) as u8;
+    }
+    map
 }
 
-/// `level` moved `shift` positions along the ramp, wrapping (levels 0 and 1 are fixed).
-/// The WGSL `shift_level` is the same function.
-pub fn shift_level(level: u8, shift: u32) -> u8 {
-    if level < 2 {
-        return level;
+/// The level map packed four per u32, as the GPU reads it after the palette words.
+pub fn level_map_words(map: &[u8; 256]) -> [u32; 64] {
+    let mut w = [0u32; 64];
+    for (i, &l) in map.iter().enumerate() {
+        w[i / 4] |= (l as u32) << (8 * (i % 4));
     }
-    (2 + (level as u32 - 2 + shift) % RAMP_LEVELS) as u8
+    w
 }
 
 /// Level of every residue `0..m`, packed four per u32 for the GPU.
@@ -275,12 +297,17 @@ impl Palette {
 
     /// Color of residue `r` under modulus `m` (what the residue layer paints).
     pub fn residue_color(&self, r: u32, m: u32) -> [u8; 3] {
-        self.residue_color_shifted(r, m, 0)
+        self.res[residue_level(r, m, self.scheme == Scheme::Spectral) as usize]
     }
 
-    /// The same with the color offset's level shift (see [`offset_shift`]).
-    pub fn residue_color_shifted(&self, r: u32, m: u32, shift: u32) -> [u8; 3] {
-        self.res[shift_level(residue_level(r, m, self.scheme == Scheme::Spectral), shift) as usize]
+    /// The same through a color offset's [`level_map`].
+    pub fn residue_color_mapped(&self, r: u32, m: u32, map: &[u8; 256]) -> [u8; 3] {
+        self.res[map[residue_level(r, m, self.scheme == Scheme::Spectral) as usize] as usize]
+    }
+
+    /// The level map of `offset` for this palette and modulus `m`.
+    pub fn level_map(&self, m: u32, offset: f32) -> [u8; 256] {
+        level_map(m, self.scheme == Scheme::Spectral, offset)
     }
 
     /// The glow color around zero cells: the ramp at 0.8, as the square scanner's
@@ -334,25 +361,47 @@ mod tests {
         assert_eq!(ramp_rgb(Scheme::Moss, 1.0 / 3.0), [46, 88, 57]);
         // its paletteColor(.8) for ember: 0.8·3 = 2.4 → 0.4 of the way from stop 2 to 3
         assert_eq!(Palette::new(Scheme::Ember).glow_color(), [255, 157, 106]);
-        // offsets rotate levels 2..=255 and leave void / white alone
-        assert_eq!(offset_shift(0.0), 0);
-        assert_eq!(offset_shift(1.0), 0);
-        assert_eq!(offset_shift(0.5), 127);
-        assert_eq!(offset_shift(-0.25), offset_shift(0.75));
-        assert_eq!(offset_shift(f32::NAN), 0);
-        for sh in [0u32, 1, 127, 253] {
-            assert_eq!(shift_level(0, sh), 0);
-            assert_eq!(shift_level(1, sh), 1);
-            for lv in 2..=255u8 {
-                let s = shift_level(lv, sh);
-                assert!(s >= 2);
-                assert_eq!(shift_level(s, RAMP_LEVELS - sh), lv, "inverse shift");
+        // offset 0 is the identity; void and white never move
+        let id: Vec<u8> = (0..=255).collect();
+        for (m, sp) in [(2u32, false), (7, false), (7, true), (1000, true), (3, true), (2, true)] {
+            assert_eq!(level_map(m, sp, 0.0).to_vec(), id);
+            assert_eq!(level_map(m, sp, 1.0).to_vec(), id, "a whole turn");
+            assert_eq!(level_map(m, sp, f32::NAN).to_vec(), id);
+            for o in [0.003f32, 0.3, -0.4, 0.999] {
+                let map = level_map(m, sp, o);
+                assert_eq!((map[0], map[1]), (0, 1));
+                assert!(map[2..].iter().all(|&l| l >= 2));
             }
         }
-        assert_eq!(shift_level(255, 1), 2, "wraps");
+        // a small nudge moves the top residue a little, never wraps it to the bottom
+        let top = residue_level(1, 2, false); // m = 2: residue 1 is the brightest level
+        assert_eq!(top, 255);
+        assert!(level_map(2, false, 0.005)[255] > 240);
+        let r6 = residue_level(6, 7, false);
+        assert!(level_map(7, false, 0.005)[r6 as usize] >= 250);
+        // steps of 1/m move every non-spectral residue one slot (mod 7: slots r/6)
+        let near = |a: u8, b: u8| a.abs_diff(b) <= 1;
+        let map = level_map(7, false, 1.0 / 7.0);
+        for r in 1..6u32 {
+            let (got, want) = (map[residue_level(r, 7, false) as usize], residue_level(r + 1, 7, false));
+            assert!(near(got, want), "r = {r}: {got} vs {want}");
+        }
+        assert!(map[residue_level(6, 7, false) as usize] <= 3, "the top residue wraps to the void's slot");
+        // spectral: residues 2..m−1, steps of 1/(m − 2)
+        let map = level_map(7, true, 1.0 / 5.0);
+        for r in 2..6u32 {
+            let (got, want) = (map[residue_level(r, 7, true) as usize], residue_level(r + 1, 7, true));
+            assert!(near(got, want), "r = {r}: {got} vs {want}");
+        }
+        assert!(near(map[residue_level(6, 7, true) as usize], residue_level(2, 7, true)));
+        // the packed words read back
+        let w = level_map_words(&map);
+        for (i, &l) in map.iter().enumerate() {
+            assert_eq!(((w[i / 4] >> (8 * (i % 4))) & 255) as u8, l);
+        }
         let p = Palette::new(Scheme::Spectral);
-        assert_eq!(p.residue_color_shifted(3, 7, 0), p.residue_color(3, 7));
-        assert_eq!(p.residue_color_shifted(0, 7, 99), BG);
+        assert_eq!(p.residue_color_mapped(3, 7, &p.level_map(7, 0.0)), p.residue_color(3, 7));
+        assert_eq!(p.residue_color_mapped(0, 7, &p.level_map(7, 0.4)), BG);
     }
 
     #[test]

@@ -107,23 +107,35 @@ them.
 `reference/ChatGPT-version-pascal-square-scanner` is a small canvas page ("Pascal ·
 Square Scanner"). These of its features earned a place here:
 
-* **Color offset** (its "fractional offset"): residue colors move that fraction
-  along the palette, wrapping around; the void of 0 and spectral's white 1 stay. It
-  applies to the residue coloring and PALETTE BLEND, on the GPU, so exports carry it.
-* **Cell outlines**: the scanner's faint `rgba(235, 238, 250, .12)` outline around
-  every cell (zeros included), a 1 px line between neighbours.
-* **Zero glow** (its glow on residue-0 cells): a halo in the palette's 0.8 color
-  spills from each zero cell onto its six lattice neighbours, out to min(10 px,
-  0.8 cell) — the outline of every void lights up. A zero cell itself stays dark.
+* **Color offset** (its "fractional offset", −1..1): residue colors slide along
+  the palette, cyclically, keeping their spacing — a step of 1/m moves every residue
+  one slot, as the scanner's frac(r/m + offset) does, and the top residue waits one
+  slot before it wraps to the bottom. Unlike the scanner, the void of 0 and
+  spectral's white 1 stay put: zeros are the structure everything here is about (with
+  nothing else on the ramp, spectral m = 2 has nothing to move). A single colored
+  residue (m = 2) bounces between the ramp's ends. It applies to the residue coloring
+  and PALETTE BLEND, on the GPU, so exports carry it.
+* **Cell outlines**: the scanner's faint `rgba(235, 238, 250, .12)` outline, as a
+  1 px line centred on every cell boundary (zeros included), drawn by coverage so its
+  width does not depend on where the boundary falls between pixels.
+* **Zero glow** (its glow on residue-0 cells): light in the palette's 0.8 color
+  spreads from every zero cell over its neighbours out to min(10 px, 0.8 cell), as the
+  scanner's `shadowBlur`. Zero cells receive it from neighbouring zeros too, so a void
+  shows a lit lattice, and the light is screen-blended, so it only ever brightens.
+  Zeros just off the canvas still cast it (their residues come from the closed form).
 * Outlines and glow are drawn by the resolve pass, so exports include them; they
-  fade in as cells grow from 3 to 6 px and vanish when zoomed out.
+  fade in as cells grow from 3 to 6 px and vanish when zoomed out. Both start off, so
+  the default view stays identical to `pascal-core.html`.
 * **Palettes** Ember, Ocean and Moss (its four-stop gradients).
 * **Examples**: one click to m = 2, 3, 5 (80 rows) or 11 (64 rows), as its presets.
 * **SVG export** (its "Save SVG"): rows 0..R−1 (the rows setting, up to 1024) as
-  vector cells — one path per color — for the residue, mask and valuation
-  colorings, which the CPU reproduces exactly (verified against the GPU); with
-  outlines if they are on. The glow is a raster effect and stays out.
-* **Reset**: every setting back to its default.
+  vector cells — one path per color, and with outlines on, one stroked path over all
+  cells — for the residue, mask and valuation colorings, which the CPU reproduces.
+  From the window the valuation is normalized by the max ν of the cells in view, so
+  the file matches the screen pixel for pixel (verified against the GPU on a fitted
+  view); `--svg` on its own normalizes over the exported rows. The glow is a raster
+  effect and stays out.
+* **Reset**: every setting back to the app's defaults (outlines and glow off).
 
 Left out: its BigInt coefficients (the closed form here is exact at any row), the
 square-cell geometry and cell-scale slider (cells here keep the √3/2 lattice the
@@ -346,9 +358,12 @@ Verified (by `cargo test` on Mesa lavapipe, and by the headless export):
   pinning, corners (the inspector moves out of the box's way), resizes, deep rows
   with their k window.
 * Square-scanner features: the resolve pass's color offset, outlines and zero
-  glow equal a CPU twin within one level on ~400k pixels (spectral and ember, m = 4
-  and 7, each feature alone and all together) and vanish on 2 px cells; the SVG
-  export's colors equal the GPU's for the residue, mask and valuation colorings.
+  glow equal an independent CPU twin (distances to the view's own cell rectangles)
+  within one level on ~1.9M pixels — spectral and ember, m = 2, 3, 7, each feature
+  alone and all together, with the apex in view, the triangle crossing the left edge
+  and the top edge inside row 30 — and vanish on 2 px cells; the SVG export's colors
+  equal the GPU's for the residue, mask and valuation colorings on a fitted m = 3
+  view whose rows past the export raise the max ν.
 * The app is idle when nothing moves (with the wave's drift at 0), and a redraw
   that changes no GPU input skips the triangle's passes; after a tween the canvas
   equals a fresh render pixel for pixel. The on-screen canvas equals the exported

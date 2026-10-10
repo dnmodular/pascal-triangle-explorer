@@ -47,6 +47,9 @@ struct Model {
     export_dir: String,
     export_note: String,
     pending_export: bool,
+    /// Save SVG was clicked: rows to write once the frame has rendered (the valuation
+    /// coloring reads the frame's max ν back).
+    pending_svg: Option<u32>,
     hover: Option<(u32, u32)>,
     /// The row under the pointer, inside the triangle or beside it.
     hover_row: Option<u32>,
@@ -87,6 +90,7 @@ impl Model {
             export_dir: std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_else(|_| ".".into()),
             export_note: String::new(),
             pending_export: false,
+            pending_svg: None,
             hover: None,
             hover_row: None,
             sweep: Sweep::default(),
@@ -316,7 +320,8 @@ fn main() {
             }
             "--export" => export = Some(PathBuf::from(next())),
             "--svg" => svg = Some(PathBuf::from(next())),
-            "--offset" => model.style.offset = next().parse().unwrap_or(0.0),
+            // as the panel's control: −1..1
+            "--offset" => model.style.offset = next().parse::<f32>().ok().filter(|v| v.is_finite()).unwrap_or(0.0).clamp(-1.0, 1.0),
             "--outlines" | "--glow" => {
                 if args[i] == "--outlines" {
                     model.style.outlines = true;
@@ -349,7 +354,8 @@ fn main() {
     }
     if let Some(path) = svg {
         let rows = model.fit_rows.round().clamp(1.0, export::SVG_MAX_ROWS as f64) as u32;
-        let Some(colors) = export::preset_colors(rows, &model.modulus, &model.palette, &model.layers, &model.style) else {
+        // headless: the valuation is normalized over the exported rows
+        let Some(colors) = export::preset_colors(rows, &model.modulus, &model.palette, &model.layers, &model.style, None) else {
             eprintln!("--svg draws the residue, mask and valuation colorings only");
             std::process::exit(2);
         };
@@ -428,8 +434,9 @@ fn check_shaders() {
 }
 
 /// Write rows `0..rows` as an SVG into the export folder; returns the note to show.
-fn save_svg(model: &Model, rows: u32) -> String {
-    let Some(colors) = export::preset_colors(rows, &model.modulus, &model.palette, &model.layers, &model.style) else {
+/// `valuation_max` is the live view's max ν, so the valuation colors match the screen.
+fn save_svg(model: &Model, rows: u32, valuation_max: Option<f32>) -> String {
+    let Some(colors) = export::preset_colors(rows, &model.modulus, &model.palette, &model.layers, &model.style, valuation_max) else {
         return "SVG export draws the residue, mask and valuation colorings only.".into();
     };
     let dir = PathBuf::from(model.export_dir.trim());
@@ -742,6 +749,12 @@ impl App {
             gfx.window.request_redraw();
         }
 
+        if let Some(rows) = model.pending_svg.take() {
+            let vmax = (model.layers.preset() == Some(Preset::Valuation)).then(|| gfx.renderer.read_max()[0]);
+            model.export_note = save_svg(model, rows, vmax);
+            gfx.window.request_redraw();
+        }
+
         self.frame_ms = t0.elapsed().as_secs_f32() * 1000.0;
         let delay = viewport_output.get(&egui::ViewportId::ROOT).map(|v| v.repaint_delay).unwrap_or(std::time::Duration::MAX);
         self.continuous = delay.is_zero() || model.sweep.playing || self.tween_t0.is_some() || !self.canvas_current || model.wave.is_animating();
@@ -1029,7 +1042,7 @@ fn panel_ui(ui: &mut egui::Ui, model: &mut Model, canvas_px: (u32, u32), _frame_
             let svg_ok = rows <= export::SVG_MAX_ROWS && model.layers.preset().is_some();
             let tip = format!("Rows 0–{} as vector cells (residue, mask and valuation colorings, up to {} rows; outlines included, glow not)", rows - 1, export::SVG_MAX_ROWS);
             if ui.add_enabled(svg_ok, egui::Button::new("Save SVG")).on_hover_text(tip).on_disabled_hover_text(format!("SVG export draws the residue, mask and valuation colorings of up to {} rows", export::SVG_MAX_ROWS)).clicked() {
-                model.export_note = save_svg(model, rows);
+                model.pending_svg = Some(rows);
             }
         });
         ui.horizontal(|ui| {
@@ -1354,6 +1367,7 @@ fn canvas_overlays(ui: &mut egui::Ui, model: &mut Model, rect: Rect, ppp: f32, g
         if let Some((n_lo, n_hi)) = model.view.visible_rows(ch) {
             let font = FontId::monospace(((model.view.ppc * 0.34).min(model.view.ppc * ROW_H * 0.55) / ppp as f64) as f32);
             let x1 = model.view.x0 + cw / model.view.ppc;
+            let level_map = model.palette.level_map(model.m, model.style.offset);
             for n in n_lo..=n_hi {
                 let k_lo = (model.view.x0 + n as f64 / 2.0 - 0.5).ceil().max(0.0) as i64;
                 let k_hi = (x1 + n as f64 / 2.0 + 0.5).floor().min(n as f64) as i64;
@@ -1362,7 +1376,7 @@ fn canvas_overlays(ui: &mut egui::Ui, model: &mut Model, rect: Rect, ppp: f32, g
                     let Some(text) = model.cell_value(n, k) else { break };
                     let r = model.modulus.binom(n, k);
                     let (rgb, show) = match model.layers.preset() {
-                        Some(Preset::Residue) => (model.palette.residue_color_shifted(r, model.m, pascal::palette::offset_shift(model.style.offset)), r != 0),
+                        Some(Preset::Residue) => (model.palette.residue_color_mapped(r, model.m, &level_map), r != 0),
                         Some(Preset::Mask) => (pascal::palette::LIGHT, r != 0),
                         Some(Preset::Valuation) => {
                             let nu = math::carries(n, k, model.modulus.p) as f64;

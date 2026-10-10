@@ -90,7 +90,7 @@ pub struct GpuParams {
     pub field_active: u32,
     pub field_stride: u32,
     pub signed_mask: u32,
-    pub res_shift: u32,
+    pub pad_d: u32,
     pub style_flags: u32,
     pub glow_rgb: u32,
     pub pad_e: u32,
@@ -669,6 +669,7 @@ pub struct Renderer {
     hist_len: u32,
     adapt_valid: bool,
     uploaded_m: Option<(u32, bool)>,
+    uploaded_level_map: Option<[u8; 256]>,
     uploaded_scheme: Option<Scheme>,
     modulus_data: Option<ModulusGpuData>,
     pass_params: Vec<PassParams>,
@@ -793,7 +794,8 @@ impl Renderer {
         let pass_buf = buffer(&device, "pass params", PASS_STRIDE * MAX_PASSES, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST);
         let tables_buf = buffer(&device, "tables", 1024, STORAGE_RW);
         let levels_buf = buffer(&device, "levels", 1024, STORAGE_RW);
-        let palette_buf = buffer(&device, "palette", 4096, STORAGE_RW);
+        // 1024 palette words, then the color offset's level map (64 words)
+        let palette_buf = buffer(&device, "palette", 4096 + 256, STORAGE_RW);
         let maxbuf = buffer(&device, "maxbuf", MAXBUF_LEN * 4, STORAGE_RW);
         let cells_buf = buffer(&device, "cells", 1024, STORAGE_RW);
         let fields_buf = buffer(&device, "fields", 1024, STORAGE_RW);
@@ -858,6 +860,7 @@ impl Renderer {
             hist_len: 0,
             adapt_valid: false,
             uploaded_m: None,
+            uploaded_level_map: None,
             uploaded_scheme: None,
             modulus_data: None,
             pass_params: Vec::new(),
@@ -1024,6 +1027,15 @@ impl Renderer {
         self.uploaded_scheme = Some(pal.scheme);
     }
 
+    /// The color offset's level map, after the palette words (see `palette::level_map`).
+    fn ensure_level_map(&mut self, map: [u8; 256]) {
+        if self.uploaded_level_map == Some(map) {
+            return;
+        }
+        self.queue.write_buffer(&self.palette_buf, 4096, bytemuck::cast_slice(&crate::palette::level_map_words(&map)));
+        self.uploaded_level_map = Some(map);
+    }
+
     /// Forget frame history (temporal average, afterimage adaptation).
     pub fn reset_history(&mut self) {
         self.hist_len = 0;
@@ -1134,6 +1146,7 @@ impl Renderer {
         self.ensure_grid(&input.grid, work_elem);
         self.ensure_modulus(input.modulus, input.palette.scheme == Scheme::Spectral);
         self.ensure_palette(input.palette);
+        self.ensure_level_map(input.palette.level_map(input.modulus.m, input.style.offset));
         self.pass_params.clear();
 
         let n_measures = plan.measures.len().min(MAX_MEASURE_SLOTS as usize) as u32;
@@ -1167,7 +1180,6 @@ impl Renderer {
             field_active: plan.field_active as u32,
             field_stride: self.stride,
             signed_mask: plan.measures.iter().take(n_measures as usize).enumerate().fold(0u32, |acc, (i, d)| acc | ((d.signed as u32) << i)),
-            res_shift: crate::palette::offset_shift(input.style.offset),
             style_flags: (input.style.outlines as u32 * STYLE_OUTLINES) | (input.style.glow as u32 * STYLE_GLOW),
             glow_rgb: {
                 let [r, g, b] = input.palette.glow_color();

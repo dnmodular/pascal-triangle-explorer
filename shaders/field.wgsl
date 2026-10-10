@@ -252,7 +252,7 @@ fn sample_color(px: f32, py: f32) -> vec3<f32> {
     col = unpack_rgb(palette[shift_level(level_of(c.x))]);
   }
   if (P.style_flags != 0u) {
-    col = decorate(col, px, py, t, c.x);
+    col = decorate(col, px, py, t);
   }
   return col;
 }
@@ -265,7 +265,6 @@ fn sample_color(px: f32, py: f32) -> vec3<f32> {
 // ---------------------------------------------------------------------------
 const OUTLINE_RGB: vec3<f32> = vec3<f32>(235.0 / 255.0, 238.0 / 255.0, 250.0 / 255.0);
 const OUTLINE_ALPHA: f32 = 0.12;  // the square scanner's rgba(235, 238, 250, .12)
-const OUTLINE_HALF_PX: f32 = 0.5; // each cell draws half of a 1 px line
 const GLOW_MAX_PX: f32 = 10.0;    // its shadowBlur = min(10, 0.8 · cell)
 const GLOW_STRENGTH: f32 = 0.55;
 
@@ -284,48 +283,69 @@ fn rect_dist(p: vec2<f32>, lo: vec2<f32>, hi: vec2<f32>) -> f32 {
   return length(max(vec2<f32>(0.0), max(lo - p, p - hi)));
 }
 
-fn decorate(col_in: vec3<f32>, px: f32, py: f32, t: vec2<i32>, residue: u32) -> vec3<f32> {
+// True when cell (nn, kk) is in the triangle and m divides C(nn, kk). The residue comes
+// from the grid when it holds the cell (texel row j + dn), else from the closed form:
+// the grid has no margin on the left and top, and zeros just off-canvas still glow.
+fn is_zero_cell(j: i32, dn: i32, nn: i32, kk: i32) -> bool {
+  if (nn < 0 || kk < 0 || kk > nn || f32(nn) > MAX_ROW_F) { return false; }
+  let jj = j + dn;
+  if (jj >= 0 && jj < i32(P.grid_h)) {
+    let ii = kk - k0_of(u32(nn));
+    if (ii >= 0 && ii < i32(P.grid_w)) {
+      let c = cells[u32(jj) * P.grid_w + u32(ii)];
+      if (cell_valid(c)) { return c.x == 0u; }
+    }
+  }
+  return residue_at(u32(nn), u32(kk)) == 0u;
+}
+
+fn decorate(col_in: vec3<f32>, px: f32, py: f32, t: vec2<i32>) -> vec3<f32> {
   if (P.sx != 1.0 || P.sy != 1.0) { return col_in; }
   let cw = 1.0 / P.cells_per_px;
   let ch = 1.0 / P.rows_per_px;
   let size = min(cw, ch);
   let fade = smoothstep(3.0, 6.0, size);
   if (fade <= 0.0) { return col_in; }
-  let n = row_of(u32(t.y));
-  if (n < 0) { return col_in; }
-  let uv = cell_uv(px, py, u32(n));
+  let cell = cell_of(u32(t.x), u32(t.y));
+  if (cell.valid == 0u) { return col_in; }
+  let n = i32(cell.n);
+  let k = i32(cell.k);
+  let uv = cell_uv(px, py, cell.n);
   let p = uv * vec2<f32>(cw, ch);
   var col = col_in;
-  if ((P.style_flags & 2u) != 0u && residue != 0u) {
-    // the nearest zero among the six lattice neighbours (a zero cell itself stays dark)
+  if ((P.style_flags & 2u) != 0u) {
+    // Light from every other zero cell within r = min(10 px, 0.8 cell): with r below
+    // one row and one cell, only these ten can reach (the same row ±1, and rows n ± 1
+    // from k − 2 to k + 2 shifted by half a cell). Zero cells glow too, from their
+    // neighbours, so a void's lattice lights up as in the scanner.
+    var nb = array<vec2<i32>, 10>(
+      vec2<i32>(-1, -2), vec2<i32>(-1, -1), vec2<i32>(-1, 0), vec2<i32>(-1, 1),
+      vec2<i32>(0, -1), vec2<i32>(0, 1),
+      vec2<i32>(1, -1), vec2<i32>(1, 0), vec2<i32>(1, 1), vec2<i32>(1, 2));
     let r = min(GLOW_MAX_PX, 0.8 * size);
     var d = 1.0e9;
-    for (var w = 0u; w < 6u; w = w + 1u) {
-      let ni = neighbor_index(t.x, t.y, w);
-      if (ni < 0) { continue; }
-      if (cells[ni].x != 0u) { continue; }
-      var lo: vec2<f32>;
-      var hi: vec2<f32>;
-      switch w {
-        case 0u: { lo = vec2<f32>(-0.5 * cw, -ch); hi = vec2<f32>(0.5 * cw, 0.0); }  // up-left
-        case 1u: { lo = vec2<f32>(0.5 * cw, -ch); hi = vec2<f32>(1.5 * cw, 0.0); }   // up-right
-        case 2u: { lo = vec2<f32>(-0.5 * cw, ch); hi = vec2<f32>(0.5 * cw, 2.0 * ch); } // down-left
-        case 3u: { lo = vec2<f32>(0.5 * cw, ch); hi = vec2<f32>(1.5 * cw, 2.0 * ch); }  // down-right
-        case 4u: { lo = vec2<f32>(-cw, 0.0); hi = vec2<f32>(0.0, ch); }              // left
-        default: { lo = vec2<f32>(cw, 0.0); hi = vec2<f32>(2.0 * cw, ch); }          // right
-      }
-      d = min(d, rect_dist(p, lo, hi));
+    for (var w = 0u; w < 10u; w = w + 1u) {
+      let dn = nb[w].x;
+      let dk = nb[w].y;
+      // the neighbour's rectangle: rows are offset by half a cell per row step
+      let lo = vec2<f32>((f32(dk) - 0.5 * f32(dn)) * cw, f32(dn) * ch);
+      let dist = rect_dist(p, lo, lo + vec2<f32>(cw, ch));
+      if (dist >= min(d, r)) { continue; }
+      if (is_zero_cell(t.y, dn, n + dn, k + dk)) { d = dist; }
     }
     if (d < r) {
       let g = 1.0 - d / r;
-      col = mix(col, unpack_rgb(P.glow_rgb), GLOW_STRENGTH * g * g * fade);
+      // screen blend: light only ever brightens
+      let a = GLOW_STRENGTH * g * g * fade;
+      col = vec3<f32>(1.0) - (vec3<f32>(1.0) - col) * (vec3<f32>(1.0) - unpack_rgb(P.glow_rgb) * a);
     }
   }
   if ((P.style_flags & 1u) != 0u) {
+    // a 1 px line centred on each boundary, by coverage: a sample at distance e from
+    // its cell's edge is covered by max(0, 1 − e) of a pixel-wide box
     let edge = min(min(p.x, cw - p.x), min(p.y, ch - p.y));
-    if (edge < OUTLINE_HALF_PX) {
-      col = mix(col, OUTLINE_RGB, OUTLINE_ALPHA * fade);
-    }
+    let cover = clamp(1.0 - edge, 0.0, 1.0);
+    col = mix(col, OUTLINE_RGB, OUTLINE_ALPHA * fade * cover);
   }
   return col;
 }

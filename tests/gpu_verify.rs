@@ -867,67 +867,51 @@ fn signed_measure_blends_around_half() {
     }
 }
 
-/// CPU twin of the resolve pass's color offset, outlines and glow (field.wgsl `decorate`)
-/// at one pixel centre, or None when the pixel sits within float noise of a threshold.
+/// CPU twin of the resolve pass's color offset, outlines and glow at one pixel centre,
+/// built from the view's own cell rectangles rather than the shader's neighbour table:
+/// the glow is the distance to the nearest other zero cell anywhere within two rows and
+/// three cells, the outline the coverage of a 1 px line on the cell's boundary. None
+/// when the pixel centre sits on a cell boundary.
 fn decorated_pixel(view: &View, md: &Modulus, pal: &Palette, style: &pascal::gpu::CanvasStyle, px: f64, py: f64) -> Option<[u8; 3]> {
-    let shift = pascal::palette::offset_shift(style.offset);
+    let map = pal.level_map(md.m, style.offset);
     let Some((n, k)) = view.cell_at(px, py) else { return Some(pascal::palette::BG) };
-    let residue = md.binom(n, k);
-    let base = pal.residue_color_shifted(residue, md.m, shift);
-    let mut col = base.map(|c| c as f32 / 255.0);
-    let cw = view.ppc;
-    let ch = view.ppc * ROW_H;
+    let mut col = pal.residue_color_mapped(md.binom(n, k), md.m, &map).map(|c| c as f64 / 255.0);
+    let (x, y, cw, ch) = view.cell_rect(n, k);
+    let edge = (px - x).min(x + cw - px).min(py - y).min(y + ch - py);
+    if edge < 1e-4 {
+        return None; // on a cell boundary
+    }
     let size = cw.min(ch);
     let fade = {
         let t = ((size - 3.0) / 3.0).clamp(0.0, 1.0);
         t * t * (3.0 - 2.0 * t)
-    } as f32;
-    let wx = view.x0 + px / view.ppc + n as f64 / 2.0 + 0.5;
-    let wy = view.y0 + py / (view.ppc * ROW_H);
-    let (u, v) = (wx - wx.floor(), wy - wy.floor());
-    if u.min(1.0 - u) < 1e-4 || v.min(1.0 - v) < 1e-4 {
-        return None; // on a cell boundary
-    }
-    let p = (u * cw, v * ch);
-    let mix = |a: [f32; 3], b: [f32; 3], t: f32| [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
-    if style.glow && residue != 0 {
+    };
+    if style.glow {
         let r = (10.0f64).min(0.8 * size);
         let mut d = f64::INFINITY;
-        let n = n as i64;
-        let k = k as i64;
-        // (row, k, rect lo, rect hi) in the cell's pixel frame
-        let nb = [
-            (n - 1, k - 1, (-0.5 * cw, -ch), (0.5 * cw, 0.0)),
-            (n - 1, k, (0.5 * cw, -ch), (1.5 * cw, 0.0)),
-            (n + 1, k, (-0.5 * cw, ch), (0.5 * cw, 2.0 * ch)),
-            (n + 1, k + 1, (0.5 * cw, ch), (1.5 * cw, 2.0 * ch)),
-            (n, k - 1, (-cw, 0.0), (0.0, ch)),
-            (n, k + 1, (cw, 0.0), (2.0 * cw, ch)),
-        ];
-        for (nn, kk, lo, hi) in nb {
-            if nn < 0 || kk < 0 || kk > nn || md.binom(nn as u32, kk as u32) != 0 {
-                continue;
+        for nn in n as i64 - 2..=n as i64 + 2 {
+            for kk in k as i64 - 3..=k as i64 + 3 {
+                if nn < 0 || kk < 0 || kk > nn || (nn, kk) == (n as i64, k as i64) || md.binom(nn as u32, kk as u32) != 0 {
+                    continue;
+                }
+                let (rx, ry, rw, rh) = view.cell_rect(nn as u32, kk as u32);
+                let dx = (rx - px).max(px - (rx + rw)).max(0.0);
+                let dy = (ry - py).max(py - (ry + rh)).max(0.0);
+                d = d.min((dx * dx + dy * dy).sqrt());
             }
-            let dx = (lo.0 - p.0).max(p.0 - hi.0).max(0.0);
-            let dy = (lo.1 - p.1).max(p.1 - hi.1).max(0.0);
-            d = d.min((dx * dx + dy * dy).sqrt());
-        }
-        if (d - r).abs() < 1e-3 {
-            return None;
         }
         if d < r {
-            let g = (1.0 - d / r) as f32;
-            col = mix(col, pal.glow_color().map(|c| c as f32 / 255.0), 0.55 * g * g * fade);
+            let g = 1.0 - d / r;
+            let a = 0.55 * g * g * fade;
+            let glow = pal.glow_color().map(|c| c as f64 / 255.0);
+            col = [0, 1, 2].map(|i| 1.0 - (1.0 - col[i]) * (1.0 - glow[i] * a));
         }
     }
     if style.outlines {
-        let edge = p.0.min(cw - p.0).min(p.1).min(ch - p.1);
-        if (edge - 0.5).abs() < 1e-3 {
-            return None;
-        }
-        if edge < 0.5 {
-            col = mix(col, [235.0 / 255.0, 238.0 / 255.0, 250.0 / 255.0], 0.12 * fade);
-        }
+        let cover = (1.0 - edge).clamp(0.0, 1.0);
+        let o = [235.0 / 255.0, 238.0 / 255.0, 250.0 / 255.0];
+        let a = 0.12 * fade * cover;
+        col = [0, 1, 2].map(|i| col[i] + (o[i] - col[i]) * a);
     }
     Some(col.map(|c| (c.clamp(0.0, 1.0) * 255.0 + 0.5).floor() as u8))
 }
@@ -936,13 +920,11 @@ fn decorated_pixel(view: &View, md: &Modulus, pal: &Palette, style: &pascal::gpu
 fn offset_outlines_and_glow_match_cpu() {
     use pascal::gpu::CanvasStyle;
     let (_gpu, mut r) = device();
-    // big cells (12 px) at an awkward offset, so no pixel centre lands on a boundary
-    let view = View { x0: -7.37, y0: -0.29, ppc: 12.0 };
+    // big cells (12 px) at awkward offsets: the apex in view; the triangle crossing the
+    // left edge; the top edge cutting through row 30 (zeros just off-canvas must glow)
+    let views = [View { x0: -7.37, y0: -0.29, ppc: 12.0 }, View { x0: -3.95, y0: -0.29, ppc: 12.0 }, View { x0: 2.02, y0: 30.01, ppc: 12.0 }];
     let (w, h) = (180u32, 150u32);
-    let grid = GridSpec::new(&view, w, h, 1, 1 << 24);
-    assert_eq!((grid.sx, grid.sy), (1.0, 1.0));
     let layers = LayerState::default();
-    let rows_inside = (h as f64 / (view.ppc * ROW_H)) as u32; // rows fully on the canvas
     let styles = [
         CanvasStyle { offset: 0.3, outlines: false, glow: false },
         CanvasStyle { offset: 0.0, outlines: true, glow: false },
@@ -951,41 +933,37 @@ fn offset_outlines_and_glow_match_cpu() {
     ];
     let mut checked = 0usize;
     let mut decorated = [0usize; 4];
-    for scheme in [Scheme::Spectral, Scheme::Ember] {
-        let pal = Palette::new(scheme);
-        for m in [4u32, 7] {
-            let md = Modulus::new(m);
-            for (si, style) in styles.into_iter().enumerate() {
-                r.render_blocking(&FrameInput { grid, modulus: &md, palette: &pal, layers: &layers, advance: true, tween: pascal::gpu::Tween::Off, style });
-                let (_, _, rgba) = r.read_output_rgba();
-                for py in 0..h {
-                    for px in 0..w {
-                        let (cx, cy) = (px as f64 + 0.5, py as f64 + 0.5);
-                        // keep to cells whose six neighbours are all inside the grid
-                        if let Some((n, k)) = view.cell_at(cx, cy) {
-                            let (x, _, cwid, _) = view.cell_rect(n, k);
-                            if n + 1 >= rows_inside || x - cwid < 0.0 || x + 2.0 * cwid > w as f64 {
-                                continue;
+    for view in views {
+        let grid = GridSpec::new(&view, w, h, 1, 1 << 24);
+        assert_eq!((grid.sx, grid.sy), (1.0, 1.0));
+        for scheme in [Scheme::Spectral, Scheme::Ember] {
+            let pal = Palette::new(scheme);
+            for m in [2u32, 3, 7] {
+                let md = Modulus::new(m);
+                for (si, style) in styles.into_iter().enumerate() {
+                    r.render_blocking(&FrameInput { grid, modulus: &md, palette: &pal, layers: &layers, advance: true, tween: pascal::gpu::Tween::Off, style });
+                    let (_, _, rgba) = r.read_output_rgba();
+                    for py in 0..h {
+                        for px in 0..w {
+                            let (cx, cy) = (px as f64 + 0.5, py as f64 + 0.5);
+                            let Some(want) = decorated_pixel(&view, &md, &pal, &style, cx, cy) else { continue };
+                            let o = ((py * w + px) * 4) as usize;
+                            let got = &rgba[o..o + 3];
+                            let diff = got.iter().zip(want).map(|(a, b)| a.abs_diff(b)).max().unwrap();
+                            assert!(diff <= 1, "{view:?} {scheme:?} m={m} {style:?} pixel ({px},{py}): {got:?} vs {want:?}");
+                            checked += 1;
+                            if decorated_pixel(&view, &md, &pal, &CanvasStyle::default(), cx, cy).is_some_and(|p| p != want) {
+                                decorated[si] += 1;
                             }
-                        }
-                        let Some(want) = decorated_pixel(&view, &md, &pal, &style, cx, cy) else { continue };
-                        let o = ((py * w + px) * 4) as usize;
-                        let got = &rgba[o..o + 3];
-                        let diff = got.iter().zip(want).map(|(a, b)| a.abs_diff(b)).max().unwrap();
-                        assert!(diff <= 1, "{scheme:?} m={m} {style:?} pixel ({px},{py}): {got:?} vs {want:?}");
-                        checked += 1;
-                        let plain = decorated_pixel(&view, &md, &pal, &CanvasStyle::default(), cx, cy);
-                        if plain.is_some_and(|p| p != want) {
-                            decorated[si] += 1;
                         }
                     }
                 }
             }
         }
     }
-    assert!(checked > 100_000, "{checked}");
+    assert!(checked > 1_000_000, "{checked}");
     // every style visibly changed a good share of the pixels
-    assert!(decorated.iter().all(|&d| d > 2_000), "pixels changed per style: {decorated:?}");
+    assert!(decorated.iter().all(|&d| d > 5_000), "pixels changed per style: {decorated:?}");
     eprintln!("checked {checked} pixels; changed per style {decorated:?}");
     // with tiny cells the decorations fade out entirely: same image as no style
     let rows = 60u32;
@@ -1001,38 +979,54 @@ fn offset_outlines_and_glow_match_cpu() {
 
 #[test]
 fn svg_colors_match_the_gpu() {
-    // the SVG export's CPU colors equal what the resolve pass paints, per preset
+    // the SVG export's CPU colors equal what the resolve pass paints, per preset, on a
+    // fitted view that shows a few rows past the exported ones (m = 3: row 81 has
+    // ν = 4 while rows 0..79 reach 3, so the valuation needs the view's max)
     use pascal::gpu::CanvasStyle;
     let (_gpu, mut r) = device();
-    let rows = 40u32;
-    let (view, grid) = cell_grid(rows);
-    let pal = Palette::new(Scheme::Viridis);
-    let md = Modulus::new(12);
-    let style = CanvasStyle { offset: 0.17, outlines: false, glow: false };
-    let mut layers = LayerState::default();
-    for preset in 0..3 {
-        match preset {
-            0 => layers.preset_residue(),
-            1 => layers.preset_mask(),
-            _ => layers.preset_valuation(),
-        }
-        let colors = pascal::export::preset_colors(rows, &md, &pal, &layers, &style).expect("a preset");
-        r.render_blocking(&FrameInput { grid, modulus: &md, palette: &pal, layers: &layers, advance: true, tween: pascal::gpu::Tween::Off, style });
-        let (w, h, rgba) = r.read_output_rgba();
-        let mut checked = 0;
-        for py in 0..h {
-            for px in 0..w {
-                let Some((n, k)) = view.cell_at(px as f64 + 0.5, py as f64 + 0.5) else { continue };
-                if n >= rows {
-                    continue;
+    let rows = 80u32;
+    let (w, h) = (1000u32, 800u32);
+    let view = View::fit(w as f64, h as f64, rows as f64);
+    let grid = GridSpec::new(&view, w, h, 1, 1 << 26);
+    assert_eq!((grid.sx, grid.sy), (1.0, 1.0));
+    let md = Modulus::new(3);
+    for (scheme, offset) in [(Scheme::Viridis, 0.17f32), (Scheme::Spectral, -0.4)] {
+        let pal = Palette::new(scheme);
+        let style = CanvasStyle { offset, outlines: false, glow: false };
+        let mut layers = LayerState::default();
+        for preset in 0..3 {
+            match preset {
+                0 => layers.preset_residue(),
+                1 => layers.preset_mask(),
+                _ => layers.preset_valuation(),
+            }
+            r.render_blocking(&FrameInput { grid, modulus: &md, palette: &pal, layers: &layers, advance: true, tween: pascal::gpu::Tween::Off, style });
+            let vmax = (preset == 2).then(|| r.read_max()[0]);
+            let colors = pascal::export::preset_colors(rows, &md, &pal, &layers, &style, vmax).expect("a preset");
+            let (_, _, rgba) = r.read_output_rgba();
+            let mut checked = 0;
+            for py in 0..h {
+                for px in 0..w {
+                    let (cx, cy) = (px as f64 + 0.5, py as f64 + 0.5);
+                    let Some((n, k)) = view.cell_at(cx, cy) else { continue };
+                    if n >= rows {
+                        continue;
+                    }
+                    // a fitted view has fractional px/cell: skip centres within float noise
+                    // of a cell boundary, where f32 (GPU) and f64 (here) may pick sides
+                    let (x, y, cw, ch) = view.cell_rect(n, k);
+                    if (cx - x).min(x + cw - cx).min(cy - y).min(y + ch - cy) < 1e-3 {
+                        continue;
+                    }
+                    let o = ((py * w + px) * 4) as usize;
+                    assert_eq!(&rgba[o..o + 3], &colors[n as usize][k as usize], "{scheme:?} preset {preset} pixel ({px},{py}) cell ({n},{k})");
+                    checked += 1;
                 }
-                // the valuation's max runs over the grid on the GPU and over rows
-                // 0..rows on the CPU; the grid's extra row adds no larger ν mod 12
-                let o = ((py * w + px) * 4) as usize;
-                assert_eq!(&rgba[o..o + 3], &colors[n as usize][k as usize], "preset {preset} pixel ({px},{py}) cell ({n},{k})");
-                checked += 1;
+            }
+            assert!(checked > 10_000);
+            if preset == 2 {
+                assert_eq!(vmax, Some(4.0), "the view reaches row 81");
             }
         }
-        assert!(checked > 1000);
     }
 }
