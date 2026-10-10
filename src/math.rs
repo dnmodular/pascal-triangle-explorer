@@ -367,7 +367,8 @@ pub fn triangle_dp(rows: usize, m: u32) -> Vec<u32> {
     t
 }
 
-/// Exact `C(n,k)` when it fits in a u128 (always for `n ≤ 130`), else `None`.
+/// Exact `C(n,k)`, or `None` when the running product would overflow a u128 (never for
+/// `n ≤ 125`; C(n,k) itself fits up to n = 130).
 pub fn binom_exact(n: u32, k: u32) -> Option<u128> {
     if k > n {
         return Some(0);

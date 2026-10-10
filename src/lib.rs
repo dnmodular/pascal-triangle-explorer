@@ -8,6 +8,7 @@
 //! * [`layers`]  — the layer registry (value / measure / transform) and its plan
 //! * [`gpu`]     — the wgpu pipeline that runs the plan
 //! * [`export`]  — PNG export of the canvas texture
+//! * [`wave_overlay`] — the "modular wave" overlay: one row of the triangle as a wave
 pub mod export;
 pub mod gpu;
 pub mod layers;
@@ -15,3 +16,4 @@ pub mod math;
 pub mod palette;
 pub mod sweep;
 pub mod view;
+pub mod wave_overlay;

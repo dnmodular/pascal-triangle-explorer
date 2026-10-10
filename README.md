@@ -91,11 +91,50 @@ driver works: `sudo apt install mesa-vulkan-drivers` (lavapipe) and run
 | **↑ / ↓** | rows to fit +1 / −1, then fit |
 | **Shift** | ×10 for any of the above |
 | hover | inspector: *n*, *k*, `C(n,k)`, `C mod m`, ν_p for each prime factor, the Lucas digit product |
+| click a cell | pin its row for the wave overlay (click the row again, or **Esc**, to release) |
+| **W** | show / hide the wave overlay (it fades) |
 
 The panel on the left has the modulus (text, ◀ ▶, log slider), the rows to fit,
 supersampling, the palette, the three color presets (residue → palette,
 zero/nonzero mask, p-adic valuation heatmap), the layer stack and PNG export.
 When cells are at least 18 px wide their residue is printed inside them.
+
+## Modular wave
+
+A translucent square in a corner of the canvas (top right by default; the View
+section of the panel moves it, sets the drift, turns the fill off) plays one row
+of the triangle as a wave:
+
+```
+r_k = C(n, k) mod m        w(θ) = Σ_k r_k · cos((n − 2k)·θ + φ(t)),   θ ∈ [−π, π]
+```
+
+The row is the pinned one if any, else the row under the pointer, else the last
+visible row; small ticks at the canvas edges mark it. Each coefficient sits at
+frequency n − 2k (the terms of (2 cos θ)ⁿ, filtered through mod m), so the maps
+are keyed by frequency and rows of different lengths line up. On a change of
+row or modulus only the target coefficients are rebuilt; the displayed ones ease
+toward them (α = 1 − e^(−dt/0.12 s), from the real frame time), and the plot is
+normalized by a running max of |w| that rises quickly and falls slowly, so the
+wave morphs instead of snapping.
+
+A whole row is symmetric (r_k = r_{n−k}), so w(θ) = cos φ · Σ r_k cos((n − 2k)θ):
+the phase drift (0.3 rad/s by default, 0 holds it) makes the wave breathe —
+swell, flatten, invert — rather than travel.
+
+* Rows up to 2048 are built with Pascal's rule mod m in `u64` (any m), stepping
+  forward or backward from the cached row. Longer rows use the same closed form
+  as the GPU (shared with the app, never a full binomial); rows past 16,384
+  entries use a window of k centred on the part on screen, shown under the label.
+  Deep rows mod a composite are mostly zeros, and the note says so when every
+  r_k in the window is 0.
+* Rows longer than 2000 draw only their 256 largest coefficients.
+* Samples: ~2 per pixel of plot width, 256–1024. cos(fθ_j + φ) is reduced exactly
+  to a table index, so frequencies near 10⁹ cost no large trig arguments, and
+  frequencies are folded by f mod P before the sum (at most P² terms a frame).
+* The per-frame path reuses its buffers: the sample, table and point vectors,
+  and the fill and line meshes (handed to egui in `Arc`s that egui releases after
+  tessellation), and the label layouts are cached.
 
 ## Sweep
 
@@ -174,6 +213,7 @@ src/view.rs      camera (f64) and the grid: texel ↔ (n, k), pixel → texel
 src/layers.rs    the layer registry: kind = value | measure | transform, params, run recipe
 src/gpu.rs       wgpu pipeline: value → measures → blend → transforms → resolve
 src/export.rs    PNG writer
+src/wave_overlay.rs  the modular-wave overlay (row cache, easing, sampling, egui shapes)
 src/main.rs      winit + egui app
 shaders/common.wgsl    mulmod, binomial, grid mapping, lattice neighbours (prepended to every pass)
 shaders/value.wgsl     residue + carries + divisibility mask per texel
@@ -252,6 +292,16 @@ Verified (by `cargo test` on Mesa lavapipe, and by the headless export):
   tween shows the previous frame at e = 0 and exactly the true frame at e = 1.
 * The windowed app was driven under Xvfb (keys, wheel zoom, drag, in-cell
   numbers, inspector, GPU timing); the headless export writes valid PNGs.
+* Wave overlay: Pascal rows mod m equal exact binomials mod m (n ≤ 30 for fourteen
+  moduli up to 2⁶⁴ − 59, and n ≤ 125 for the largest), forward and backward;
+  closed-form rows equal Pascal rows; the samples equal the direct sum; easing
+  converges at 30 and 144 fps alike; m = 1, n = 0, rows near 2³², moduli above
+  the cap, zero-sized and resized viewports and NaN/negative frame times stay
+  finite. Under Xvfb: hover, a modulus step and a row change morph, **W** fades
+  out and in, pinning, corners, resizes, deep rows with their k window.
+* The app is idle when nothing moves (with the wave's drift at 0), and a redraw
+  that changes no GPU input skips the triangle's passes; after a tween the canvas
+  equals a fresh render pixel for pixel.
 
 Not verified here: behavior on a real GPU and display (only the software Vulkan
 device was available), light-theme appearance, Windows and macOS builds, and

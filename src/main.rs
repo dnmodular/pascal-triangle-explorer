@@ -14,6 +14,7 @@ use pascal::math::{self, Modulus, MOD_CAP};
 use pascal::palette::{Palette, Scheme};
 use pascal::sweep::{ModMode, PrimeOrder, Seq, Sweep};
 use pascal::view::{GridSpec, View, ROW_H, STATUS_H};
+use pascal::wave_overlay::{Corner, WaveOverlay};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -30,7 +31,8 @@ const NUMBERS_MAX_CELLS: u64 = 9000;
 /// Everything the user can change.
 struct Model {
     m: u32,
-    modulus: Modulus,
+    /// Shared with the wave overlay, which reads long rows through the same closed form.
+    modulus: Arc<Modulus>,
     m_text: String,
     scheme: Scheme,
     palette: Palette,
@@ -44,9 +46,18 @@ struct Model {
     export_note: String,
     pending_export: bool,
     hover: Option<(u32, u32)>,
+    /// The row under the pointer, inside the triangle or beside it.
+    hover_row: Option<u32>,
     sweep: Sweep,
     /// When the play timer last advanced the modulus.
     last_step: Option<Instant>,
+    /// The "modular wave" overlay and the row it plays: the pinned row (click a cell),
+    /// else the hovered row, else the last visible row.
+    wave: WaveOverlay,
+    pinned_row: Option<u32>,
+    wave_row: u32,
+    /// The pointer is over the overlay box: the canvas under it gets no hover.
+    over_wave: bool,
 }
 
 impl Model {
@@ -54,7 +65,7 @@ impl Model {
         let m = 7;
         Model {
             m,
-            modulus: Modulus::new(m),
+            modulus: Arc::new(Modulus::new(m)),
             m_text: m.to_string(),
             scheme: Scheme::Spectral,
             palette: Palette::new(Scheme::Spectral),
@@ -68,8 +79,13 @@ impl Model {
             export_note: String::new(),
             pending_export: false,
             hover: None,
+            hover_row: None,
             sweep: Sweep::default(),
             last_step: None,
+            wave: WaveOverlay::new(),
+            pinned_row: None,
+            wave_row: 0,
+            over_wave: false,
         }
     }
 
@@ -77,7 +93,7 @@ impl Model {
         let m = m.clamp(2, MOD_CAP);
         if m != self.m {
             self.m = m;
-            self.modulus = Modulus::new(m);
+            self.modulus = Arc::new(Modulus::new(m));
         }
         self.m_text = m.to_string();
     }
@@ -192,6 +208,18 @@ struct App {
     /// Modulus of the last rendered frame, and when the running tween began.
     last_m: u32,
     tween_t0: Option<Instant>,
+    /// The display texture holds the true frame of `last_inputs` (no tween in it), so a
+    /// redraw that changes none of them (overlay animation, hover) can skip the GPU passes.
+    canvas_current: bool,
+    /// When the last frame started, and whether it asked for the next one right away
+    /// (then the gap is real frame time; after an idle gap one nominal frame is used).
+    last_frame: Option<Instant>,
+    continuous: bool,
+    /// Frames since `fps_t0` (logged at debug level once a second).
+    fps_frames: u32,
+    fps_t0: Option<Instant>,
+    /// A delayed repaint egui asked for.
+    repaint_at: Option<Instant>,
 }
 
 const USAGE: &str = "pascal-triangle-explorer [options]
@@ -279,7 +307,7 @@ fn main() {
     }
     let event_loop = EventLoop::new().expect("event loop");
     event_loop.set_control_flow(ControlFlow::Wait);
-    let mut app = App { gfx: None, model, last_inputs: None, frame_ms: 0.0, frame_nr: 0, surface_errors: 0, fatal: false, last_m: 0, tween_t0: None };
+    let mut app = App { gfx: None, model, last_inputs: None, frame_ms: 0.0, frame_nr: 0, surface_errors: 0, fatal: false, last_m: 0, tween_t0: None, canvas_current: false, last_frame: None, continuous: false, fps_frames: 0, fps_t0: None, repaint_at: None };
     event_loop.run_app(&mut app).expect("run");
 }
 
@@ -394,7 +422,9 @@ impl ApplicationHandler for App {
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         let Some(gfx) = self.gfx.as_mut() else { return };
         let response = gfx.egui_state.on_window_event(&gfx.window, &event);
-        if response.repaint {
+        // egui flags every event it saw for a repaint, RedrawRequested included; honoring
+        // that one would redraw in a loop forever (continuous frames are asked for below).
+        if response.repaint && !matches!(event, WindowEvent::RedrawRequested) {
             gfx.window.request_redraw();
         }
         match event {
@@ -414,6 +444,21 @@ impl ApplicationHandler for App {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// egui asks for delayed repaints (tooltips, cursor blink): sleep until then.
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        match self.repaint_at {
+            Some(t) if Instant::now() >= t => {
+                self.repaint_at = None;
+                if let Some(gfx) = &self.gfx {
+                    gfx.window.request_redraw();
+                }
+                event_loop.set_control_flow(ControlFlow::Wait);
+            }
+            Some(t) => event_loop.set_control_flow(ControlFlow::WaitUntil(t)),
+            None => event_loop.set_control_flow(ControlFlow::Wait),
         }
     }
 }
@@ -450,6 +495,20 @@ impl App {
         let raw_input = gfx.egui_state.take_egui_input(&gfx.window);
         let gpu_ms = gfx.renderer.gpu_ms();
         self.model.play_tick(Instant::now());
+        // real frame time for the overlay's easing (one nominal frame after an idle gap)
+        let now = Instant::now();
+        let dt = match self.last_frame {
+            Some(t) if self.continuous => now.duration_since(t).as_secs_f32().min(0.25),
+            _ => 1.0 / 60.0,
+        };
+        self.last_frame = Some(now);
+        self.fps_frames += 1;
+        let fps_t0 = *self.fps_t0.get_or_insert(now);
+        if now.duration_since(fps_t0).as_secs_f32() >= 1.0 {
+            log::debug!("{} frames in {:.2} s", self.fps_frames, now.duration_since(fps_t0).as_secs_f32());
+            self.fps_frames = 0;
+            self.fps_t0 = Some(now);
+        }
         let mut canvas_px = (gfx.config.width.saturating_sub((PANEL_W * ppp) as u32).max(1), gfx.config.height.max(1));
         let model = &mut self.model;
         let frame_ms = self.frame_ms;
@@ -509,6 +568,7 @@ impl App {
                 handled_frame = frame_nr;
                 canvas_interaction(ui, model, &response, rect, ppp, handle);
                 canvas_overlays(ui, model, rect, ppp, gpu_ms, frame_ms, handle);
+                wave_overlay(ui, model, rect, ppp, dt, handle);
             });
         });
         let egui::FullOutput { platform_output, mut textures_delta, shapes, pixels_per_point, viewport_output } = full_output;
@@ -538,8 +598,13 @@ impl App {
         };
         self.last_m = model.m;
         let mut encoder = gfx.gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
-        gfx.renderer.render(&mut encoder, &FrameInput { grid, modulus: &model.modulus, palette: &model.palette, layers: &model.layers, advance, tween });
-        gfx.renderer.flush_pass_params();
+        let tween_off = matches!(tween, Tween::Off);
+        let render_canvas = advance || !tween_off || !self.canvas_current;
+        if render_canvas {
+            gfx.renderer.render(&mut encoder, &FrameInput { grid, modulus: &model.modulus, palette: &model.palette, layers: &model.layers, advance, tween });
+            gfx.renderer.flush_pass_params();
+        }
+        self.canvas_current = tween_off;
 
         // ---- egui paint ----
         let paint_jobs = ctx.tessellate(shapes, pixels_per_point);
@@ -570,7 +635,9 @@ impl App {
             gfx.egui_renderer.render(&mut rpass, &paint_jobs, &screen);
         }
         gfx.gpu.queue.submit(extra.into_iter().chain(std::iter::once(encoder.finish())));
-        gfx.renderer.begin_timing_readback();
+        if render_canvas {
+            gfx.renderer.begin_timing_readback();
+        }
         gfx.window.pre_present_notify();
         gfx.gpu.queue.present(frame);
         for id in &textures_delta.free {
@@ -595,9 +662,13 @@ impl App {
         }
 
         self.frame_ms = t0.elapsed().as_secs_f32() * 1000.0;
-        let repaint = viewport_output.get(&egui::ViewportId::ROOT).map(|v| v.repaint_delay.is_zero()).unwrap_or(false);
-        if repaint || model.sweep.playing || self.tween_t0.is_some() {
+        let delay = viewport_output.get(&egui::ViewportId::ROOT).map(|v| v.repaint_delay).unwrap_or(std::time::Duration::MAX);
+        self.continuous = delay.is_zero() || model.sweep.playing || self.tween_t0.is_some() || model.wave.is_animating();
+        if self.continuous {
             gfx.window.request_redraw();
+            self.repaint_at = None;
+        } else {
+            self.repaint_at = Instant::now().checked_add(delay);
         }
     }
 }
@@ -717,6 +788,31 @@ fn panel_ui(ui: &mut egui::Ui, model: &mut Model, canvas_px: (u32, u32), _frame_
         });
         note(ui, "When cells are smaller than a pixel, each pixel averages this many samples. Zoomed in, cells stay crisp.");
         ui.checkbox(&mut model.show_numbers, "numbers when zoomed in");
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            let mut on = model.wave.visible();
+            if ui.checkbox(&mut on, "wave overlay").on_hover_text("Show or hide the modular wave (W)").changed() {
+                model.wave.set_visible(on);
+            }
+            let corner = &mut model.wave.config.corner;
+            egui::ComboBox::from_id_salt("wave corner").selected_text(corner.label()).show_ui(ui, |ui| {
+                for c in Corner::ALL {
+                    ui.selectable_value(corner, c, c.label());
+                }
+            });
+        });
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("drift").color(ui.visuals().weak_text_color()));
+            mono_drag(ui, &mut model.wave.config.drift, 0.0..=3.0, 0.01).on_hover_text("Phase drift φ′ in rad/s; 0 holds the phase");
+            ui.label(egui::RichText::new("rad/s").color(ui.visuals().weak_text_color()));
+            ui.checkbox(&mut model.wave.config.fill, "fill");
+            if let Some(n) = model.pinned_row {
+                if ui.small_button(format!("unpin {}", group(n as u64))).on_hover_text("Back to the hovered / last visible row (Esc)").clicked() {
+                    model.pinned_row = None;
+                }
+            }
+        });
+        note(ui, "Plays one row as w(θ) = Σ (C(n,k) mod m)·cos((n−2k)θ + φ): the row under the pointer, else the last visible row. Click a cell to pin its row.");
     });
 
     section(ui, "Color", |ui| {
@@ -1073,18 +1169,22 @@ fn canvas_interaction(ui: &mut egui::Ui, model: &mut Model, response: &egui::Res
             }
         }
     }
-    model.hover = if response.hovered() && !response.dragged() {
-        response.hover_pos().and_then(|p| {
-            let (px, py) = to_px(p);
-            model.view.cell_at(px, py)
-        })
-    } else {
-        None
-    };
+    let pointer = response.hover_pos().filter(|_| response.hovered() && !response.dragged());
+    model.over_wave = pointer.is_some_and(|p| model.wave.box_rect().is_some_and(|b| b.contains(p)));
+    let pointer = pointer.filter(|_| !model.over_wave).map(to_px);
+    model.hover = pointer.and_then(|(px, py)| model.view.cell_at(px, py));
+    model.hover_row = pointer.and_then(|(_, py)| model.view.row_at(py));
+    // A click on a cell pins its row for the wave overlay; a click on the pinned row (or
+    // Esc) releases it. A double click (fit) toggles twice and leaves the pin as it was.
+    if handle && response.clicked() {
+        if let Some((n, _)) = model.hover {
+            model.pinned_row = if model.pinned_row == Some(n) { None } else { Some(n) };
+        }
+    }
 
     // Keyboard, when no text field has focus.
     if handle && !ui.ctx().egui_wants_keyboard_input() {
-        let (space, shift, right, left, pgup, pgdn, up, down, fit) = ui.input(|i| {
+        let (space, shift, right, left, pgup, pgdn, up, down, fit, wave, esc) = ui.input(|i| {
             (
                 i.key_pressed(egui::Key::Space),
                 i.modifiers.shift,
@@ -1095,8 +1195,16 @@ fn canvas_interaction(ui: &mut egui::Ui, model: &mut Model, response: &egui::Res
                 i.num_presses(egui::Key::ArrowUp),
                 i.num_presses(egui::Key::ArrowDown),
                 i.key_pressed(egui::Key::F),
+                i.key_pressed(egui::Key::W),
+                i.key_pressed(egui::Key::Escape),
             )
         });
+        if wave {
+            model.wave.toggle();
+        }
+        if esc {
+            model.pinned_row = None;
+        }
         let big: i64 = if shift { 10 } else { 1 };
         if space {
             model.sweep.playing = !model.sweep.playing;
@@ -1206,6 +1314,45 @@ fn canvas_overlays(ui: &mut egui::Ui, model: &mut Model, rect: Rect, ppp: f32, g
     let strip = Rect::from_min_max(Pos2::new(rect.min.x, rect.max.y - STATUS_H as f32), rect.max);
     painter.rect_filled(strip, 0.0, Color32::from_black_alpha(150));
     painter.text(Pos2::new(strip.min.x + 8.0, strip.center().y), Align2::LEFT_CENTER, parts.join("  ·  "), FontId::monospace(11.0), Color32::from_rgb(187, 187, 187));
+}
+
+/// The "modular wave" overlay, drawn last so it sits on top of the canvas. The state is
+/// advanced once per frame (egui may run the UI closure twice); drawing happens every pass.
+fn wave_overlay(ui: &mut egui::Ui, model: &mut Model, rect: Rect, ppp: f32, dt: f32, handle: bool) {
+    let cw = (rect.width() * ppp) as f64;
+    let ch = (rect.height() * ppp) as f64;
+    if handle {
+        let row = if let Some(n) = model.pinned_row {
+            n
+        } else if let Some(n) = model.hover_row {
+            n
+        } else if model.over_wave {
+            model.wave_row // the pointer is on the overlay: keep playing the same row
+        } else {
+            model.view.visible_rows(ch).map(|r| r.1).unwrap_or(model.wave_row)
+        };
+        model.wave_row = row;
+        let (k_lo, k_hi) = model.view.visible_k(row, cw);
+        model.wave.share_closed_form(&model.modulus);
+        model.wave.set_source(row as u64, model.m as u64, (k_lo as u64, k_hi as u64));
+        model.wave.set_pinned(model.pinned_row.is_some());
+        model.wave.set_viewport(rect, ui.ctx().viewport_rect().size(), ppp);
+        model.wave.update(dt);
+    }
+    let painter = ui.painter_at(rect);
+    // ticks at the canvas edges mark the row the wave plays (solid when pinned)
+    let fade = model.wave.fade();
+    if fade > 0.0 {
+        let (_, y, _, h) = model.view.cell_rect(model.wave_row, 0);
+        let yc = rect.min.y + ((y + h / 2.0) / ppp as f64) as f32;
+        if (rect.min.y..=rect.max.y - STATUS_H as f32).contains(&yc) {
+            let a = if model.pinned_row.is_some() { 0.95 } else { 0.55 };
+            let stroke = egui::Stroke::new(2.0, Color32::from_rgba_unmultiplied(0x4f, 0xc3, 0xf7, (a * fade * 255.0) as u8));
+            painter.line_segment([Pos2::new(rect.min.x, yc), Pos2::new(rect.min.x + 10.0, yc)], stroke);
+            painter.line_segment([Pos2::new(rect.max.x - 10.0, yc), Pos2::new(rect.max.x, yc)], stroke);
+        }
+    }
+    model.wave.draw(&painter);
 }
 
 // ---------------------------------------------------------------------------------

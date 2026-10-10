@@ -75,13 +75,24 @@ impl View {
         h * self.rows_per_px()
     }
 
+    /// The row under canvas pixel row `py` (inside or outside the triangle), if any.
+    pub fn row_at(&self, py: f64) -> Option<u32> {
+        let wy = self.y0 + py * self.rows_per_px();
+        (0.0..MAX_ROW).contains(&wy).then(|| wy.floor() as u32)
+    }
+
+    /// The `k` range of row `n` that intersects a canvas of width `w` (clamped to the
+    /// row, so it is never empty).
+    pub fn visible_k(&self, n: u32, w: f64) -> (u32, u32) {
+        let nf = n as f64;
+        let lo = (self.x0 + nf / 2.0 - 0.5).ceil().clamp(0.0, nf);
+        let hi = (self.x0 + w * self.cells_per_px() + nf / 2.0 + 0.5).floor().clamp(lo, nf);
+        (lo as u32, hi as u32)
+    }
+
     /// The cell under pixel `(px, py)`, if inside the triangle.
     pub fn cell_at(&self, px: f64, py: f64) -> Option<(u32, u32)> {
-        let wy = self.y0 + py * self.rows_per_px();
-        if !(0.0..MAX_ROW).contains(&wy) {
-            return None;
-        }
-        let n = wy.floor();
+        let n = self.row_at(py)? as f64;
         let wx = self.x0 + px * self.cells_per_px();
         let k = (wx + n / 2.0 + 0.5).floor();
         if k < 0.0 || k > n {
@@ -234,6 +245,28 @@ mod tests {
             }
         }
         assert_eq!(v.cell_at(400.0, 2.0), None); // above the apex
+    }
+
+    #[test]
+    fn row_and_k_window_lookup() {
+        let v = View::fit(800.0, 600.0, 64.0);
+        // every cell's row is found from its centre, inside the triangle or beside it
+        for n in [0u32, 1, 31, 63] {
+            let (_, y, _, h) = v.cell_rect(n, 0);
+            assert_eq!(v.row_at(y + h / 2.0), Some(n));
+        }
+        assert_eq!(v.row_at(-1e6), None);
+        // the fitted view shows whole rows
+        assert_eq!(v.visible_k(40, 800.0), (0, 40));
+        // a view panned off to one side clamps to an end of the row, never inverts
+        let right = View { x0: 1e6, ..v };
+        let left = View { x0: -1e6, ..v };
+        assert_eq!(right.visible_k(40, 800.0), (40, 40));
+        assert_eq!(left.visible_k(40, 800.0), (0, 0));
+        // zoomed into the middle of a deep row
+        let deep = View { x0: -10.0, y0: 1e9 - 100.0, ppc: 20.0 };
+        let (lo, hi) = deep.visible_k(999_999_950, 800.0);
+        assert!(lo < 499_999_975 && hi > 499_999_975 && hi - lo <= 42, "{lo}..{hi}");
     }
 
     #[test]

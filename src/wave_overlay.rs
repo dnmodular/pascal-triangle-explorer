@@ -1,0 +1,965 @@
+//! The "modular wave" overlay: a translucent square over the canvas that plays one row
+//! of the triangle as a wave.
+//!
+//! For the active row n and modulus m, the coefficients are r_k = C(n, k) mod m and each
+//! sits at frequency f_k = n − 2k, the expansion (2 cos θ)^n = Σ C(n,k) e^{i(n−2k)θ}
+//! filtered through mod m:
+//!
+//! ```text
+//! w(θ) = Σ_k r_k · cos(f_k·θ + φ(t)),   θ ∈ [−π, π]
+//! ```
+//!
+//! A full row is symmetric (r_k = r_{n−k}), so w(θ) = cos φ · Σ r_k cos(f_k θ): the
+//! phase drift makes the wave breathe (swell, flatten, invert) rather than travel.
+//!
+//! Coefficients live in maps keyed by frequency, so rows of different lengths line up.
+//! A source change only rebuilds `target`; every frame the `displayed` coefficients
+//! ease toward it with frame-rate-independent exponential smoothing, and the plot is
+//! normalized by a smoothed running max of |w|, so the wave morphs instead of snapping.
+//!
+//! API: [`WaveOverlay::set_source`] (cheap, idempotent; call every frame with the app's
+//! state), [`WaveOverlay::set_viewport`], [`WaveOverlay::update`] (easing, sampling and
+//! geometry, once per frame) and [`WaveOverlay::draw`] (adds the prepared shapes to an
+//! egui painter, after everything else on the canvas).
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use egui::epaint::tessellator::Path;
+use egui::epaint::text::{LayoutJob, TextWrapping};
+use egui::epaint::{Mesh, PathStroke};
+use egui::{Color32, CornerRadius, FontId, Galley, Pos2, Rect, Shape, Stroke, StrokeKind, Vec2};
+
+use crate::math::{Modulus, MOD_CAP};
+
+/// Default phase drift φ'(t) in rad/s (see [`OverlayConfig::drift`]).
+pub const PHASE_DRIFT: f32 = 0.3;
+/// Time constant of the coefficient easing, the fade and the normalization's rise.
+pub const TAU: f32 = 0.12;
+/// The normalization falls more slowly than it rises (a running max), so a quieter row
+/// or the cos φ breathing shows as a smaller wave instead of being scaled away.
+const NORM_RELEASE: f32 = 0.6;
+/// Displayed entries are dropped once both their value and their target are below this.
+const DROP_EPS: f32 = 1e-4;
+/// Rows longer than this draw only the `TOP_K` largest |displayed| coefficients: the cost
+/// per frame is (active frequencies × samples), and beyond ~2000 terms the smaller ones
+/// add nothing visible at a few hundred pixels.
+const LARGE_ROW: u64 = 2000;
+const TOP_K: usize = 256;
+/// Rows up to this are built with Pascal's rule mod m (O(n²) from scratch, O(n) per
+/// forward step). Longer rows use the app's closed form (Lucas / Granville / CRT,
+/// verified against Pascal's rule in the GPU tests), which never forms a full binomial.
+const PASCAL_MAX_ROW: u64 = 2048;
+/// Most coefficients enumerated for one row. Rows longer than this (the app reaches
+/// rows near 10⁹) use the window of k on screen, clamped to this many entries.
+const ROW_ENUM_CAP: u64 = 16_384;
+/// Sample count: ~2 per pixel of plot width (≈ 400–500 at the default size), within
+/// these bounds.
+const MIN_SAMPLES: usize = 256;
+const MAX_SAMPLES: usize = 1024;
+/// Floor of the normalization, so an all-zero row (m = 1, deep zeros) stays flat.
+const NORM_FLOOR: f32 = 1e-3;
+/// Below this fade the overlay is neither computed nor drawn.
+const FADE_EPS: f32 = 0.004;
+/// Inner padding of the box, and the heights of the text strips above and below the plot.
+const PAD: f32 = 10.0;
+const LABEL_H: f32 = 15.0;
+const NOTE_H: f32 = 13.0;
+const FORMULA_H: f32 = 14.0;
+/// The formula line is shown on boxes at least this big, when it fits unclipped.
+const FORMULA_MIN_SIDE: f32 = 200.0;
+
+const WAVE_RGB: [u8; 3] = [0x4f, 0xc3, 0xf7];
+const FORMULA: &str = "C(n,k) mod m → Σ r_k cos((n−2k)θ)";
+
+/// Which corner of the canvas the overlay sits in.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Corner {
+    TopRight,
+    TopLeft,
+    BottomRight,
+    BottomLeft,
+}
+
+impl Corner {
+    pub const ALL: [Corner; 4] = [Corner::TopRight, Corner::TopLeft, Corner::BottomRight, Corner::BottomLeft];
+    pub fn label(self) -> &'static str {
+        match self {
+            Corner::TopRight => "top right",
+            Corner::TopLeft => "top left",
+            Corner::BottomRight => "bottom right",
+            Corner::BottomLeft => "bottom left",
+        }
+    }
+}
+
+/// Placement, size and motion of the overlay. Lengths are in egui points.
+#[derive(Clone, Copy, Debug)]
+pub struct OverlayConfig {
+    pub corner: Corner,
+    /// Gap to the canvas edges.
+    pub margin: f32,
+    /// Extra gap at the top edge (keeps the canvas zoom buttons clear).
+    pub top_clearance: f32,
+    /// Extra gap at the bottom edge (the status strip).
+    pub bottom_clearance: f32,
+    /// Side as a fraction of min(window width, height), clamped to [min_side, max_side]
+    /// and then to the canvas.
+    pub size_frac: f32,
+    pub min_side: f32,
+    pub max_side: f32,
+    /// Phase drift in rad/s; 0 freezes φ.
+    pub drift: f32,
+    /// Subtle fill between the wave and the zero line.
+    pub fill: bool,
+}
+
+impl Default for OverlayConfig {
+    fn default() -> Self {
+        OverlayConfig { corner: Corner::TopRight, margin: 16.0, top_clearance: 26.0, bottom_clearance: 18.0, size_frac: 0.28, min_side: 160.0, max_side: 420.0, drift: PHASE_DRIFT, fill: true }
+    }
+}
+
+/// What the current `target` describes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Source {
+    row: u64,
+    modulus: u64,
+    /// The k range actually used (the whole row unless it is longer than ROW_ENUM_CAP).
+    k_lo: u64,
+    k_hi: u64,
+}
+
+/// Row n of Pascal's triangle mod m, built and cached with Pascal's rule in u64.
+#[derive(Default)]
+struct PascalRow {
+    n: u64,
+    m: u64,
+    row: Vec<u64>,
+    valid: bool,
+}
+
+impl PascalRow {
+    /// Row `n` mod `m` (any m ≥ 1). Steps forward or backward from the cached row when
+    /// that is cheaper than restarting from row 0.
+    fn get(&mut self, n: u64, m: u64) -> &[u64] {
+        let cur = self.n;
+        let back_cheaper = n < cur && (cur - n).saturating_mul(cur) < n.saturating_mul(n) / 2;
+        if !(self.valid && self.m == m && (n >= cur || back_cheaper)) {
+            self.row.clear();
+            self.row.push(1 % m);
+            self.n = 0;
+            self.m = m;
+            self.valid = true;
+        }
+        while self.n > n {
+            // Pascal's rule inverted, in place, left to right: old[k] = new[k] − old[k−1]
+            let len = self.row.len();
+            for k in 1..len - 1 {
+                let (a, b) = (self.row[k], self.row[k - 1]);
+                self.row[k] = if a >= b { a - b } else { a.wrapping_sub(b).wrapping_add(m) };
+            }
+            self.row.pop();
+            self.n -= 1;
+        }
+        while self.n < n {
+            // in place, right to left: new[k] = old[k] + old[k−1] (mod m)
+            self.row.push(1 % m);
+            let len = self.row.len();
+            for k in (1..len - 1).rev() {
+                let (a, b) = (self.row[k], self.row[k - 1]);
+                let s = a.wrapping_add(b);
+                // a, b < m: on overflow the true sum is s + 2⁶⁴ ≥ m, so subtracting m
+                // with wrapping gives the residue either way
+                self.row[k] = if s < a || s >= m { s.wrapping_sub(m) } else { s };
+            }
+            self.n += 1;
+        }
+        &self.row
+    }
+}
+
+/// Laid-out label, note and formula, kept until the text, the width or the scale changes.
+struct TextCache {
+    width: f32,
+    pixels_per_point: f32,
+    label: Arc<Galley>,
+    note: Arc<Galley>,
+    formula: Arc<Galley>,
+}
+
+/// Where everything goes inside the box.
+struct Layout {
+    bx: Rect,
+    plot: Rect,
+    label: Rect,
+    note: Option<Rect>,
+    formula: Option<Rect>,
+}
+
+pub struct WaveOverlay {
+    pub config: OverlayConfig,
+    visible: bool,
+    /// Eased visibility, 0..1.
+    fade: f32,
+    source: Option<Source>,
+    /// `target` is stale: rebuilt on the next visible `update`.
+    dirty: bool,
+    pinned: bool,
+    pascal: PascalRow,
+    /// Closed form for long rows: the app's (see `share_closed_form`) or our own.
+    closed: Option<Arc<Modulus>>,
+    target: HashMap<i64, f32>,
+    displayed: HashMap<i64, f32>,
+    /// Scratch for the per-frame top-K selection (reused).
+    active: Vec<(i64, f32)>,
+    /// w(θ_j), j = 0..samples (reused).
+    samples: Vec<f32>,
+    /// cos(2π i / P + φ) for i = 0..P, P = samples − 1 (reused, refilled every frame).
+    rot: Vec<f32>,
+    /// Active coefficients folded by frequency mod P (reused).
+    buckets: Vec<f32>,
+    phase: f32,
+    /// Smoothed running max of |w|.
+    norm: f32,
+    /// Geometry, from `set_viewport`.
+    viewport: Rect,
+    window: Vec2,
+    pixels_per_point: f32,
+    /// Prepared shapes: the fill under the wave and the anti-aliased polyline. Held in
+    /// Arcs that egui drops after tessellation, so `Arc::make_mut` reuses the buffers.
+    fill_mesh: Arc<Mesh>,
+    line_mesh: Arc<Mesh>,
+    path: Path,
+    points: Vec<Pos2>,
+    /// Label text and a second, smaller line (the k window of a deep row, an all-zero
+    /// row), rebuilt only when the source changes, and their layout.
+    label: String,
+    note: String,
+    text: Option<TextCache>,
+    /// The formula fit the box at the last layout (decided when the text is laid out).
+    formula_fits: bool,
+    settled: bool,
+}
+
+impl Default for WaveOverlay {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl WaveOverlay {
+    pub fn new() -> Self {
+        WaveOverlay {
+            config: OverlayConfig::default(),
+            visible: true,
+            fade: 0.0,
+            source: None,
+            dirty: false,
+            pinned: false,
+            pascal: PascalRow::default(),
+            closed: None,
+            target: HashMap::new(),
+            displayed: HashMap::new(),
+            active: Vec::new(),
+            samples: Vec::new(),
+            rot: Vec::new(),
+            buckets: Vec::new(),
+            phase: 0.0,
+            norm: 0.0,
+            viewport: Rect::NOTHING,
+            window: Vec2::ZERO,
+            pixels_per_point: 1.0,
+            fill_mesh: Arc::new(Mesh::default()),
+            line_mesh: Arc::new(Mesh::default()),
+            path: Path::default(),
+            points: Vec::new(),
+            label: String::new(),
+            note: String::new(),
+            text: None,
+            formula_fits: true,
+            settled: false,
+        }
+    }
+
+    pub fn visible(&self) -> bool {
+        self.visible
+    }
+
+    pub fn set_visible(&mut self, on: bool) {
+        self.visible = on;
+    }
+
+    pub fn toggle(&mut self) {
+        self.visible = !self.visible;
+    }
+
+    /// True while the overlay changes from frame to frame (fading, easing or drifting),
+    /// i.e. while the app should keep requesting redraws for it.
+    pub fn is_animating(&self) -> bool {
+        if self.visible {
+            self.fade < 1.0 || self.dirty || !self.settled || self.config.drift != 0.0
+        } else {
+            self.fade > 0.0
+        }
+    }
+
+    /// The screen rectangle of the overlay box (for hit testing), if it is drawn.
+    pub fn box_rect(&self) -> Option<Rect> {
+        if self.fade <= FADE_EPS || !self.viewport.is_positive() {
+            return None;
+        }
+        Some(self.layout().bx)
+    }
+
+    /// Point the overlay at row `row` of the triangle mod `modulus`. Cheap and idempotent:
+    /// it only records the request; the coefficients are rebuilt by the next visible
+    /// `update`, and only when the row, the modulus or (for rows too long to enumerate)
+    /// the k window changed. `k_window` is the part of the row on screen; it is used only
+    /// when the row has more than ROW_ENUM_CAP entries.
+    pub fn set_source(&mut self, row: u64, modulus: u64, k_window: (u64, u64)) {
+        let len = row.saturating_add(1);
+        let (k_lo, k_hi) = if len <= ROW_ENUM_CAP {
+            (0, row)
+        } else {
+            let lo = k_window.0.min(row);
+            let hi = k_window.1.clamp(lo, row);
+            // centre a window of ROW_ENUM_CAP entries on the visible range
+            let mid = lo + (hi - lo) / 2;
+            let lo2 = mid.saturating_sub(ROW_ENUM_CAP / 2).min(len - ROW_ENUM_CAP);
+            (lo2, lo2 + ROW_ENUM_CAP - 1)
+        };
+        let src = Source { row, modulus, k_lo, k_hi };
+        if self.source == Some(src) {
+            return;
+        }
+        // A new window of the same long row only changes the target when the window
+        // moved a lot; keeps the morph calm while panning along a deep row.
+        if let Some(old) = self.source {
+            if old.row == row && old.modulus == modulus && len > ROW_ENUM_CAP && old.k_lo.abs_diff(k_lo) < ROW_ENUM_CAP / 8 {
+                return;
+            }
+        }
+        self.source = Some(src);
+        self.dirty = true;
+    }
+
+    /// Lend the overlay the app's closed form for the current modulus, so long rows do not
+    /// build a second copy of its tables. Cheap (an Arc clone when it changed).
+    pub fn share_closed_form(&mut self, md: &Arc<Modulus>) {
+        if !self.closed.as_ref().is_some_and(|c| Arc::ptr_eq(c, md)) {
+            self.closed = Some(md.clone());
+        }
+    }
+
+    /// Mark the row as pinned by the user (shown in the label).
+    pub fn set_pinned(&mut self, pinned: bool) {
+        if pinned != self.pinned {
+            self.pinned = pinned;
+            self.dirty = true;
+        }
+    }
+
+    /// Canvas rectangle and window size (points) and pixels per point. Cheap; call every
+    /// frame (handles resizes).
+    pub fn set_viewport(&mut self, canvas: Rect, window: Vec2, pixels_per_point: f32) {
+        self.viewport = canvas;
+        self.window = window;
+        self.pixels_per_point = if pixels_per_point.is_finite() { pixels_per_point.max(0.1) } else { 1.0 };
+    }
+
+    /// Rebuild `target` and the texts for the current source.
+    fn rebuild(&mut self) {
+        let Some(src) = self.source else { return };
+        let in_range = self.rebuild_target(src);
+        let Source { row: n, modulus: m, k_lo, k_hi } = src;
+        use std::fmt::Write;
+        self.label.clear();
+        let _ = write!(self.label, "row {} · mod {}", group(n), group(m));
+        if self.pinned {
+            self.label.push_str(" · pinned");
+        }
+        // the verdict goes first, so a narrow box elides the k range rather than it
+        self.note.clear();
+        if !in_range {
+            self.note.push_str("beyond the overlay's range");
+        } else if self.target.is_empty() {
+            self.note.push_str("every r_k is 0");
+        }
+        if n.saturating_add(1) > ROW_ENUM_CAP {
+            if !self.note.is_empty() {
+                self.note.push_str(" · ");
+            }
+            let _ = write!(self.note, "k {}–{}", group(k_lo), group(k_hi));
+        }
+        self.text = None;
+    }
+
+    /// Fill `target` with the nonzero r_k of `src`; false when the row is out of reach.
+    fn rebuild_target(&mut self, src: Source) -> bool {
+        self.target.clear();
+        let Source { row: n, modulus: m, k_lo, k_hi } = src;
+        if m <= 1 {
+            // every residue mod 1 is 0: an empty target, so the wave eases to a flat line
+            return true;
+        }
+        let ni = n as i64;
+        if n <= PASCAL_MAX_ROW {
+            let row = self.pascal.get(n, m);
+            for (k, &r) in row.iter().enumerate() {
+                if r != 0 {
+                    self.target.insert(ni - 2 * k as i64, r as f32);
+                }
+            }
+        } else if m <= MOD_CAP as u64 && n <= u32::MAX as u64 {
+            let m32 = m as u32;
+            if self.closed.as_ref().map(|c| c.m) != Some(m32) {
+                self.closed = Some(Arc::new(Modulus::new(m32)));
+            }
+            let md = self.closed.as_ref().expect("closed form just built");
+            for k in k_lo..=k_hi {
+                let r = md.binom(n as u32, k as u32);
+                if r != 0 {
+                    self.target.insert(ni - 2 * k as i64, r as f32);
+                }
+            }
+        } else {
+            // Moduli above the app's cap have no closed-form tables; a deep row would
+            // need O(n²) Pascal steps, so it is left flat rather than stalling the UI.
+            log::debug!("wave overlay: row {n} mod {m} is beyond the overlay's range");
+            return false;
+        }
+        // every target frequency gets a displayed entry to ease from (allocates only
+        // here, on a source change)
+        for &f in self.target.keys() {
+            self.displayed.entry(f).or_insert(0.0);
+        }
+        true
+    }
+
+    /// The box and its parts for the current viewport.
+    fn layout(&self) -> Layout {
+        let c = &self.config;
+        let vp = self.viewport;
+        let basis = if self.window.x > 0.0 && self.window.y > 0.0 { self.window.x.min(self.window.y) } else { vp.width().min(vp.height()) };
+        let avail_w = (vp.width() - 2.0 * c.margin).max(1.0);
+        let avail_h = (vp.height() - 2.0 * c.margin - c.top_clearance - c.bottom_clearance).max(1.0);
+        let side = (c.size_frac * basis).clamp(c.min_side, c.max_side).min(avail_w).min(avail_h).max(1.0);
+        let x = match c.corner {
+            Corner::TopRight | Corner::BottomRight => vp.max.x - c.margin - side,
+            Corner::TopLeft | Corner::BottomLeft => vp.min.x + c.margin,
+        };
+        let y = match c.corner {
+            Corner::TopRight | Corner::TopLeft => vp.min.y + c.margin + c.top_clearance,
+            Corner::BottomRight | Corner::BottomLeft => vp.max.y - c.margin - c.bottom_clearance - side,
+        };
+        let bx = Rect::from_min_size(Pos2::new(x, y), Vec2::splat(side));
+        let inner = bx.shrink(PAD);
+        let show_formula = side >= FORMULA_MIN_SIDE && self.formula_fits;
+        let formula_h = if show_formula { FORMULA_H } else { 0.0 };
+        let label = Rect::from_min_max(inner.min, Pos2::new(inner.max.x, inner.min.y + LABEL_H));
+        let note = (!self.note.is_empty()).then(|| Rect::from_min_max(Pos2::new(inner.min.x, label.max.y), Pos2::new(inner.max.x, label.max.y + NOTE_H)));
+        let top = note.map_or(label.max.y, |r| r.max.y);
+        let plot = Rect::from_min_max(Pos2::new(inner.min.x, top), Pos2::new(inner.max.x, (inner.max.y - formula_h).max(top + 1.0)));
+        let formula = show_formula.then(|| Rect::from_min_max(Pos2::new(inner.min.x, inner.max.y - FORMULA_H), inner.max));
+        Layout { bx, plot, label, note, formula }
+    }
+
+    /// Advance the animation by the real frame time `dt` (seconds): fade, phase drift,
+    /// coefficient easing, sampling, normalization and the prepared geometry. Call once
+    /// per frame, after `set_source` and `set_viewport`.
+    pub fn update(&mut self, dt: f32) {
+        let dt = if dt.is_finite() { dt.max(0.0) } else { 0.0 };
+        let alpha = 1.0 - (-dt / TAU).exp();
+        let want = if self.visible { 1.0 } else { 0.0 };
+        self.fade += (want - self.fade) * alpha;
+        if (self.fade - want).abs() < FADE_EPS {
+            self.fade = want;
+        }
+        let drift = if self.config.drift.is_finite() { self.config.drift } else { 0.0 };
+        self.phase = (self.phase + drift * dt).rem_euclid(std::f32::consts::TAU);
+        if !self.visible && self.fade <= FADE_EPS {
+            return; // hidden: nothing to compute
+        }
+        if self.dirty {
+            self.dirty = false;
+            self.rebuild();
+            self.settled = false;
+        }
+
+        // ease every displayed coefficient toward its target (0 when absent)
+        let target = &self.target;
+        let mut moving = false;
+        for (f, v) in self.displayed.iter_mut() {
+            let t = target.get(f).copied().unwrap_or(0.0);
+            *v += (t - *v) * alpha;
+            if (t - *v).abs() > DROP_EPS * (1.0 + t.abs()) {
+                moving = true;
+            }
+        }
+        self.displayed.retain(|f, v| v.abs() >= DROP_EPS || target.get(f).is_some_and(|t| t.abs() >= DROP_EPS));
+
+        // the frequencies to draw: all, or for long rows only the TOP_K largest |value|
+        // (cost per frame is frequencies × samples; the small terms of a row past ~2000
+        // entries are invisible at this size)
+        self.active.clear();
+        self.active.extend(self.displayed.iter().map(|(&f, &v)| (f, v)));
+        let long_row = self.source.is_some_and(|s| s.row > LARGE_ROW);
+        if long_row && self.active.len() > TOP_K {
+            self.active.select_nth_unstable_by(TOP_K, |a, b| b.1.abs().total_cmp(&a.1.abs()));
+            self.active.truncate(TOP_K);
+        }
+
+        // sample count from the plot width in pixels
+        let plot = self.layout().plot;
+        let px = (plot.width() * self.pixels_per_point).max(1.0);
+        let n_samples = ((px * 2.0).round() as usize).clamp(MIN_SAMPLES, MAX_SAMPLES);
+        if self.samples.len() != n_samples {
+            self.samples.resize(n_samples, 0.0);
+        }
+        let period = n_samples - 1; // θ_j = −π + 2π j / period, j = 0..=period
+        if self.rot.len() != period {
+            self.rot.resize(period, 0.0);
+        }
+        // cos(f θ_j + φ) = (−1)^f · cos(2π ((f mod P)·j mod P) / P + φ): exact for any
+        // integer frequency, so rows near 10⁹ need no large trig arguments, and all
+        // frequencies with the same f mod P fold into one bucket (≤ P² terms per frame).
+        let step = std::f32::consts::TAU / period as f32;
+        for (i, r) in self.rot.iter_mut().enumerate() {
+            *r = (step * i as f32 + self.phase).cos();
+        }
+        let p64 = period as i64;
+        self.buckets.clear();
+        self.buckets.resize(period, 0.0);
+        for &(f, c) in &self.active {
+            self.buckets[f.rem_euclid(p64) as usize] += if f.rem_euclid(2) == 1 { -c } else { c };
+        }
+        self.samples.iter_mut().for_each(|s| *s = 0.0);
+        for (b, &c) in self.buckets.iter().enumerate() {
+            if c == 0.0 {
+                continue;
+            }
+            let mut i = 0usize;
+            for s in self.samples.iter_mut() {
+                *s += c * self.rot[i];
+                i += b;
+                if i >= period {
+                    i -= period;
+                }
+            }
+        }
+
+        // normalize by a smoothed running max of |w| (fast rise, slow fall), floored
+        let raw = self.samples.iter().fold(0.0f32, |a, &s| a.max(s.abs())).max(NORM_FLOOR);
+        if !(self.norm > 0.0 && self.norm.is_finite()) {
+            self.norm = raw;
+        } else {
+            let k = if raw > self.norm { alpha } else { 1.0 - (-dt / NORM_RELEASE).exp() };
+            self.norm += (raw - self.norm) * k;
+        }
+        self.norm = self.norm.max(NORM_FLOOR);
+        if (raw - self.norm).abs() > 1e-3 * raw {
+            moving = true;
+        }
+        self.settled = !moving;
+        self.build_geometry(plot);
+    }
+
+    /// Fill and polyline meshes for the current samples (buffers reused across frames).
+    fn build_geometry(&mut self, plot: Rect) {
+        let fade = self.fade;
+        let n = self.samples.len();
+        let cy = plot.center().y;
+        let half = plot.height() * 0.5 * 0.92;
+        let inv = 1.0 / self.norm.max(NORM_FLOOR);
+        self.points.clear();
+        for (j, &s) in self.samples.iter().enumerate() {
+            let x = plot.min.x + plot.width() * j as f32 / (n - 1).max(1) as f32;
+            let y = (cy - s * inv * half).clamp(plot.min.y, plot.max.y);
+            self.points.push(Pos2::new(x, y));
+        }
+        let [r, g, b] = WAVE_RGB;
+        let fill = Arc::make_mut(&mut self.fill_mesh);
+        fill.clear();
+        if self.config.fill {
+            let fill_col = Color32::from_rgba_unmultiplied(r, g, b, (0.15 * 255.0 * fade).round() as u8);
+            for (j, p) in self.points.iter().enumerate() {
+                fill.colored_vertex(*p, fill_col);
+                fill.colored_vertex(Pos2::new(p.x, cy), fill_col);
+                if j > 0 {
+                    let a = 2 * (j as u32 - 1);
+                    fill.add_triangle(a, a + 1, a + 2);
+                    fill.add_triangle(a + 1, a + 3, a + 2);
+                }
+            }
+        }
+        let line = Arc::make_mut(&mut self.line_mesh);
+        line.clear();
+        if self.points.len() >= 2 {
+            self.path.clear();
+            self.path.add_open_points(&self.points);
+            let stroke = PathStroke::from(Stroke::new(2.0, Color32::from_rgba_unmultiplied(r, g, b, (255.0 * fade).round() as u8)));
+            self.path.stroke_open(1.0 / self.pixels_per_point, &stroke, line);
+        }
+    }
+
+    /// Add the overlay to `painter`, on top of whatever the painter already holds.
+    pub fn draw(&mut self, painter: &egui::Painter) {
+        if self.fade <= FADE_EPS || !self.viewport.is_positive() {
+            return;
+        }
+        let Layout { bx, plot, label: label_rect, note: note_rect, formula: formula_rect } = self.layout();
+        let fade = self.fade;
+        let a = |x: f32| (x * 255.0 * fade).round() as u8;
+        painter.rect_filled(bx, CornerRadius::same(8), Color32::from_rgba_unmultiplied(0, 0, 0, a(0.62)));
+        painter.rect_stroke(bx, CornerRadius::same(8), Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, a(0.15))), StrokeKind::Inside);
+        let zero = Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, a(0.18)));
+        painter.line_segment([Pos2::new(plot.min.x, plot.center().y), Pos2::new(plot.max.x, plot.center().y)], zero);
+        painter.add(Shape::mesh(self.fill_mesh.clone()));
+        painter.add(Shape::mesh(self.line_mesh.clone()));
+
+        // text: laid out once per label / size / scale, elided to the box width
+        let width = label_rect.width();
+        let ppp = self.pixels_per_point;
+        if !self.text.as_ref().is_some_and(|t| t.width == width && t.pixels_per_point == ppp) {
+            let line = |text: String, size: f32| {
+                let mut job = LayoutJob::simple_singleline(text, FontId::monospace(size), Color32::WHITE);
+                job.wrap = TextWrapping::truncate_at_width(width);
+                painter.layout_job(job)
+            };
+            let formula = line(FORMULA.to_string(), 10.0);
+            self.formula_fits = !formula.elided;
+            self.text = Some(TextCache { width, pixels_per_point: ppp, label: line(self.label.clone(), 11.0), note: line(self.note.clone(), 10.0), formula });
+        }
+        let text = self.text.as_ref().expect("laid out above");
+        painter.galley_with_override_text_color(label_rect.min, text.label.clone(), Color32::from_rgba_unmultiplied(221, 221, 221, a(0.9)));
+        if let Some(nr) = note_rect {
+            painter.galley_with_override_text_color(nr.min, text.note.clone(), Color32::from_rgba_unmultiplied(187, 187, 187, a(0.7)));
+        }
+        if let Some(fr) = formula_rect {
+            let pos = Pos2::new(fr.min.x, fr.max.y - text.formula.size().y);
+            painter.galley_with_override_text_color(pos, text.formula.clone(), Color32::from_rgba_unmultiplied(187, 187, 187, a(0.7)));
+        }
+    }
+
+    // ---- read access for tests and diagnostics ----
+
+    pub fn samples(&self) -> &[f32] {
+        &self.samples
+    }
+
+    pub fn norm(&self) -> f32 {
+        self.norm
+    }
+
+    pub fn fade(&self) -> f32 {
+        self.fade
+    }
+
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    pub fn note(&self) -> &str {
+        &self.note
+    }
+
+    pub fn displayed(&self, f: i64) -> f32 {
+        self.displayed.get(&f).copied().unwrap_or(0.0)
+    }
+
+    pub fn target(&self, f: i64) -> f32 {
+        self.target.get(&f).copied().unwrap_or(0.0)
+    }
+
+    pub fn displayed_len(&self) -> usize {
+        self.displayed.len()
+    }
+
+    pub fn active_len(&self) -> usize {
+        self.active.len()
+    }
+}
+
+/// `1234567` → `1,234,567`.
+fn group(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, ch) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::math::binom_exact;
+
+    fn overlay() -> WaveOverlay {
+        let mut w = WaveOverlay::new();
+        w.set_viewport(Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 700.0)), Vec2::new(1300.0, 760.0), 1.0);
+        w
+    }
+
+    /// Run `secs` of frames of length `dt`.
+    fn run(w: &mut WaveOverlay, secs: f32, dt: f32) {
+        for _ in 0..(secs / dt).round() as usize {
+            w.update(dt);
+        }
+    }
+
+    #[test]
+    fn pascal_row_matches_true_binomials_mod_m() {
+        let mut pr = PascalRow::default();
+        let huge = u64::MAX - 58; // the largest prime below 2⁶⁴: sums overflow u64
+        for m in [1u64, 2, 3, 4, 6, 7, 10, 12, 30, 97, 65536, 1_000_000_007, 1 << 63, huge] {
+            for n in 0..=30u64 {
+                let row = pr.get(n, m).to_vec();
+                assert_eq!(row.len() as u64, n + 1);
+                for (k, &r) in row.iter().enumerate() {
+                    let exact = binom_exact(n as u32, k as u32).unwrap();
+                    assert_eq!(r as u128, exact % m as u128, "C({n},{k}) mod {m}");
+                }
+            }
+            // stepping backwards (inverse Pascal rule, or a restart for big jumps)
+            for n in (0..=29u64).rev().chain([30, 3, 28, 27, 0, 30, 2]) {
+                let row = pr.get(n, m).to_vec();
+                let want: Vec<u128> = (0..=n as u32).map(|k| binom_exact(n as u32, k).unwrap() % m as u128).collect();
+                assert_eq!(row.iter().map(|&x| x as u128).collect::<Vec<_>>(), want, "row {n} mod {m}");
+            }
+        }
+        // deep enough that C(n,k) overflows u64 many times over, forward and back
+        for n in [125u64, 124, 110, 125] {
+            let row = pr.get(n, huge).to_vec();
+            for (k, &r) in row.iter().enumerate() {
+                assert_eq!(r as u128, binom_exact(n as u32, k as u32).unwrap() % huge as u128, "C({n},{k}) mod {huge}");
+            }
+        }
+    }
+
+    #[test]
+    fn closed_form_rows_match_pascal_rows() {
+        // the long-row path (closed form) agrees with Pascal's rule where both apply
+        let mut pr = PascalRow::default();
+        for m in [2u32, 9, 30, 101] {
+            let md = Modulus::new(m);
+            let n = PASCAL_MAX_ROW + 1;
+            let row = pr.get(n, m as u64).to_vec();
+            for (k, &r) in row.iter().enumerate() {
+                assert_eq!(md.binom(n as u32, k as u32) as u64, r, "C({n},{k}) mod {m}");
+            }
+        }
+    }
+
+    #[test]
+    fn target_is_keyed_by_frequency() {
+        let mut w = overlay();
+        w.set_source(4, 7, (0, 4));
+        w.update(0.0);
+        // row 4: 1 4 6 4 1 at frequencies 4, 2, 0, −2, −4
+        for (f, c) in [(4, 1.0), (2, 4.0), (0, 6.0), (-2, 4.0), (-4, 1.0)] {
+            assert_eq!(w.target(f), c);
+        }
+        assert_eq!(w.target(1), 0.0);
+        assert_eq!(w.label(), "row 4 · mod 7");
+        assert_eq!(w.note(), "");
+        w.set_pinned(true);
+        w.update(0.0);
+        assert_eq!(w.label(), "row 4 · mod 7 · pinned");
+        // a long row, through the closed form: C(2050, k) mod 7 at f = 2050 − 2k
+        let mut w = overlay();
+        w.set_source(2050, 7, (0, 2050));
+        w.update(0.0);
+        let md = Modulus::new(7);
+        for k in [0u32, 1, 2, 7, 49, 1000, 1025, 2050] {
+            assert_eq!(w.target(2050 - 2 * k as i64), md.binom(2050, k) as f32, "k={k}");
+        }
+    }
+
+    #[test]
+    fn set_source_is_lazy_and_idempotent() {
+        let mut w = overlay();
+        w.set_source(12, 5, (0, 12));
+        assert_eq!(w.target(12), 0.0, "nothing is built before update");
+        w.update(1.0 / 60.0);
+        assert_eq!(w.target(12), 1.0);
+        let label = w.label().as_ptr();
+        w.set_source(12, 5, (0, 12));
+        assert!(!w.dirty, "the same source is a no-op");
+        w.update(1.0 / 60.0);
+        assert_eq!(w.label().as_ptr(), label);
+        // hidden overlays do no work
+        w.set_visible(false);
+        run(&mut w, 2.0, 1.0 / 60.0);
+        w.set_source(13, 5, (0, 13));
+        w.update(1.0 / 60.0);
+        assert!(w.dirty && w.target(13) == 0.0);
+    }
+
+    #[test]
+    fn smoothing_converges_to_target_frame_rate_independently() {
+        for dt in [1.0 / 30.0, 1.0 / 144.0] {
+            let mut w = overlay();
+            w.set_source(6, 5, (0, 6));
+            run(&mut w, 2.0, dt);
+            for f in [-6i64, -4, -2, 0, 2, 4, 6] {
+                assert!((w.displayed(f) - w.target(f)).abs() < 1e-3, "dt={dt}: f={f} {} vs {}", w.displayed(f), w.target(f));
+            }
+            // a new row eases away from the old one, and old frequencies decay to nothing
+            w.set_source(7, 5, (0, 7));
+            w.update(0.01);
+            assert!(w.displayed(5) > 0.0 && w.displayed(5) < w.target(5), "eases, does not snap");
+            assert!(w.displayed(6) > 0.0, "the old row fades out");
+            run(&mut w, 3.0, dt);
+            assert_eq!(w.displayed(6), 0.0, "row 7 has only odd frequencies");
+            assert!((w.displayed(5) - w.target(5)).abs() < 1e-3);
+        }
+        // the same elapsed time gives the same state at different frame rates
+        let state = |dt: f32| {
+            let mut w = overlay();
+            w.set_source(10, 11, (0, 10));
+            w.update(0.0);
+            run(&mut w, 0.3, dt);
+            (w.displayed(0), w.norm(), w.fade())
+        };
+        let (a, b) = (state(1.0 / 30.0), state(1.0 / 240.0));
+        assert!(a.0 > 1.0, "C(10,5) mod 11 = 10 is on its way");
+        assert!((a.0 - b.0).abs() < 1e-3 * a.0 && (a.2 - b.2).abs() < 1e-3, "{a:?} vs {b:?}");
+        // the normalization chases a moving max, so it agrees only approximately
+        assert!((a.1 - b.1).abs() < 0.05 * a.1, "{a:?} vs {b:?}");
+    }
+
+    #[test]
+    fn edge_cases_produce_no_nans() {
+        for (n, m) in [(0u64, 1u64), (0, 7), (5, 1), (10, 1), (3, 2), (100, u64::from(u32::MAX)), (40, u64::MAX), (5000, 1_000_003), (1_000_000_000, 7), (u64::from(u32::MAX), 2), (u64::MAX, 3)] {
+            let mut w = overlay();
+            w.set_source(n, m, (0, n.min(1000)));
+            run(&mut w, 0.5, 1.0 / 60.0);
+            assert!(w.samples().iter().all(|s| s.is_finite()), "n={n} m={m}");
+            assert!(w.norm().is_finite() && w.norm() > 0.0, "n={n} m={m}");
+            if m == 1 {
+                assert!(w.samples().iter().all(|s| *s == 0.0), "m = 1 is a flat line");
+                assert_eq!(w.note(), "every r_k is 0");
+            }
+        }
+        // n = 0: a single coefficient at frequency 0, so w(θ) = cos φ everywhere
+        let mut w = overlay();
+        w.set_source(0, 7, (0, 0));
+        run(&mut w, 2.0, 1.0 / 60.0);
+        let s = w.samples();
+        assert!(s.iter().all(|x| (x - s[0]).abs() < 1e-4), "row 0 is constant in θ");
+        // odd frame times, a zero-sized window and resizes stay finite
+        let mut w = overlay();
+        w.set_source(33, 6, (0, 33));
+        for dt in [0.0, -1.0, f32::NAN, f32::INFINITY, 1e-7, 5.0] {
+            w.update(dt);
+        }
+        for size in [Vec2::new(0.0, 0.0), Vec2::new(90.0, 4000.0), Vec2::new(5000.0, 3000.0)] {
+            w.set_viewport(Rect::from_min_size(Pos2::ZERO, size), size, 2.0);
+            w.update(1.0 / 60.0);
+            assert!(w.samples().iter().all(|s| s.is_finite()) && w.norm().is_finite(), "{size:?}");
+            assert!(w.samples().len() <= MAX_SAMPLES);
+        }
+    }
+
+    #[test]
+    fn samples_match_the_direct_sum() {
+        let mut w = overlay();
+        w.set_source(9, 11, (0, 9));
+        run(&mut w, 4.0, 1.0 / 60.0);
+        let s = w.samples().to_vec();
+        let period = s.len() - 1;
+        let phase = w.phase;
+        for (j, &got) in s.iter().enumerate().step_by(37) {
+            let theta = -std::f64::consts::PI + 2.0 * std::f64::consts::PI * j as f64 / period as f64;
+            let want: f64 = (0..=9i64).map(|k| w.displayed(9 - 2 * k) as f64 * ((9 - 2 * k) as f64 * theta + phase as f64).cos()).sum();
+            assert!((got as f64 - want).abs() < 1e-3 * (1.0 + want.abs()), "j={j}: {got} vs {want}");
+        }
+    }
+
+    #[test]
+    fn long_rows_draw_only_the_largest_coefficients() {
+        let mut w = overlay();
+        w.set_source(3000, 999_983, (0, 3000));
+        run(&mut w, 0.2, 1.0 / 60.0);
+        assert!(w.displayed_len() > TOP_K);
+        assert_eq!(w.active_len(), TOP_K);
+        // short rows draw everything
+        let mut w = overlay();
+        w.set_source(1500, 999_983, (0, 1500));
+        run(&mut w, 0.2, 1.0 / 60.0);
+        assert_eq!(w.active_len(), 1501);
+        // rows beyond the enumeration cap use a window of k around the visible part
+        let mut w = overlay();
+        w.set_source(1_000_000_000, 30, (499_999_000, 500_001_000));
+        let s = w.source.unwrap();
+        assert_eq!(s.k_hi - s.k_lo + 1, ROW_ENUM_CAP);
+        assert!(s.k_lo <= 499_999_000 && s.k_hi >= 500_001_000);
+        // ... clamped to the row
+        w.set_source(1_000_000_000, 30, (999_999_990, 1_000_000_000));
+        let s = w.source.unwrap();
+        assert_eq!((s.k_hi, s.k_hi - s.k_lo + 1), (1_000_000_000, ROW_ENUM_CAP));
+        run(&mut w, 0.2, 1.0 / 60.0);
+        assert_eq!(w.label(), "row 1,000,000,000 · mod 30");
+        assert!(w.note().starts_with("k 999,983,617–1,000,000,000"), "{}", w.note());
+        // deep rows are mostly zeros: say so instead of drawing an unexplained flat line
+        let mut w = overlay();
+        w.set_source(587_896_253, 30, (0, 587_896_253));
+        w.update(1.0 / 60.0);
+        if w.displayed_len() == 0 {
+            assert!(w.note().starts_with("every r_k is 0 · k "), "{}", w.note());
+        }
+    }
+
+    #[test]
+    fn hiding_fades_out() {
+        let mut w = overlay();
+        w.set_source(8, 3, (0, 8));
+        run(&mut w, 1.0, 1.0 / 60.0);
+        assert!(w.box_rect().is_some());
+        assert!(w.is_animating(), "the phase drifts");
+        w.toggle();
+        w.update(1.0 / 60.0);
+        assert!(w.fade() > 0.5, "fades, does not pop");
+        run(&mut w, 2.0, 1.0 / 60.0);
+        assert!(w.box_rect().is_none());
+        assert!(!w.is_animating(), "a hidden overlay needs no redraws");
+        // with the drift off, a settled overlay stops asking for frames
+        let mut w = overlay();
+        w.config.drift = 0.0;
+        w.set_source(8, 3, (0, 8));
+        run(&mut w, 3.0, 1.0 / 60.0);
+        assert!(!w.is_animating());
+    }
+
+    #[test]
+    fn box_follows_the_window_and_stays_inside_the_canvas() {
+        let mut w = overlay();
+        w.set_source(5, 3, (0, 5));
+        run(&mut w, 1.0, 1.0 / 60.0);
+        // 28% of min(1300, 760) = 212.8
+        let b = w.box_rect().unwrap();
+        assert!((b.width() - 212.8).abs() < 1e-3 && (b.width() - b.height()).abs() < 1e-3, "{b:?}");
+        assert_eq!(b.max.x, 1000.0 - 16.0);
+        // clamped to [160, 420]
+        w.set_viewport(Rect::from_min_size(Pos2::ZERO, Vec2::new(3000.0, 2000.0)), Vec2::new(3300.0, 2100.0), 1.0);
+        assert_eq!(w.box_rect().unwrap().width(), 420.0);
+        w.set_viewport(Rect::from_min_size(Pos2::ZERO, Vec2::new(400.0, 300.0)), Vec2::new(500.0, 360.0), 1.0);
+        assert_eq!(w.box_rect().unwrap().width(), 160.0);
+        // and never larger than the canvas
+        let canvas = Rect::from_min_size(Pos2::new(300.0, 0.0), Vec2::new(150.0, 900.0));
+        w.set_viewport(canvas, Vec2::new(450.0, 960.0), 1.0);
+        assert!(canvas.contains_rect(w.box_rect().unwrap()));
+        for c in Corner::ALL {
+            w.config.corner = c;
+            w.set_viewport(Rect::from_min_size(Pos2::new(300.0, 0.0), Vec2::new(980.0, 736.0)), Vec2::new(1280.0, 800.0), 1.0);
+            let b = w.box_rect().unwrap();
+            assert!(Rect::from_min_size(Pos2::new(300.0, 0.0), Vec2::new(980.0, 736.0)).contains_rect(b), "{c:?}");
+        }
+    }
+}
+
