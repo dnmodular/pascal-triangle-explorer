@@ -196,8 +196,196 @@ impl CpuGrid {
         cur
     }
 
+    fn residue(&self, n: u32, k: u32) -> u32 {
+        if k > n { 0 } else { self.md.binom(n, k) }
+    }
+
+    fn wrap(&self, a: u32, b: u32) -> u32 {
+        let d = a.abs_diff(b);
+        d.min(self.md.m - d)
+    }
+
+    fn per_cell(&self, f: impl Fn(u32, u32, u32) -> f32) -> Vec<f32> {
+        self.cells.iter().map(|c| c.map(|(n, k, v)| f(n, k, v)).unwrap_or(0.0)).collect()
+    }
+
+    /// Breadth-first lattice distance to the nearest zero over the grid's neighbour
+    /// graph, saturated at `cap`; 0 everywhere when the view holds no zero.
+    fn dist_to_zero(&self) -> Vec<f32> {
+        let (w, h) = (self.grid.w as i32, self.grid.h as i32);
+        let cap = 256u32.min(self.grid.w.max(self.grid.h));
+        let mut dist = vec![u32::MAX; self.cells.len()];
+        let mut queue = std::collections::VecDeque::new();
+        for (i, c) in self.cells.iter().enumerate() {
+            if matches!(c, Some((_, _, 0))) {
+                dist[i] = 0;
+                queue.push_back(i);
+            }
+        }
+        if queue.is_empty() {
+            return vec![0.0; self.cells.len()];
+        }
+        while let Some(i) = queue.pop_front() {
+            let (ii, jj) = ((i as i32) % w, (i as i32) / w);
+            let _ = h;
+            for which in 0..6 {
+                if let Some(ni) = self.neighbor(ii, jj, which) {
+                    if dist[ni] == u32::MAX {
+                        dist[ni] = dist[i] + 1;
+                        queue.push_back(ni);
+                    }
+                }
+            }
+        }
+        self.cells.iter().zip(&dist).map(|(c, &d)| if c.is_some() { d.min(cap) as f32 } else { 0.0 }).collect()
+    }
+
+    /// ln C(n,k) in f64 (sum of logs below 4096, Stirling above), clamped at 0.
+    fn ln_binom(n: u32, k: u32) -> f64 {
+        fn lnf(x: u32) -> f64 {
+            if x < 4096 {
+                (2..=x).map(|i| (i as f64).ln()).sum()
+            } else {
+                let x = x as f64;
+                (x + 0.5) * x.ln() - x + 0.5 * (2.0 * std::f64::consts::PI).ln() + 1.0 / (12.0 * x) - 1.0 / (360.0 * x * x * x)
+            }
+        }
+        let j = k.min(n - k);
+        (lnf(n) - lnf(j) - lnf(n - j)).max(0.0)
+    }
+
+    /// The reference's STRIPES DP (forward chain F, backward chain G, value F[i] +
+    /// G[pred]) on the additive triangle of `rows_total` rows. Returns (value, F, G)
+    /// keyed like the grid.
+    fn stripes_reference(&self, period: u32, dir: i32, tol: u32, rows_total: usize) -> (Vec<f32>, u32) {
+        let (dr, dc) = pascal::layers::direction_step(dir);
+        let m = self.md.m;
+        let tri = triangle_dp(rows_total, m);
+        let at = |r: usize, c: usize| tri[r * (r + 1) / 2 + c];
+        let wrap = |a: u32, b: u32| {
+            let d = a.abs_diff(b);
+            d.min(m - d)
+        };
+        let n_tot = rows_total;
+        let total = n_tot * (n_tot + 1) / 2;
+        let (sr, sc) = ((dr * period) as usize, (dc * period) as usize);
+        let mut cflag = vec![false; total];
+        for r in 0..n_tot {
+            let (r1, r2) = (r + sr, r + 2 * sr);
+            for c in 0..=r {
+                let (c1, c2) = (c + sc, c + 2 * sc);
+                if r1 >= n_tot || c1 > r1 || r2 >= n_tot || c2 > r2 {
+                    continue;
+                }
+                let (v0, vp, v2) = (at(r, c), at(r1, c1), at(r2, c2));
+                if wrap(v0, v2) <= tol && wrap(v0, vp) > tol {
+                    cflag[r * (r + 1) / 2 + c] = true;
+                }
+            }
+        }
+        let mut f = vec![0u32; total];
+        for r in (0..n_tot).rev() {
+            for c in (0..=r).rev() {
+                let i = r * (r + 1) / 2 + c;
+                if !cflag[i] {
+                    continue;
+                }
+                let (r1, c1) = (r + sr, c + sc);
+                f[i] = 1 + if r1 < n_tot && c1 <= r1 { f[r1 * (r1 + 1) / 2 + c1] } else { 0 };
+            }
+        }
+        let mut g = vec![0u32; total];
+        for r in 0..n_tot {
+            for c in 0..=r {
+                let i = r * (r + 1) / 2 + c;
+                if !cflag[i] {
+                    continue;
+                }
+                let ok = r >= sr && c >= sc && c - sc <= r - sr;
+                g[i] = 1 + if ok { g[(r - sr) * (r - sr + 1) / 2 + c - sc] } else { 0 };
+            }
+        }
+        let mut longest = 0;
+        let vals = self
+            .cells
+            .iter()
+            .map(|cell| {
+                let Some((n, k, _)) = *cell else { return 0.0 };
+                let (r, c) = (n as usize, k as usize);
+                let i = r * (r + 1) / 2 + c;
+                let ok = r >= sr && c >= sc && c - sc <= r - sr;
+                let gb = if ok { g[(r - sr) * (r - sr + 1) / 2 + c - sc] } else { 0 };
+                longest = longest.max(f[i]).max(gb);
+                (f[i] + gb) as f32
+            })
+            .collect();
+        (vals, longest)
+    }
+
     fn measure(&self, id: LayerId, layers: &LayerState) -> Vec<f32> {
         let p = self.md.p;
+        let m = self.md.m;
+        match id {
+            LayerId::Gradient => {
+                return self.per_cell(|n, k, v| {
+                    let mut g = 0;
+                    if n > 0 {
+                        if k > 0 {
+                            g += self.wrap(v, self.residue(n - 1, k - 1));
+                        }
+                        if k < n {
+                            g += self.wrap(v, self.residue(n - 1, k));
+                        }
+                    }
+                    g as f32
+                })
+            }
+            LayerId::LagDiff => {
+                let (dr, dc) = pascal::layers::direction_step(layers.param("lagDir"));
+                let lag = layers.param("lagLen") as u32;
+                return self.per_cell(|n, k, v| {
+                    let (n2, k2) = (n + lag * dr, k + lag * dc);
+                    if k2 <= n2 { self.wrap(v, self.residue(n2, k2)) as f32 } else { 0.0 }
+                });
+            }
+            LayerId::Magnitude => return self.per_cell(|n, k, _| Self::ln_binom(n, k) as f32),
+            LayerId::DistZero => return self.dist_to_zero(),
+            LayerId::Primes => {
+                let t = pascal::sweep::prime_tables();
+                let mask = layers.param("primesMode") == 1;
+                return self.per_cell(|_, _, v| {
+                    let r = t.rank(v);
+                    if mask { (r > 0) as u32 as f32 } else { r as f32 }
+                });
+            }
+            LayerId::Rarity => {
+                let mut counts = std::collections::HashMap::new();
+                let mut total = 0u32;
+                for (_, _, v) in self.cells.iter().flatten() {
+                    *counts.entry(*v).or_insert(0u32) += 1;
+                    total += 1;
+                }
+                return self.per_cell(|_, _, v| ((total as f64).log2() - (counts[&v] as f64).log2()).max(0.0) as f32);
+            }
+            LayerId::Variance => {
+                let ang = |v: u32| 6.2831853f32 * v as f32 / m as f32;
+                let r = layers.param("varR") as u32;
+                let bc = self.hex_blur(&self.per_cell(|_, _, v| ang(v).cos()), r);
+                let bs = self.hex_blur(&self.per_cell(|_, _, v| ang(v).sin()), r);
+                return (0..self.cells.len()).map(|i| if self.cells[i].is_some() { (1.0 - (bc[i] * bc[i] + bs[i] * bs[i]).sqrt()).max(0.0) } else { 0.0 }).collect();
+            }
+            LayerId::Moire => {
+                let q = self.md.factors.get(1).map(|t| t.f.p);
+                let r = layers.param("moireR") as u32;
+                let Some(q) = q else { return vec![0.0; self.cells.len()] };
+                let zp = self.per_cell(|_, _, v| (v % p == 0) as u32 as f32);
+                let zq = self.per_cell(|_, _, v| (v % q == 0) as u32 as f32);
+                let zpq = self.per_cell(|_, _, v| (v % p == 0 && v % q == 0) as u32 as f32);
+                let (cp, cq, cpq) = (self.hex_blur(&zp, r), self.hex_blur(&zq, r), self.hex_blur(&zpq, r));
+                return (0..self.cells.len()).map(|i| if self.cells[i].is_some() { cpq[i] - cp[i] * cq[i] } else { 0.0 }).collect();
+            }
+            _ => {}
+        }
         let raw: Vec<f32> = self
             .cells
             .iter()
@@ -258,13 +446,13 @@ impl CpuGrid {
     fn blend(&self, layers: &LayerState) -> Vec<f32> {
         let plan = layers.plan();
         let denom = (self.md.m as f32 - 1.0).max(1.0);
-        let fields: Vec<(Vec<f32>, f32)> = plan
+        let fields: Vec<(Vec<f32>, f32, bool)> = plan
             .measures
             .iter()
             .map(|d| {
                 let f = self.measure(d.id, layers);
-                let mx = f.iter().cloned().fold(0.0f32, f32::max);
-                (f, if mx == 0.0 { 1.0 } else { mx })
+                let mx = f.iter().map(|x| if d.signed { x.abs() } else { *x }).fold(0.0f32, f32::max);
+                (f, if mx == 0.0 { 1.0 } else { mx }, d.signed)
             })
             .collect();
         (0..self.cells.len())
@@ -281,8 +469,9 @@ impl CpuGrid {
                 };
                 let mut acc = if layers.blend == BlendMode::Multiply { 1.0 } else { 0.0 };
                 let mut nl = 0.0;
-                for (f, mx) in &fields {
-                    acc = fold(acc, f[idx] * (1.0 / mx));
+                for (f, mx, signed) in &fields {
+                    let raw = f[idx] * (1.0 / mx);
+                    acc = fold(acc, if *signed { 0.5 + 0.5 * raw.clamp(-1.0, 1.0) } else { raw });
                     nl += 1.0;
                 }
                 if plan.wants_value {
@@ -560,4 +749,118 @@ fn tween_is_display_only_and_lands_on_the_true_frame() {
     r.render_blocking(&tween_frame(grid, &m13, &pal, &layers, Tween::Start(0.0)));
     let (_, _, d0) = r.read_display_rgba();
     assert_rgba_close(&d0, &mid, 0, "morph retarget starts from the blended field");
+}
+
+#[test]
+fn ported_measures_match_cpu() {
+    let (_gpu, mut r) = device();
+    let pal = Palette::new(Scheme::Viridis);
+    let rows = 100u32;
+    let (_, grid) = cell_grid(rows);
+    // (modulus, layer, parameters, tolerance)
+    let cases: &[(u32, LayerId, &[(&str, i32)], f32)] = &[
+        (7, LayerId::Gradient, &[], 0.0),
+        (12, LayerId::Gradient, &[], 0.0),
+        (65537, LayerId::Gradient, &[], 0.0),
+        (2, LayerId::DistZero, &[], 0.0),
+        (3, LayerId::DistZero, &[], 0.0),
+        (30, LayerId::DistZero, &[], 0.0),
+        (99991, LayerId::DistZero, &[], 0.0), // no zero in view: 0 everywhere
+        (5, LayerId::Magnitude, &[], 2e-3),
+        (5, LayerId::Variance, &[("varR", 4)], 2e-5),
+        (30, LayerId::Variance, &[("varR", 1)], 2e-5),
+        (7, LayerId::Rarity, &[], 2e-5),
+        (360, LayerId::Rarity, &[], 2e-5),
+        (6, LayerId::Moire, &[("moireR", 4)], 2e-6),
+        (30, LayerId::Moire, &[("moireR", 2)], 2e-6),
+        (9, LayerId::Moire, &[("moireR", 4)], 0.0), // prime power: flat
+        (11, LayerId::Primes, &[("primesMode", 0)], 0.0),
+        (100, LayerId::Primes, &[("primesMode", 1)], 0.0),
+        (13, LayerId::LagDiff, &[("lagDir", 0), ("lagLen", 1)], 0.0),
+        (13, LayerId::LagDiff, &[("lagDir", 1), ("lagLen", 7)], 0.0),
+        (30, LayerId::LagDiff, &[("lagDir", 2), ("lagLen", 3)], 0.0),
+    ];
+    for &(m, id, params, tol) in cases {
+        let cg = CpuGrid::new(grid, m);
+        let mut layers = LayerState::default();
+        layers.set_active(LayerId::Value, false);
+        layers.set_active(id, true);
+        for &(k, v) in params {
+            layers.params.insert(k, v);
+        }
+        r.render_blocking(&frame(grid, &cg.md, &pal, &layers));
+        let got = r.read_field(0);
+        let want = cg.measure(id, &layers);
+        assert_close(&got, &want, tol, &format!("m={m} {id:?} {params:?}"));
+        let signed = pascal::layers::def(id).signed;
+        let mx = r.read_max()[0];
+        let want_mx = want.iter().map(|x| if signed { x.abs() } else { *x }).fold(0.0, f32::max);
+        assert!((mx - want_mx).abs() <= tol.max(want_mx * 1e-5), "m={m} {id:?}: max {mx} vs {want_mx}");
+    }
+}
+
+#[test]
+fn stripes_match_reference_dp() {
+    let (_gpu, mut r) = device();
+    let pal = Palette::new(Scheme::Viridis);
+    let rows = 90u32;
+    let (_, grid) = cell_grid(rows);
+    for &(m, dir, period, tol) in &[(7u32, 0i32, 1u32, 0u32), (7, 1, 1, 0), (7, 2, 1, 0), (199, 0, 1, 4), (199, 2, 2, 6), (12, 1, 2, 0), (3, 0, 3, 0)] {
+        let cg = CpuGrid::new(grid, m);
+        let mut layers = LayerState::default();
+        layers.set_active(LayerId::Value, false);
+        layers.set_active(LayerId::Stripes, true);
+        layers.params.insert("stripeDir", dir);
+        layers.params.insert("stripePeriod", period as i32);
+        layers.params.insert("stripeTol", tol as i32);
+        r.render_blocking(&frame(grid, &cg.md, &pal, &layers));
+        let got = r.read_field(0);
+        // margin rows so the reference's bottom edge cannot shorten any chain in view
+        let margin = (2 * period as usize) * 260;
+        let (want, longest) = cg.stripes_reference(period, dir, tol, rows as usize + margin + 4);
+        assert!(longest < 256, "m={m}: a run of {longest} reaches the shader's 256-step walk");
+        eprintln!("stripes m={m} dir={dir} P={period} tol={tol}: longest run {longest}");
+        assert_close(&got, &want, 0.0, &format!("stripes m={m} dir={dir} P={period} tol={tol}"));
+    }
+}
+
+#[test]
+fn deep_row_measures_stay_exact() {
+    // Closed-form measures far below the additive rule's reach.
+    let (_gpu, mut r) = device();
+    let pal = Palette::new(Scheme::Viridis);
+    let rows = 64u32;
+    for &(m, n0) in &[(7u32, 1_000_000u32), (30, 123_456_789)] {
+        let view = View { x0: -40.0, y0: n0 as f64, ppc: 2.0 };
+        let grid = GridSpec::new(&view, rows * 2, (rows as f64 * ROW_H * 2.0).ceil() as u32 + 2, 1, 1 << 26);
+        let cg = CpuGrid::new(grid, m);
+        for id in [LayerId::Gradient, LayerId::LagDiff, LayerId::Magnitude] {
+            let mut layers = LayerState::default();
+            layers.set_active(LayerId::Value, false);
+            layers.set_active(id, true);
+            layers.params.insert("lagLen", 5);
+            r.render_blocking(&frame(grid, &cg.md, &pal, &layers));
+            let got = r.read_field(0);
+            let want = cg.measure(id, &layers);
+            let tol = if id == LayerId::Magnitude { want.iter().cloned().fold(0.0, f32::max) * 2e-5 } else { 0.0 };
+            assert_close(&got, &want, tol, &format!("deep m={m} n0={n0} {id:?}"));
+        }
+    }
+}
+
+#[test]
+fn signed_measure_blends_around_half() {
+    let (_gpu, mut r) = device();
+    let pal = Palette::new(Scheme::CoolWarm);
+    let (_, grid) = cell_grid(80);
+    let cg = CpuGrid::new(grid, 30);
+    for blend in BlendMode::ALL {
+        let mut layers = LayerState::default();
+        layers.set_active(LayerId::Value, false);
+        layers.set_active(LayerId::Moire, true);
+        layers.set_active(LayerId::Density, true);
+        layers.blend = blend;
+        r.render_blocking(&frame(grid, &cg.md, &pal, &layers));
+        assert_close(&r.read_work(), &cg.blend(&layers), 2e-5, &format!("moiré + density, {blend:?}"));
+    }
 }

@@ -193,7 +193,8 @@ const USAGE: &str = "pascal-triangle-explorer [options]
   --rows R           rows to fit (default 128)
   --palette NAME     spectral | viridis | magma | inferno | turbo | cividis | coolwarm | mono
   --mode MODE        residue | mask | valuation
-  --layers a,b,c     active layers: value kummer lucas crt dlog pdigit density average bandpass afterimage
+  --layers a,b,c     active layers: value kummer lucas crt dlog pdigit gradient distzero magnitude
+                     density variance rarity moire primes stripes lagdiff average bandpass afterimage
   --field MODE       math | palette (field color mode)
   --export FILE.png  render once without a window and write a PNG
   --size WxH         canvas size for --export (default 1600x1000)
@@ -225,7 +226,8 @@ fn main() {
                 model.layers.active.clear();
                 for name in next().split(',') {
                     let name = name.trim().to_lowercase().replace([' ', '-', '_'], "");
-                    match REGISTRY.iter().find(|d| d.label.to_lowercase().replace(' ', "") == name) {
+                    let clean = |x: &str| x.to_lowercase().chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>();
+                    match REGISTRY.iter().find(|d| clean(d.label) == clean(&name) || clean(&format!("{:?}", d.id)) == clean(&name)) {
                         Some(d) => model.layers.set_active(d.id, true),
                         None => {
                             eprintln!("unknown layer {name}\n{USAGE}");
@@ -773,8 +775,21 @@ fn panel_ui(ui: &mut egui::Ui, model: &mut Model, canvas_px: (u32, u32), _frame_
                         ui.horizontal(|ui| {
                             ui.label(egui::RichText::new(p.label).color(ui.visuals().weak_text_color()));
                             let mut v = model.layers.param(p.key);
+                            if !p.choices.is_empty() {
+                                let before = v;
+                                egui::ComboBox::from_id_salt(p.key).selected_text(p.choices[v.clamp(0, p.choices.len() as i32 - 1) as usize]).show_ui(ui, |ui| {
+                                    for (i, c) in p.choices.iter().enumerate() {
+                                        ui.selectable_value(&mut v, i as i32, *c);
+                                    }
+                                });
+                                if v != before {
+                                    model.layers.params.insert(p.key, v);
+                                }
+                                return;
+                            }
                             let (lo, hi) = if p.key == "avgAmount" && model.layers.avg_mode == AvgMode::Spatial { (1, 12) } else { (p.min, p.max) };
-                            if mono_drag(ui, &mut v, lo..=hi, 0.1).changed() {
+                            let speed = if p.max > 1000 { 1.0 } else { 0.1 };
+                            if mono_drag(ui, &mut v, lo..=hi, speed).changed() {
                                 model.layers.params.insert(p.key, v);
                             }
                         });

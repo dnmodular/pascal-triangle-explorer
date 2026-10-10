@@ -22,7 +22,16 @@ pub enum LayerId {
     Crt,
     Dlog,
     PDigit,
+    Gradient,
+    DistZero,
+    Magnitude,
     Density,
+    Variance,
+    Rarity,
+    Moire,
+    Primes,
+    Stripes,
+    LagDiff,
     Average,
     BandPass,
     Afterimage,
@@ -43,6 +52,8 @@ pub struct ParamDef {
     pub min: i32,
     pub max: i32,
     pub default: i32,
+    /// Non-empty for a choice: the value is an index into these labels.
+    pub choices: &'static [&'static str],
 }
 
 /// How a measure's field is produced on the GPU.
@@ -52,6 +63,26 @@ pub enum MeasureRun {
     Pointwise { entry: &'static str },
     /// One compute pass, then that many hex-blur passes (count from the named parameter).
     Blurred { entry: &'static str, passes: &'static str },
+    /// `init` writes `fields` (1..=3) auxiliary fields into buf_a..buf_c, each is
+    /// hex-blurred `passes` times, then `combine` reads them and writes the measure to buf_d.
+    MultiBlur { init: &'static str, fields: u32, passes: &'static str, combine: &'static str },
+    /// `init`, then min(`cap`, larger grid side) passes of `step` (one relaxation
+    /// sweep each, ping-ponged), then `finish` in place. Breadth-first distances.
+    Relax { init: &'static str, step: &'static str, finish: &'static str, cap: u32 },
+    /// `count` builds an atomic histogram of the residues in view, `lookup` reads it.
+    Histogram { count: &'static str, lookup: &'static str },
+}
+
+impl MeasureRun {
+    /// Every compute entry point the recipe dispatches.
+    pub fn entries(&self) -> Vec<&'static str> {
+        match *self {
+            MeasureRun::Pointwise { entry } | MeasureRun::Blurred { entry, .. } => vec![entry],
+            MeasureRun::MultiBlur { init, combine, .. } => vec![init, combine],
+            MeasureRun::Relax { init, step, finish, .. } => vec![init, step, finish],
+            MeasureRun::Histogram { count, lookup } => vec![count, lookup],
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -68,6 +99,8 @@ pub struct LayerDef {
     /// free of data-dependent loops that some driver compilers reject.
     pub derive: Option<Derive>,
     pub dslot: u32,
+    /// The field is signed: normalized by its largest magnitude and centered on 0.5.
+    pub signed: bool,
     /// Compares frames: reads flat until something changes.
     pub sweep: bool,
 }
@@ -97,6 +130,40 @@ fn derive_padic(s: &LayerState, md: &Modulus) -> [u32; 4] {
     [pow_or_zero(md.p, j), j, 0, 0]
 }
 
+/// Lattice step (rows, columns) of a scan direction choice: ╲ (n+1, k), ╱ (n+1, k+1), — (n, k+1).
+pub fn direction_step(choice: i32) -> (u32, u32) {
+    match choice {
+        1 => (1, 1),
+        2 => (0, 1),
+        _ => (1, 0),
+    }
+}
+
+fn derive_stripes(s: &LayerState, md: &Modulus) -> [u32; 4] {
+    let (dr, dc) = direction_step(s.param("stripeDir"));
+    let period = s.param("stripePeriod").max(1) as u32;
+    let tol = (s.param("stripeTol").max(0) as u32).min(md.m);
+    [period * dr, period * dc, tol, 0]
+}
+
+fn derive_lagdiff(s: &LayerState, _md: &Modulus) -> [u32; 4] {
+    let (dr, dc) = direction_step(s.param("lagDir"));
+    let lag = s.param("lagLen").max(1) as u32;
+    [lag * dr, lag * dc, 0, 0]
+}
+
+/// The two smallest distinct primes of m (q = 0 when m is a prime power).
+fn derive_moire(_s: &LayerState, md: &Modulus) -> [u32; 4] {
+    let q = md.factors.get(1).map(|t| t.f.p).unwrap_or(0);
+    [md.p, q, (q != 0) as u32, 0]
+}
+
+fn derive_primes(s: &LayerState, _md: &Modulus) -> [u32; 4] {
+    [s.param("primesMode").clamp(0, 1) as u32, 0, 0, 0]
+}
+
+const DIRECTIONS: &[&str] = &["diag ╲", "diag ╱", "row —"];
+
 /// Measures first (console order), then the transforms in the order they run.
 pub const REGISTRY: &[LayerDef] = &[
     LayerDef {
@@ -108,6 +175,7 @@ pub const REGISTRY: &[LayerDef] = &[
         run: None,
         derive: None,
         dslot: 0,
+        signed: false,
         sweep: false,
     },
     LayerDef {
@@ -119,6 +187,7 @@ pub const REGISTRY: &[LayerDef] = &[
         run: Some(MeasureRun::Pointwise { entry: "measure_kummer" }),
         derive: None,
         dslot: 0,
+        signed: false,
         sweep: false,
     },
     LayerDef {
@@ -126,10 +195,11 @@ pub const REGISTRY: &[LayerDef] = &[
         label: "LUCAS",
         kind: Kind::Measure,
         desc: "Colors each cell by its base-p digit pair at the chosen scale. Raise SCALE to step through the self-similar block levels; holes (k digit > n digit) show dark.",
-        params: &[ParamDef { key: "lucasScale", label: "scale", min: 0, max: 12, default: 0 }],
+        params: &[ParamDef { key: "lucasScale", label: "scale", min: 0, max: 12, default: 0, choices: &[] }],
         run: Some(MeasureRun::Pointwise { entry: "measure_lucas" }),
         derive: Some(derive_lucas),
         dslot: 0,
+        signed: false,
         sweep: false,
     },
     LayerDef {
@@ -141,6 +211,7 @@ pub const REGISTRY: &[LayerDef] = &[
         run: Some(MeasureRun::Pointwise { entry: "measure_crt" }),
         derive: None,
         dslot: 0,
+        signed: false,
         sweep: false,
     },
     LayerDef {
@@ -152,6 +223,7 @@ pub const REGISTRY: &[LayerDef] = &[
         run: Some(MeasureRun::Pointwise { entry: "measure_dlog" }),
         derive: None,
         dslot: 0,
+        signed: false,
         sweep: false,
     },
     LayerDef {
@@ -159,10 +231,47 @@ pub const REGISTRY: &[LayerDef] = &[
         label: "P DIGIT",
         kind: Kind::Measure,
         desc: "The chosen base-p digit of each residue. Digit 0 is fully Lucas-explained; digits ≥ 1 are what a prime-power modulus knows beyond mod p. Most meaningful on p, p², p³ moduli (try 9, 27, 25).",
-        params: &[ParamDef { key: "padicDigit", label: "digit", min: 0, max: 12, default: 1 }],
+        params: &[ParamDef { key: "padicDigit", label: "digit", min: 0, max: 12, default: 1, choices: &[] }],
         run: Some(MeasureRun::Pointwise { entry: "measure_padic" }),
         derive: Some(derive_padic),
         dslot: 1,
+        signed: false,
+        sweep: false,
+    },
+    LayerDef {
+        id: LayerId::Gradient,
+        label: "GRADIENT",
+        kind: Kind::Measure,
+        desc: "Wrap-distance from each cell to its two parents — how sharply the residue turns over as the triangle grows. The boundaries of the self-similar blocks light up.",
+        params: &[],
+        run: Some(MeasureRun::Pointwise { entry: "measure_gradient" }),
+        derive: None,
+        dslot: 0,
+        signed: false,
+        sweep: false,
+    },
+    LayerDef {
+        id: LayerId::DistZero,
+        label: "DIST→0",
+        kind: Kind::Measure,
+        desc: "Lattice distance from each cell to the nearest zero, so the gasket holes become basins and the ridges sit farthest from any divisible cell. Measured over the cells in view, up to 256 steps.",
+        params: &[],
+        run: Some(MeasureRun::Relax { init: "distzero_init", step: "distzero_step", finish: "distzero_finish", cap: 256 }),
+        derive: None,
+        dslot: 0,
+        signed: false,
+        sweep: false,
+    },
+    LayerDef {
+        id: LayerId::Magnitude,
+        label: "MAGNITUDE",
+        kind: Kind::Measure,
+        desc: "log of the true integer C(n,k), ignoring the modulus — the raw magnitude the residues hide. Peaks at the middle of each row.",
+        params: &[],
+        run: Some(MeasureRun::Pointwise { entry: "measure_magnitude" }),
+        derive: None,
+        dslot: 0,
+        signed: false,
         sweep: false,
     },
     LayerDef {
@@ -170,10 +279,90 @@ pub const REGISTRY: &[LayerDef] = &[
         label: "DENSITY",
         kind: Kind::Measure,
         desc: "Local fraction of nonzero cells — the fractal's mass. A larger radius blurs toward broad density structure.",
-        params: &[ParamDef { key: "densityR", label: "radius", min: 1, max: 16, default: 4 }],
+        params: &[ParamDef { key: "densityR", label: "radius", min: 1, max: 16, default: 4, choices: &[] }],
         run: Some(MeasureRun::Blurred { entry: "measure_density", passes: "densityR" }),
         derive: None,
         dslot: 0,
+        signed: false,
+        sweep: false,
+    },
+    LayerDef {
+        id: LayerId::Variance,
+        label: "VARIANCE",
+        kind: Kind::Measure,
+        desc: "Circular variance of nearby residues — the wrap-aware dispersion for cyclic values. Dark on uniform blocks, bright where colors churn: DENSITY shows the mass, this shows the gappiness.",
+        params: &[ParamDef { key: "varR", label: "radius", min: 1, max: 16, default: 4, choices: &[] }],
+        run: Some(MeasureRun::MultiBlur { init: "variance_init", fields: 2, passes: "varR", combine: "variance_combine" }),
+        derive: None,
+        dslot: 0,
+        signed: false,
+        sweep: false,
+    },
+    LayerDef {
+        id: LayerId::Rarity,
+        label: "RARITY",
+        kind: Kind::Measure,
+        desc: "Colors each cell by −log₂ of its residue's frequency among the cells in view. The majority mode fades automatically and improbable residues glow — self-normalizing isolation, no residue list needed.",
+        params: &[],
+        run: Some(MeasureRun::Histogram { count: "rarity_count", lookup: "rarity_lookup" }),
+        derive: None,
+        dslot: 0,
+        signed: false,
+        sweep: false,
+    },
+    LayerDef {
+        id: LayerId::Moire,
+        label: "MOIRÉ",
+        kind: Kind::Measure,
+        desc: "Local covariance of the two smallest prime factors' zero sets — bright where the gaskets overlap beyond chance, dark-signed where they avoid each other. Needs two distinct primes (try 6, 10, 15, 30); flat on prime powers. Diverging schemes read best.",
+        params: &[ParamDef { key: "moireR", label: "radius", min: 1, max: 16, default: 4, choices: &[] }],
+        run: Some(MeasureRun::MultiBlur { init: "moire_init", fields: 3, passes: "moireR", combine: "moire_combine" }),
+        derive: Some(derive_moire),
+        dslot: 4,
+        signed: true,
+        sweep: false,
+    },
+    LayerDef {
+        id: LayerId::Primes,
+        label: "PRIMES",
+        kind: Kind::Measure,
+        desc: "Primality of each residue as a field. SPECTRUM spreads the primes by index (a spectral scheme recovers the prime rainbow); MASK is 0/1 — multiply it under another map to see that map on prime cells only.",
+        params: &[ParamDef { key: "primesMode", label: "show", min: 0, max: 1, default: 0, choices: &["spectrum", "mask"] }],
+        run: Some(MeasureRun::Pointwise { entry: "measure_primes" }),
+        derive: Some(derive_primes),
+        dslot: 5,
+        signed: false,
+        sweep: false,
+    },
+    LayerDef {
+        id: LayerId::Stripes,
+        label: "STRIPES",
+        kind: Kind::Measure,
+        desc: "Run length of a periodic A…B…A alternation through each cell. TOLERANCE lets drifting colors count as one band; PERIOD sets band width (1 = A,B,A,B; 2 = A,A,B,B). Runs are followed up to 256 steps each way.",
+        params: &[
+            ParamDef { key: "stripeDir", label: "direction", min: 0, max: 2, default: 0, choices: DIRECTIONS },
+            ParamDef { key: "stripeTol", label: "tolerance", min: 0, max: 1_000_000, default: 0, choices: &[] },
+            ParamDef { key: "stripePeriod", label: "period", min: 1, max: 8, default: 1, choices: &[] },
+        ],
+        run: Some(MeasureRun::Pointwise { entry: "measure_stripes" }),
+        derive: Some(derive_stripes),
+        dslot: 2,
+        signed: false,
+        sweep: false,
+    },
+    LayerDef {
+        id: LayerId::LagDiff,
+        label: "LAG DIFF",
+        kind: Kind::Measure,
+        desc: "Wrap-distance between each cell and the cell LAG steps away. Set LAG to a suspected period and the periodic structure cancels to dark — the defects light up. The general form of STRIPES.",
+        params: &[
+            ParamDef { key: "lagDir", label: "direction", min: 0, max: 2, default: 0, choices: DIRECTIONS },
+            ParamDef { key: "lagLen", label: "lag", min: 1, max: 128, default: 1, choices: &[] },
+        ],
+        run: Some(MeasureRun::Pointwise { entry: "measure_lagdiff" }),
+        derive: Some(derive_lagdiff),
+        dslot: 3,
+        signed: false,
         sweep: false,
     },
     LayerDef {
@@ -181,10 +370,11 @@ pub const REGISTRY: &[LayerDef] = &[
         label: "AVERAGE",
         kind: Kind::Transform,
         desc: "Blurs the layers beneath it over the triangular lattice, or averages them over recent frames (temporal).",
-        params: &[ParamDef { key: "avgAmount", label: "amount", min: 1, max: 64, default: 2 }],
+        params: &[ParamDef { key: "avgAmount", label: "amount", min: 1, max: 64, default: 2, choices: &[] }],
         run: None,
         derive: None,
         dslot: 0,
+        signed: false,
         sweep: false,
     },
     LayerDef {
@@ -193,12 +383,13 @@ pub const REGISTRY: &[LayerDef] = &[
         kind: Kind::Transform,
         desc: "blur(KEEP) − blur(CUT) of the layers below. Removes broad trends and pixel speckle; mid-scale structure survives, centered at 0.5 — diverging schemes (cool–warm) read best.",
         params: &[
-            ParamDef { key: "bandLo", label: "keep", min: 0, max: 16, default: 1 },
-            ParamDef { key: "bandHi", label: "cut", min: 1, max: 24, default: 6 },
+            ParamDef { key: "bandLo", label: "keep", min: 0, max: 16, default: 1, choices: &[] },
+            ParamDef { key: "bandHi", label: "cut", min: 1, max: 24, default: 6, choices: &[] },
         ],
         run: None,
         derive: None,
         dslot: 0,
+        signed: false,
         sweep: false,
     },
     LayerDef {
@@ -207,13 +398,14 @@ pub const REGISTRY: &[LayerDef] = &[
         kind: Kind::Transform,
         desc: "Simulated retinal fatigue: past frames leave a complementary ghost. Under PALETTE BLEND it works per channel, so a red region ghosts cyan. ATTACK and DECAY are frame counts for fatigue to build and release.",
         params: &[
-            ParamDef { key: "aiStrength", label: "strength", min: 0, max: 100, default: 45 },
-            ParamDef { key: "aiAttack", label: "attack", min: 1, max: 64, default: 3 },
-            ParamDef { key: "aiDecay", label: "decay", min: 1, max: 64, default: 16 },
+            ParamDef { key: "aiStrength", label: "strength", min: 0, max: 100, default: 45, choices: &[] },
+            ParamDef { key: "aiAttack", label: "attack", min: 1, max: 64, default: 3, choices: &[] },
+            ParamDef { key: "aiDecay", label: "decay", min: 1, max: 64, default: 16, choices: &[] },
         ],
         run: None,
         derive: None,
         dslot: 0,
+        signed: false,
         sweep: true,
     },
 ];

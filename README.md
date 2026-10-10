@@ -204,20 +204,36 @@ lists. Two field color modes share the same passes: MATH RAMP runs them on an
 palette image (measures as lightness, transforms per channel). `field.wgsl` is
 compiled once per element type.
 
-**Adding a measure** (GRADIENT, DIST→0, MAGNITUDE, VARIANCE, RARITY, MOIRÉ,
-PRIMES, STRIPES, LAG DIFF, TEMPORAL, COLOR FLOW, MAGNIFY, TRAIL, CENSUS from the
-reference): add a `LayerDef` with `kind: Measure`, its parameters and a `run`
-recipe, and one `@compute` entry point in `measures.wgsl` that writes `buf_a`.
-Parameters reach the shader through `iparam(slot)` (slots in `gpu::param_slot`);
-anything loop-derived (powers of `p`, table sizes) is computed on the CPU by the
-entry's `derive` function and read from `P.dparams[DSLOT_<LABEL>]` (the constant is generated from the registry), so the measure
-shaders stay free of data-dependent loops, which NVIDIA's compiler rejected for
-LUCAS and P DIGIT. Measures that need extra passes (several blurred fields,
-frame history) extend the `MeasureRun` recipe rather than the driver's control
-flow.
+**Measures.** KUMMER, LUCAS, CRT, DLOG, P DIGIT, GRADIENT, DIST→0, MAGNITUDE,
+DENSITY, VARIANCE, RARITY, MOIRÉ, PRIMES, STRIPES and LAG DIFF, ported from the
+reference's `mapFieldRaw` with the same controls. How each relates to the
+reference's whole-triangle computation:
 
-**Export** reads back the same `rgba8` texture the live view shows, so the two
-cannot differ.
+* **Exact at any zoom** (closed form per cell): KUMMER, LUCAS, CRT, DLOG,
+  P DIGIT, GRADIENT and LAG DIFF (neighbour residues via `residue_at(n, k)`),
+  MAGNITUDE (`ln i!` table below 4096, a cancellation-safe Stirling form above),
+  PRIMES (CPU-built prime-index table), STRIPES (walks the line through each cell,
+  up to 256 positions each way; longer runs saturate).
+* **Over the cells in view** (the reference uses its whole triangle): DENSITY,
+  VARIANCE and MOIRÉ blur over the lattice, DIST→0 relaxes up to 256 steps
+  (farther distances saturate), RARITY counts residue frequencies. Zoomed in,
+  the grid is the cell lattice; zoomed out, these run on the sampled lattice.
+
+The triangle here has no bottom row, so near the reference's last rows (where
+its chains and lags run off the edge) the values legitimately differ.
+
+**Adding a measure** (TEMPORAL, COLOR FLOW, MAGNIFY, TRAIL and CENSUS remain
+from the reference): add a `LayerDef` with `kind: Measure`, its parameters and a
+`run` recipe, and the compute entry points the recipe names in `measures.wgsl`.
+Recipes: `Pointwise`, `Blurred` (then N hex blurs), `MultiBlur` (up to three
+auxiliary fields blurred, then combined), `Relax` (iterated relaxation
+dispatches) and `Histogram` (atomic residue counts, then a lookup). Anything
+loop-derived (powers of `p`, per-direction steps, prime pairs) is computed on
+the CPU by the entry's `derive` function and read from `P.dparams[DSLOT_<ID>]`
+(the constant is generated from the registry). Every shader loop has a constant
+bound with an early break, because NVIDIA's compiler rejected data-dependent
+power loops in LUCAS and P DIGIT. A `signed: true` measure is normalized by its
+largest magnitude and centered on 0.5, as in the reference's blend.
 
 ## Status
 
@@ -225,10 +241,13 @@ Verified (by `cargo test` on Mesa lavapipe, and by the headless export):
 
 * `C(n,k) mod m` on the GPU equals the additive rule for every modulus listed
   above, and equals the CPU closed form at rows 10⁶, 1.2·10⁸ and 10⁹.
-* The packed carry count and per-factor divisibility mask, the seven measures,
-  all four blend modes, the three transforms (spatial and temporal AVERAGE,
-  BAND PASS, AFTERIMAGE over two frames) and the resolved residue/ramp colors
-  match CPU twins.
+* The packed carry count and per-factor divisibility mask, all sixteen measures,
+  all four blend modes (with a signed measure), the three transforms (spatial
+  and temporal AVERAGE, BAND PASS, AFTERIMAGE over two frames) and the resolved
+  residue/ramp colors match CPU twins. DIST→0 equals a CPU breadth-first search
+  on the same lattice, and STRIPES equals the reference's chain DP, exactly.
+* The sweep's selection modes and sequences match the reference's lists; the
+  tween shows the previous frame at e = 0 and exactly the true frame at e = 1.
 * The windowed app was driven under Xvfb (keys, wheel zoom, drag, in-cell
   numbers, inspector, GPU timing); the headless export writes valid PNGs.
 
@@ -237,8 +256,9 @@ device was available), light-theme appearance, Windows and macOS builds, and
 PALETTE BLEND beyond a smoke test (its colors are not compared against the
 reference's JavaScript output).
 
-Deviations from the reference worth knowing: PgUp/PgDn step the modulus by 10
+Deviations from the reference worth knowing: PgUp/PgDn take ten sweep steps
 (the reference's "whole step" belongs to its decimal-modulus mode, which is out
-of scope for v1); in-cell numbers are drawn by the UI over the live view only,
+of scope for v1); the tween cross-dissolves in color where the reference fades
+the canvas; in-cell numbers are drawn by the UI over the live view only,
 not into exports; frame history for temporal AVERAGE and AFTERIMAGE lives in
 screen space, so panning smears it rather than following cells.

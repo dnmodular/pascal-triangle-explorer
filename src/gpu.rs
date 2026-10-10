@@ -33,7 +33,12 @@ pub const MAX_MEASURE_SLOTS: u32 = 8;
 const BAND_MAX_SLOT: u32 = 8;
 const MAXBUF_LEN: u64 = 16;
 const PASS_STRIDE: u64 = 256;
-const MAX_PASSES: u64 = 512;
+const MAX_PASSES: u64 = 2048;
+/// `maxbuf` counters used by DIST→0 (zeros in view) and RARITY (cells in view).
+const ZERO_COUNT_SLOT: u32 = 12;
+const CELL_COUNT_SLOT: u32 = 13;
+/// Auxiliary scalar fields for multi-pass measures (plus one blur temporary in `tmp_buf`).
+const AUX_FIELDS: u64 = 3;
 /// Temporal AVERAGE keeps at most this many past frames.
 pub const HIST_CAP: u32 = 64;
 
@@ -264,9 +269,8 @@ pub fn module_sources() -> Vec<ModuleSource> {
     let measure_entries: Vec<(&'static str, LayoutKind)> = crate::layers::REGISTRY
         .iter()
         .filter_map(|d| d.run)
-        .map(|run| match run {
-            MeasureRun::Pointwise { entry } | MeasureRun::Blurred { entry, .. } => (entry, LayoutKind::Scalar),
-        })
+        .flat_map(|run| run.entries())
+        .map(|entry| (entry, LayoutKind::Scalar))
         .chain([("reduce_max", LayoutKind::Scalar), ("blur_scalar", LayoutKind::Scalar)])
         .collect();
     let field_entries: Vec<(&'static str, LayoutKind)> =
@@ -280,13 +284,13 @@ pub fn module_sources() -> Vec<ModuleSource> {
     ]
 }
 
-/// `const DSLOT_<LABEL>: u32 = n;` for every registry entry with a `derive`, so the
+/// `const DSLOT_<ID>: u32 = n;` for every registry entry with a `derive`, so the
 /// shader's slot numbers come from the registry and cannot drift from it.
 pub fn dslot_constants() -> String {
     crate::layers::REGISTRY
         .iter()
         .filter(|d| d.derive.is_some())
-        .map(|d| format!("const DSLOT_{}: u32 = {}u;\n", d.label.replace(|c: char| !c.is_ascii_alphanumeric(), ""), d.dslot))
+        .map(|d| format!("const DSLOT_{}: u32 = {}u;\n", format!("{:?}", d.id).to_uppercase(), d.dslot))
         .collect()
 }
 
@@ -332,7 +336,7 @@ impl Layouts {
         };
         let bgl_scalar = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("scalar passes"),
-            entries: &[storage_entry(0, false), storage_entry(1, false), storage_entry(2, false), storage_entry(3, false), pass_entry(4)],
+            entries: &[storage_entry(0, false), storage_entry(1, false), storage_entry(2, false), storage_entry(3, false), pass_entry(4), storage_entry(5, false)],
         });
         let bgl_field = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("field passes"),
@@ -606,7 +610,12 @@ pub struct Renderer {
     maxbuf: wgpu::Buffer,
     cells_buf: wgpu::Buffer,
     fields_buf: wgpu::Buffer,
+    /// AUX_FIELDS scalar fields of `stride` elements each.
     scratch_buf: wgpu::Buffer,
+    /// Blur and relaxation temporary (a separate buffer, so copies never alias).
+    tmp_buf: wgpu::Buffer,
+    /// Residue histogram (RARITY), atomic u32 per residue.
+    counts_buf: wgpu::Buffer,
     work: [wgpu::Buffer; 4],
     hist_buf: wgpu::Buffer,
     adapt_buf: wgpu::Buffer,
@@ -732,10 +741,9 @@ impl Renderer {
         let mut pipe_measures = HashMap::new();
         for d in crate::layers::REGISTRY {
             if let Some(run) = d.run {
-                let entry = match run {
-                    MeasureRun::Pointwise { entry } | MeasureRun::Blurred { entry, .. } => entry,
-                };
-                pipe_measures.insert(entry, take(&mut pipes, "measures", entry));
+                for entry in run.entries() {
+                    pipe_measures.insert(entry, take(&mut pipes, "measures", entry));
+                }
             }
         }
         let pipe_reduce_max = take(&mut pipes, "measures", "reduce_max");
@@ -763,6 +771,8 @@ impl Renderer {
         let cells_buf = buffer(&device, "cells", 1024, STORAGE_RW);
         let fields_buf = buffer(&device, "fields", 1024, STORAGE_RW);
         let scratch_buf = buffer(&device, "scratch", 1024, STORAGE_RW);
+        let counts_buf = buffer(&device, "counts", 1024, STORAGE_RW);
+        let tmp_buf = buffer(&device, "tmp", 1024, STORAGE_RW);
         let work = [
             buffer(&device, "work0", 1024, STORAGE_RW),
             buffer(&device, "work1", 1024, STORAGE_RW),
@@ -796,6 +806,8 @@ impl Renderer {
             cells_buf,
             fields_buf,
             scratch_buf,
+            counts_buf,
+            tmp_buf,
             work,
             hist_buf,
             adapt_buf,
@@ -931,7 +943,8 @@ impl Renderer {
             if dims_changed {
                 self.cells_buf = buffer(d, "cells", texels * 8, STORAGE_RW);
                 self.fields_buf = buffer(d, "fields", MAX_MEASURE_SLOTS as u64 * stride as u64 * 4, STORAGE_RW);
-                self.scratch_buf = buffer(d, "scratch", stride as u64 * 4, STORAGE_RW);
+                self.scratch_buf = buffer(d, "scratch", AUX_FIELDS * stride as u64 * 4, STORAGE_RW);
+                self.tmp_buf = buffer(d, "tmp", stride as u64 * 4, STORAGE_RW);
             }
             self.work_elem = work_elem;
             let wbytes = stride as u64 * work_elem;
@@ -990,6 +1003,28 @@ impl Renderer {
         self.adapt_valid = false;
     }
 
+    /// Auxiliary field `i` (0..AUX_FIELDS), or the temporary for `i == AUX_FIELDS`.
+    fn aux(&self, i: u64) -> Bind<'_> {
+        let bytes = self.stride as u64 * 4;
+        if i >= AUX_FIELDS {
+            return Bind { buf: &self.tmp_buf, offset: 0, size: bytes };
+        }
+        Bind { buf: &self.scratch_buf, offset: i * bytes, size: bytes }
+    }
+
+    /// Hex-blur `field` `n` times, ping-ponging with `tmp`; the result ends in `field`.
+    fn blur_scalar_n(&self, enc: &mut wgpu::CommandEncoder, passes: &mut Vec<PassParams>, field: Bind<'_>, tmp: Bind<'_>, n: u32) {
+        let mut in_field = true;
+        for _ in 0..n {
+            let (src, dst) = if in_field { (field, tmp) } else { (tmp, field) };
+            self.dispatch_scalar(enc, passes, &self.pipe_blur_scalar, [src, dst, tmp, tmp], PassParams::default());
+            in_field = !in_field;
+        }
+        if !in_field {
+            enc.copy_buffer_to_buffer(tmp.buf, tmp.offset, field.buf, field.offset, field.size);
+        }
+    }
+
     fn slot_bind(&self, slot: u32) -> Bind<'_> {
         let bytes = self.stride as u64 * 4;
         Bind { buf: &self.fields_buf, offset: slot as u64 * bytes, size: bytes }
@@ -1019,6 +1054,7 @@ impl Renderer {
                     binding: 4,
                     resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding { buffer: &self.pass_buf, offset: 0, size: NonZeroU64::new(std::mem::size_of::<PassParams>() as u64) }),
                 },
+                wgpu::BindGroupEntry { binding: 5, resource: self.counts_buf.as_entire_binding() },
             ],
         });
         let g = self.grid.unwrap();
@@ -1101,6 +1137,7 @@ impl Renderer {
             value_style: matches!(input.layers.value_style, ValueStyle::Mask) as u32,
             field_active: plan.field_active as u32,
             field_stride: self.stride,
+            signed_mask: plan.measures.iter().take(n_measures as usize).enumerate().fold(0u32, |acc, (i, d)| acc | ((d.signed as u32) << i)),
             factors: md.factors,
             ..Default::default()
         };
@@ -1111,6 +1148,10 @@ impl Renderer {
         }
         self.queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
         self.queue.write_buffer(&self.maxbuf, 0, &[0u8; (MAXBUF_LEN * 4) as usize]);
+        let need_counts = (input.modulus.m as u64 + 1) * 4;
+        if plan.measures.iter().any(|d| matches!(d.run, Some(MeasureRun::Histogram { .. }))) && self.counts_buf.size() < need_counts {
+            self.counts_buf = buffer(&self.device, "counts", round_up(need_counts, 4096), STORAGE_RW);
+        }
         self.last_n_measures = n_measures;
 
         // Display-only tween: decide morph (field lerp in the resolve pass) or dissolve
@@ -1194,28 +1235,54 @@ impl Renderer {
             return out;
         }
 
-        // 2. measures → fields[slot], each followed by reduce_max.
+        // 2. measures → fields[slot], each followed by reduce_max. The recipe, not the
+        //    measure's id, decides the passes.
         for (slot, def) in plan.measures.iter().take(n_measures as usize).enumerate() {
             let slot = slot as u32;
             let run = def.run.expect("measure has a run recipe");
-            let (entry, blur_passes) = match run {
-                MeasureRun::Pointwise { entry } => (entry, 0),
-                MeasureRun::Blurred { entry, passes } => (entry, input.layers.param(passes).max(0) as u32),
-            };
-            let pipe = self.pipe_measures.get(entry).expect("measure pipeline");
+            let pipe = |e: &str| self.pipe_measures.get(e).expect("measure pipeline");
             let fb = self.slot_bind(slot);
-            let sb = Bind::whole(&self.scratch_buf);
-            self.dispatch_scalar(enc, passes, pipe, [fb, sb, sb, sb], PassParams::default());
-            let mut in_slot = true;
-            for _ in 0..blur_passes {
-                let (src, dst) = if in_slot { (fb, sb) } else { (sb, fb) };
-                self.dispatch_scalar(enc, passes, &self.pipe_blur_scalar, [src, dst, sb, sb], PassParams::default());
-                in_slot = !in_slot;
+            let (a0, a1, a2, a3) = (self.aux(0), self.aux(1), self.aux(2), self.aux(3));
+            let none = PassParams::default();
+            match run {
+                MeasureRun::Pointwise { entry } => {
+                    self.dispatch_scalar(enc, passes, pipe(entry), [fb, a3, a3, a3], none);
+                }
+                MeasureRun::Blurred { entry, passes: key } => {
+                    self.dispatch_scalar(enc, passes, pipe(entry), [fb, a3, a3, a3], none);
+                    self.blur_scalar_n(enc, passes, fb, a3, input.layers.param(key).max(0) as u32);
+                }
+                MeasureRun::MultiBlur { init, fields, passes: key, combine } => {
+                    self.dispatch_scalar(enc, passes, pipe(init), [a0, a1, a2, fb], none);
+                    let n = input.layers.param(key).max(0) as u32;
+                    for (i, f) in [a0, a1, a2].into_iter().enumerate().take(fields as usize) {
+                        let _ = i;
+                        self.blur_scalar_n(enc, passes, f, a3, n);
+                    }
+                    self.dispatch_scalar(enc, passes, pipe(combine), [a0, a1, a2, fb], none);
+                }
+                MeasureRun::Relax { init, step, finish, cap } => {
+                    let iters = cap.min(g.w.max(g.h));
+                    self.dispatch_scalar(enc, passes, pipe(init), [fb, a3, a3, a3], PassParams { slot: ZERO_COUNT_SLOT, count: iters, ..none });
+                    let mut in_field = true;
+                    for _ in 0..iters {
+                        let (src, dst) = if in_field { (fb, a3) } else { (a3, fb) };
+                        self.dispatch_scalar(enc, passes, pipe(step), [src, dst, a3, a3], none);
+                        in_field = !in_field;
+                    }
+                    if !in_field {
+                        enc.copy_buffer_to_buffer(a3.buf, a3.offset, fb.buf, fb.offset, fb.size);
+                    }
+                    self.dispatch_scalar(enc, passes, pipe(finish), [fb, a3, a3, a3], PassParams { slot: ZERO_COUNT_SLOT, count: iters, ..none });
+                }
+                MeasureRun::Histogram { count, lookup } => {
+                    enc.clear_buffer(&self.counts_buf, 0, None);
+                    self.dispatch_scalar(enc, passes, pipe(count), [fb, a3, a3, a3], PassParams { slot: CELL_COUNT_SLOT, ..none });
+                    self.dispatch_scalar(enc, passes, pipe(lookup), [fb, a3, a3, a3], PassParams { slot: CELL_COUNT_SLOT, ..none });
+                }
             }
-            if !in_slot {
-                enc.copy_buffer_to_buffer(&self.scratch_buf, 0, &self.fields_buf, fb.offset, fb.size);
-            }
-            self.dispatch_scalar(enc, passes, &self.pipe_reduce_max, [fb, sb, sb, sb], PassParams { slot, ..Default::default() });
+            // signed fields are normalized by their largest magnitude
+            self.dispatch_scalar(enc, passes, &self.pipe_reduce_max, [fb, a3, a3, a3], PassParams { slot, flag: def.signed as u32, ..none });
         }
 
         // 3. blend → work[0]
