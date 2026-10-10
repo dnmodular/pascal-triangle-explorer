@@ -544,13 +544,13 @@ impl Canvas {
                 dimension: wgpu::TextureDimension::D2,
                 format: wgpu::TextureFormat::Rgba8Unorm,
                 usage,
-                view_formats: &[wgpu::TextureFormat::Rgba8UnormSrgb],
+                view_formats: &[],
             })
         };
         let view = |t: &wgpu::Texture, format: wgpu::TextureFormat, usage: wgpu::TextureUsages| {
             t.create_view(&wgpu::TextureViewDescriptor { label: None, format: Some(format), usage: Some(usage), ..Default::default() })
         };
-        use wgpu::TextureFormat::{Rgba8Unorm, Rgba8UnormSrgb};
+        use wgpu::TextureFormat::Rgba8Unorm;
         use wgpu::TextureUsages as U;
         let frame = make("canvas frame", U::STORAGE_BINDING | U::TEXTURE_BINDING | U::COPY_SRC);
         let display = make("canvas display", U::STORAGE_BINDING | U::TEXTURE_BINDING | U::COPY_SRC);
@@ -559,8 +559,9 @@ impl Canvas {
             frame_storage: view(&frame, Rgba8Unorm, U::STORAGE_BINDING),
             frame_load: view(&frame, Rgba8Unorm, U::TEXTURE_BINDING),
             display_storage: view(&display, Rgba8Unorm, U::STORAGE_BINDING),
-            // sRGB view so egui (which expects linear samples) shows the stored bytes unchanged
-            display_sampled: view(&display, Rgba8UnormSrgb, U::TEXTURE_BINDING),
+            // a plain (non-sRGB) view: egui 0.36 samples textures as gamma-encoded bytes and,
+            // on the app's non-sRGB surface, writes them out unchanged
+            display_sampled: view(&display, Rgba8Unorm, U::TEXTURE_BINDING),
             snap_load: view(&snap, Rgba8Unorm, U::TEXTURE_BINDING),
             frame,
             display,

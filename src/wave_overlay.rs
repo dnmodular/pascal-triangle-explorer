@@ -34,16 +34,13 @@ use crate::math::{Modulus, MOD_CAP};
 
 /// Default phase drift φ'(t) in rad/s (see [`OverlayConfig::drift`]).
 pub const PHASE_DRIFT: f32 = 0.3;
-/// Time constant of the coefficient easing, the fade and the normalization's rise.
+/// Time constant of every easing in the overlay (coefficients, normalization, fade).
 pub const TAU: f32 = 0.12;
-/// The normalization falls more slowly than it rises (a running max), so a quieter row
-/// or the cos φ breathing shows as a smaller wave instead of being scaled away.
-const NORM_RELEASE: f32 = 0.6;
 /// Displayed entries are dropped once both their value and their target are below this.
 const DROP_EPS: f32 = 1e-4;
-/// Rows longer than this draw only the `TOP_K` largest |displayed| coefficients: the cost
-/// per frame is (active frequencies × samples), and beyond ~2000 terms the smaller ones
-/// add nothing visible at a few hundred pixels.
+/// Rows longer than this draw only their `TOP_K` largest coefficients (by magnitude),
+/// which bounds the per-frame work for rows of up to 16,384 terms; the plot is then an
+/// approximation of the full sum. See `select_active` for how morphs stay smooth.
 const LARGE_ROW: u64 = 2000;
 const TOP_K: usize = 256;
 /// Rows up to this are built with Pascal's rule mod m (O(n²) from scratch, O(n) per
@@ -68,6 +65,8 @@ const NOTE_H: f32 = 13.0;
 const FORMULA_H: f32 = 14.0;
 /// The formula line is shown on boxes at least this big, when it fits unclipped.
 const FORMULA_MIN_SIDE: f32 = 200.0;
+/// Boxes smaller than this (tiny canvases) are not drawn at all.
+const MIN_DRAW_SIDE: f32 = 2.0 * PAD + LABEL_H + 32.0;
 
 const WAVE_RGB: [u8; 3] = [0x4f, 0xc3, 0xf7];
 const FORMULA: &str = "C(n,k) mod m → Σ r_k cos((n−2k)θ)";
@@ -179,15 +178,6 @@ impl PascalRow {
     }
 }
 
-/// Laid-out label, note and formula, kept until the text, the width or the scale changes.
-struct TextCache {
-    width: f32,
-    pixels_per_point: f32,
-    label: Arc<Galley>,
-    note: Arc<Galley>,
-    formula: Arc<Galley>,
-}
-
 /// Where everything goes inside the box.
 struct Layout {
     bx: Rect,
@@ -195,6 +185,16 @@ struct Layout {
     label: Rect,
     note: Option<Rect>,
     formula: Option<Rect>,
+}
+
+/// A displayed coefficient as `select_active` ranks it.
+#[derive(Clone, Copy)]
+struct Ranked {
+    f: i64,
+    value: f32,
+    /// |target| for the current row's terms, |value| for terms fading out.
+    key: f32,
+    current: bool,
 }
 
 pub struct WaveOverlay {
@@ -211,16 +211,21 @@ pub struct WaveOverlay {
     closed: Option<Arc<Modulus>>,
     target: HashMap<i64, f32>,
     displayed: HashMap<i64, f32>,
-    /// Scratch for the per-frame top-K selection (reused).
+    /// The coefficients drawn this frame, and scratch for choosing them (both reused).
     active: Vec<(i64, f32)>,
+    ranked: Vec<Ranked>,
     /// w(θ_j), j = 0..samples (reused).
     samples: Vec<f32>,
-    /// cos(2π i / P + φ) for i = 0..P, P = samples − 1 (reused, refilled every frame).
-    rot: Vec<f32>,
+    /// cos and sin of 2π i / P for i = 0..P, P = samples − 1 (rebuilt when P changes).
+    cos_t: Vec<f32>,
+    sin_t: Vec<f32>,
+    /// Phase-free sums Σ c·cos(2π b j / P) and Σ c·sin(…) per sample (reused).
+    csum: Vec<f32>,
+    ssum: Vec<f32>,
     /// Active coefficients folded by frequency mod P (reused).
     buckets: Vec<f32>,
     phase: f32,
-    /// Smoothed running max of |w|.
+    /// Smoothed running max of |w| over θ and the phase: the envelope max_θ |Σ c e^{ifθ}|.
     norm: f32,
     /// Geometry, from `set_viewport`.
     viewport: Rect,
@@ -233,11 +238,10 @@ pub struct WaveOverlay {
     path: Path,
     points: Vec<Pos2>,
     /// Label text and a second, smaller line (the k window of a deep row, an all-zero
-    /// row), rebuilt only when the source changes, and their layout.
+    /// row), rebuilt only when the source changes.
     label: String,
     note: String,
-    text: Option<TextCache>,
-    /// The formula fit the box at the last layout (decided when the text is laid out).
+    /// The formula fit the box when it was last laid out (decided in `draw`).
     formula_fits: bool,
     settled: bool,
 }
@@ -262,8 +266,12 @@ impl WaveOverlay {
             target: HashMap::new(),
             displayed: HashMap::new(),
             active: Vec::new(),
+            ranked: Vec::new(),
             samples: Vec::new(),
-            rot: Vec::new(),
+            cos_t: Vec::new(),
+            sin_t: Vec::new(),
+            csum: Vec::new(),
+            ssum: Vec::new(),
             buckets: Vec::new(),
             phase: 0.0,
             norm: 0.0,
@@ -276,7 +284,6 @@ impl WaveOverlay {
             points: Vec::new(),
             label: String::new(),
             note: String::new(),
-            text: None,
             formula_fits: true,
             settled: false,
         }
@@ -297,6 +304,9 @@ impl WaveOverlay {
     /// True while the overlay changes from frame to frame (fading, easing or drifting),
     /// i.e. while the app should keep requesting redraws for it.
     pub fn is_animating(&self) -> bool {
+        if self.layout().is_none() {
+            return false; // nothing to show (no viewport, or one too small for the box)
+        }
         if self.visible {
             self.fade < 1.0 || self.dirty || !self.settled || self.config.drift != 0.0
         } else {
@@ -306,10 +316,10 @@ impl WaveOverlay {
 
     /// The screen rectangle of the overlay box (for hit testing), if it is drawn.
     pub fn box_rect(&self) -> Option<Rect> {
-        if self.fade <= FADE_EPS || !self.viewport.is_positive() {
+        if self.fade <= FADE_EPS {
             return None;
         }
-        Some(self.layout().bx)
+        self.layout().map(|l| l.bx)
     }
 
     /// Point the overlay at row `row` of the triangle mod `modulus`. Cheap and idempotent:
@@ -392,7 +402,6 @@ impl WaveOverlay {
             }
             let _ = write!(self.note, "k {}–{}", group(k_lo), group(k_hi));
         }
-        self.text = None;
     }
 
     /// Fill `target` with the nonzero r_k of `src`; false when the row is out of reach.
@@ -437,14 +446,20 @@ impl WaveOverlay {
         true
     }
 
-    /// The box and its parts for the current viewport.
-    fn layout(&self) -> Layout {
+    /// The box and its parts for the current viewport (None when there is no room).
+    fn layout(&self) -> Option<Layout> {
         let c = &self.config;
         let vp = self.viewport;
+        if !vp.is_positive() {
+            return None;
+        }
         let basis = if self.window.x > 0.0 && self.window.y > 0.0 { self.window.x.min(self.window.y) } else { vp.width().min(vp.height()) };
         let avail_w = (vp.width() - 2.0 * c.margin).max(1.0);
         let avail_h = (vp.height() - 2.0 * c.margin - c.top_clearance - c.bottom_clearance).max(1.0);
-        let side = (c.size_frac * basis).clamp(c.min_side, c.max_side).min(avail_w).min(avail_h).max(1.0);
+        let side = (c.size_frac * basis).clamp(c.min_side, c.max_side).min(avail_w).min(avail_h);
+        if side.is_nan() || side < MIN_DRAW_SIDE {
+            return None;
+        }
         let x = match c.corner {
             Corner::TopRight | Corner::BottomRight => vp.max.x - c.margin - side,
             Corner::TopLeft | Corner::BottomLeft => vp.min.x + c.margin,
@@ -462,7 +477,7 @@ impl WaveOverlay {
         let top = note.map_or(label.max.y, |r| r.max.y);
         let plot = Rect::from_min_max(Pos2::new(inner.min.x, top), Pos2::new(inner.max.x, (inner.max.y - formula_h).max(top + 1.0)));
         let formula = show_formula.then(|| Rect::from_min_max(Pos2::new(inner.min.x, inner.max.y - FORMULA_H), inner.max));
-        Layout { bx, plot, label, note, formula }
+        Some(Layout { bx, plot, label, note, formula })
     }
 
     /// Advance the animation by the real frame time `dt` (seconds): fade, phase drift,
@@ -499,63 +514,70 @@ impl WaveOverlay {
         }
         self.displayed.retain(|f, v| v.abs() >= DROP_EPS || target.get(f).is_some_and(|t| t.abs() >= DROP_EPS));
 
-        // the frequencies to draw: all, or for long rows only the TOP_K largest |value|
-        // (cost per frame is frequencies × samples; the small terms of a row past ~2000
-        // entries are invisible at this size)
-        self.active.clear();
-        self.active.extend(self.displayed.iter().map(|(&f, &v)| (f, v)));
-        let long_row = self.source.is_some_and(|s| s.row > LARGE_ROW);
-        if long_row && self.active.len() > TOP_K {
-            self.active.select_nth_unstable_by(TOP_K, |a, b| b.1.abs().total_cmp(&a.1.abs()));
-            self.active.truncate(TOP_K);
-        }
+        self.select_active();
 
         // sample count from the plot width in pixels
-        let plot = self.layout().plot;
+        let Some(Layout { plot, .. }) = self.layout() else {
+            self.settled = true; // no room to draw: nothing to animate
+            return;
+        };
         let px = (plot.width() * self.pixels_per_point).max(1.0);
         let n_samples = ((px * 2.0).round() as usize).clamp(MIN_SAMPLES, MAX_SAMPLES);
         if self.samples.len() != n_samples {
             self.samples.resize(n_samples, 0.0);
         }
         let period = n_samples - 1; // θ_j = −π + 2π j / period, j = 0..=period
-        if self.rot.len() != period {
-            self.rot.resize(period, 0.0);
+        if self.cos_t.len() != period {
+            let step = std::f64::consts::TAU / period as f64;
+            self.cos_t.clear();
+            self.sin_t.clear();
+            self.cos_t.extend((0..period).map(|i| (step * i as f64).cos() as f32));
+            self.sin_t.extend((0..period).map(|i| (step * i as f64).sin() as f32));
         }
-        // cos(f θ_j + φ) = (−1)^f · cos(2π ((f mod P)·j mod P) / P + φ): exact for any
-        // integer frequency, so rows near 10⁹ need no large trig arguments, and all
-        // frequencies with the same f mod P fold into one bucket (≤ P² terms per frame).
-        let step = std::f32::consts::TAU / period as f32;
-        for (i, r) in self.rot.iter_mut().enumerate() {
-            *r = (step * i as f32 + self.phase).cos();
-        }
+        // e^{i f θ_j} = (−1)^f · e^{2πi ((f mod P)·j mod P) / P}: exact for any integer
+        // frequency, so rows near 10⁹ need no large trig arguments, and frequencies with
+        // the same f mod P fold into one bucket (at most P² terms per frame).
         let p64 = period as i64;
         self.buckets.clear();
         self.buckets.resize(period, 0.0);
         for &(f, c) in &self.active {
             self.buckets[f.rem_euclid(p64) as usize] += if f.rem_euclid(2) == 1 { -c } else { c };
         }
-        self.samples.iter_mut().for_each(|s| *s = 0.0);
+        // C_j = Σ c cos(x), S_j = Σ c sin(x) with x = 2π b j / P; then
+        // w(θ_j) = Σ c cos(x + φ) = cos φ · C_j − sin φ · S_j
+        self.csum.clear();
+        self.csum.resize(n_samples, 0.0);
+        self.ssum.clear();
+        self.ssum.resize(n_samples, 0.0);
         for (b, &c) in self.buckets.iter().enumerate() {
             if c == 0.0 {
                 continue;
             }
             let mut i = 0usize;
-            for s in self.samples.iter_mut() {
-                *s += c * self.rot[i];
+            for (cs, ss) in self.csum.iter_mut().zip(self.ssum.iter_mut()) {
+                *cs += c * self.cos_t[i];
+                *ss += c * self.sin_t[i];
                 i += b;
                 if i >= period {
                     i -= period;
                 }
             }
         }
+        let (cp, sp) = (self.phase.cos(), self.phase.sin());
+        let mut env2 = 0.0f32;
+        for ((s, &cs), &ss) in self.samples.iter_mut().zip(&self.csum).zip(&self.ssum) {
+            *s = cp * cs - sp * ss;
+            env2 = env2.max(cs * cs + ss * ss);
+        }
 
-        // normalize by a smoothed running max of |w| (fast rise, slow fall), floored
-        let raw = self.samples.iter().fold(0.0f32, |a, &s| a.max(s.abs())).max(NORM_FLOOR);
+        // Normalize by a smoothed running max of |w|, taken over the phase as well: the
+        // envelope max_j |C_j + i S_j| does not move with φ, so the drift shows as the
+        // wave breathing (a whole row is w = cos φ · C) and peaks never clip.
+        let raw = env2.sqrt().max(NORM_FLOOR);
         if !(self.norm > 0.0 && self.norm.is_finite()) {
             self.norm = raw;
         } else {
-            let k = if raw > self.norm { alpha } else { 1.0 - (-dt / NORM_RELEASE).exp() };
-            self.norm += (raw - self.norm) * k;
+            self.norm += (raw - self.norm) * alpha;
         }
         self.norm = self.norm.max(NORM_FLOOR);
         if (raw - self.norm).abs() > 1e-3 * raw {
@@ -563,6 +585,49 @@ impl WaveOverlay {
         }
         self.settled = !moving;
         self.build_geometry(plot);
+    }
+
+    /// The coefficients to draw this frame. Rows up to LARGE_ROW draw every displayed
+    /// term. Longer rows draw the TOP_K largest terms of the current row (ranked by their
+    /// target) plus the TOP_K largest still fading out from earlier rows (ranked by their
+    /// value). Easing scales each group uniformly, so neither ranking changes during a
+    /// morph and nothing pops in or out; ties break by |f| and then f, which keeps the
+    /// choice deterministic and the ±f pairs of a symmetric row together.
+    fn select_active(&mut self) {
+        self.active.clear();
+        let long_row = self.source.is_some_and(|s| s.row > LARGE_ROW);
+        if !long_row || self.displayed.len() <= TOP_K {
+            self.active.extend(self.displayed.iter().map(|(&f, &v)| (f, v)));
+            return;
+        }
+        self.ranked.clear();
+        for (&f, &value) in &self.displayed {
+            let t = self.target.get(&f).copied().unwrap_or(0.0);
+            let current = t != 0.0;
+            self.ranked.push(Ranked { f, value, key: if current { t.abs() } else { value.abs() }, current });
+        }
+        // current-row terms first
+        let mut split = 0;
+        for i in 0..self.ranked.len() {
+            if self.ranked[i].current {
+                self.ranked.swap(i, split);
+                split += 1;
+            }
+        }
+        let order = |a: &Ranked, b: &Ranked| b.key.total_cmp(&a.key).then(a.f.unsigned_abs().cmp(&b.f.unsigned_abs())).then(b.f.cmp(&a.f));
+        let (cur, old) = self.ranked.split_at_mut(split);
+        for group in [cur, old] {
+            let mut keep = group.len().min(TOP_K);
+            if group.len() > TOP_K {
+                group.select_nth_unstable_by(TOP_K, order);
+                // the first term left out is the partner of the last term kept: keep both
+                let last = group[..TOP_K].iter().copied().max_by(|a, b| order(a, b)).expect("TOP_K > 0");
+                if group[TOP_K].f == -last.f {
+                    keep += 1;
+                }
+            }
+            self.active.extend(group[..keep].iter().map(|r| (r.f, r.value)));
+        }
     }
 
     /// Fill and polyline meshes for the current samples (buffers reused across frames).
@@ -605,10 +670,10 @@ impl WaveOverlay {
 
     /// Add the overlay to `painter`, on top of whatever the painter already holds.
     pub fn draw(&mut self, painter: &egui::Painter) {
-        if self.fade <= FADE_EPS || !self.viewport.is_positive() {
+        if self.fade <= FADE_EPS {
             return;
         }
-        let Layout { bx, plot, label: label_rect, note: note_rect, formula: formula_rect } = self.layout();
+        let Some(Layout { bx, plot, label: label_rect, note: note_rect, formula: formula_rect }) = self.layout() else { return };
         let fade = self.fade;
         let a = |x: f32| (x * 255.0 * fade).round() as u8;
         painter.rect_filled(bx, CornerRadius::same(8), Color32::from_rgba_unmultiplied(0, 0, 0, a(0.62)));
@@ -618,27 +683,30 @@ impl WaveOverlay {
         painter.add(Shape::mesh(self.fill_mesh.clone()));
         painter.add(Shape::mesh(self.line_mesh.clone()));
 
-        // text: laid out once per label / size / scale, elided to the box width
+        // Text, elided to the box width. Laid out every frame through egui's galley cache
+        // (a hash lookup, plus a copy of each short string), so it follows font-atlas
+        // rebuilds such as a theme switch.
         let width = label_rect.width();
-        let ppp = self.pixels_per_point;
-        if !self.text.as_ref().is_some_and(|t| t.width == width && t.pixels_per_point == ppp) {
-            let line = |text: String, size: f32| {
-                let mut job = LayoutJob::simple_singleline(text, FontId::monospace(size), Color32::WHITE);
-                job.wrap = TextWrapping::truncate_at_width(width);
-                painter.layout_job(job)
-            };
-            let formula = line(FORMULA.to_string(), 10.0);
-            self.formula_fits = !formula.elided;
-            self.text = Some(TextCache { width, pixels_per_point: ppp, label: line(self.label.clone(), 11.0), note: line(self.note.clone(), 10.0), formula });
-        }
-        let text = self.text.as_ref().expect("laid out above");
-        painter.galley_with_override_text_color(label_rect.min, text.label.clone(), Color32::from_rgba_unmultiplied(221, 221, 221, a(0.9)));
+        let line = |text: &str, size: f32| -> Arc<Galley> {
+            let mut job = LayoutJob::simple_singleline(text.to_owned(), FontId::monospace(size), Color32::WHITE);
+            job.wrap = TextWrapping::truncate_at_width(width);
+            painter.layout_job(job)
+        };
+        painter.galley_with_override_text_color(label_rect.min, line(&self.label, 11.0), Color32::from_rgba_unmultiplied(221, 221, 221, a(0.9)));
         if let Some(nr) = note_rect {
-            painter.galley_with_override_text_color(nr.min, text.note.clone(), Color32::from_rgba_unmultiplied(187, 187, 187, a(0.7)));
+            painter.galley_with_override_text_color(nr.min, line(&self.note, 10.0), Color32::from_rgba_unmultiplied(187, 187, 187, a(0.7)));
         }
-        if let Some(fr) = formula_rect {
-            let pos = Pos2::new(fr.min.x, fr.max.y - text.formula.size().y);
-            painter.galley_with_override_text_color(pos, text.formula.clone(), Color32::from_rgba_unmultiplied(187, 187, 187, a(0.7)));
+        if bx.width() >= FORMULA_MIN_SIDE {
+            let formula = line(FORMULA, 10.0);
+            let fits = !formula.elided;
+            if fits != self.formula_fits {
+                // the plot height depends on this: lay out again next frame
+                self.formula_fits = fits;
+                self.settled = false;
+            }
+            if let (Some(fr), true) = (formula_rect, fits) {
+                painter.galley_with_override_text_color(Pos2::new(fr.min.x, fr.max.y - formula.size().y), formula, Color32::from_rgba_unmultiplied(187, 187, 187, a(0.7)));
+            }
         }
     }
 
@@ -887,7 +955,7 @@ mod tests {
         w.set_source(3000, 999_983, (0, 3000));
         run(&mut w, 0.2, 1.0 / 60.0);
         assert!(w.displayed_len() > TOP_K);
-        assert_eq!(w.active_len(), TOP_K);
+        assert!((TOP_K..=TOP_K + 1).contains(&w.active_len()), "{}", w.active_len());
         // short rows draw everything
         let mut w = overlay();
         w.set_source(1500, 999_983, (0, 1500));
@@ -913,6 +981,75 @@ mod tests {
         if w.displayed_len() == 0 {
             assert!(w.note().starts_with("every r_k is 0 · k "), "{}", w.note());
         }
+    }
+
+    #[test]
+    fn long_row_morphs_do_not_jump() {
+        // rows 3001 → 3002 share no frequency (opposite parity): the old row's top terms
+        // must fade out while the new row's fade in, not swap in one frame
+        let mut w = overlay();
+        w.config.drift = 0.0;
+        w.set_source(3001, 999_983, (0, 3001));
+        run(&mut w, 3.0, 1.0 / 60.0);
+        w.set_source(3002, 999_983, (0, 3002));
+        let mut prev: Option<Vec<f32>> = None;
+        let mut worst = 0.0f32;
+        for _ in 0..120 {
+            w.update(1.0 / 60.0);
+            let norm = w.norm();
+            let cur: Vec<f32> = w.samples().iter().map(|s| s / norm).collect();
+            if let Some(p) = &prev {
+                worst = worst.max(p.iter().zip(&cur).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max));
+            }
+            prev = Some(cur);
+        }
+        assert!(worst < 0.25, "largest frame-to-frame change {worst} of full scale");
+        // ties (every r_k = 1 mod 2) still pick a symmetric, deterministic set
+        let pick = || {
+            let mut w = overlay();
+            w.set_source(4095, 2, (0, 4095));
+            run(&mut w, 0.5, 1.0 / 60.0);
+            let mut f: Vec<i64> = w.active.iter().map(|a| a.0).collect();
+            f.sort_unstable();
+            f
+        };
+        let a = pick();
+        assert!(a.iter().all(|f| a.binary_search(&-f).is_ok()), "±f pairs stay together");
+        assert_eq!(a, pick());
+    }
+
+    #[test]
+    fn normalization_follows_the_envelope() {
+        // a full drift cycle on a whole row: the wave breathes (|w| ∝ |cos φ|) and the
+        // normalized peaks never pass ±1, so nothing is clipped
+        let mut w = overlay();
+        w.set_source(20, 7, (0, 20));
+        run(&mut w, 2.0, 1.0 / 60.0);
+        let (mut lo, mut hi) = (f32::MAX, 0.0f32);
+        for _ in 0..(std::f32::consts::TAU / PHASE_DRIFT * 60.0) as usize {
+            w.update(1.0 / 60.0);
+            let peak = w.samples().iter().fold(0.0f32, |a, s| a.max(s.abs())) / w.norm();
+            assert!(peak <= 1.0 + 1e-4, "peak {peak} at φ = {}", w.phase);
+            lo = lo.min(peak);
+            hi = hi.max(peak);
+        }
+        assert!(hi > 0.99 && lo < 0.05, "breathes from {lo} to {hi}");
+    }
+
+    #[test]
+    fn tiny_canvases_draw_nothing() {
+        let mut w = overlay();
+        w.set_source(9, 4, (0, 9));
+        for size in [Vec2::new(300.0, 70.0), Vec2::new(300.0, 90.0), Vec2::new(60.0, 500.0)] {
+            w.set_viewport(Rect::from_min_size(Pos2::new(300.0, 0.0), size), size + Vec2::splat(100.0), 1.0);
+            run(&mut w, 0.5, 1.0 / 60.0);
+            assert!(w.box_rect().is_none(), "{size:?}");
+            assert!(!w.is_animating(), "{size:?}");
+        }
+        // and come back when there is room again
+        w.set_viewport(Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0)), Vec2::new(1100.0, 660.0), 1.0);
+        w.update(1.0 / 60.0);
+        assert!(w.box_rect().is_some() && w.is_animating());
     }
 
     #[test]

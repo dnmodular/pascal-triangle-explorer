@@ -58,6 +58,12 @@ struct Model {
     wave_row: u32,
     /// The pointer is over the overlay box: the canvas under it gets no hover.
     over_wave: bool,
+    /// The pin before the latest click (a double click undoes its first click).
+    pin_before_click: Option<u32>,
+    /// The canvas is being dragged (the wave keeps its row while the view pans).
+    dragging: bool,
+    /// A widget had keyboard focus or a popup was open last frame (its Esc is not ours).
+    focus_last_frame: bool,
 }
 
 impl Model {
@@ -86,6 +92,9 @@ impl Model {
             pinned_row: None,
             wave_row: 0,
             over_wave: false,
+            pin_before_click: None,
+            dragging: false,
+            focus_last_frame: false,
         }
     }
 
@@ -208,8 +217,9 @@ struct App {
     /// Modulus of the last rendered frame, and when the running tween began.
     last_m: u32,
     tween_t0: Option<Instant>,
-    /// The display texture holds the true frame of `last_inputs` (no tween in it), so a
-    /// redraw that changes none of them (overlay animation, hover) can skip the GPU passes.
+    /// The display texture holds the settled true frame of `last_inputs` (no tween, not
+    /// the advancing render), so a redraw that changes none of them (overlay animation,
+    /// hover) can skip the GPU passes.
     canvas_current: bool,
     /// When the last frame started, and whether it asked for the next one right away
     /// (then the gap is real frame time; after an idle gap one nominal frame is used).
@@ -413,7 +423,8 @@ impl ApplicationHandler for App {
         let egui_ctx = egui::Context::default();
         setup_style(&egui_ctx);
         let egui_state = egui_winit::State::new(egui_ctx.clone(), egui::ViewportId::ROOT, &window, Some(window.scale_factor() as f32), window.theme(), Some(gpu.device.limits().max_texture_dimension_2d as usize));
-        let egui_renderer = egui_wgpu::Renderer::new(&gpu.device, format, egui_wgpu::RendererOptions::default());
+        // no dithering: the canvas bytes are already 8-bit and must reach the screen exactly
+        let egui_renderer = egui_wgpu::Renderer::new(&gpu.device, format, egui_wgpu::RendererOptions { dithering: false, ..Default::default() });
         let mut renderer = Renderer::new(gpu.device.clone(), gpu.queue.clone());
         renderer.enable_timing();
         self.gfx = Some(Gfx { window, surface, config, gpu, renderer, egui_ctx, egui_state, egui_renderer, canvas_tex: None, canvas_size: (0, 0) });
@@ -604,7 +615,9 @@ impl App {
             gfx.renderer.render(&mut encoder, &FrameInput { grid, modulus: &model.modulus, palette: &model.palette, layers: &model.layers, advance, tween });
             gfx.renderer.flush_pass_params();
         }
-        self.canvas_current = tween_off;
+        // After a change, render once more without advancing: the history layers
+        // (temporal AVERAGE, AFTERIMAGE) then settle on the image an export reproduces.
+        self.canvas_current = tween_off && !advance;
 
         // ---- egui paint ----
         let paint_jobs = ctx.tessellate(shapes, pixels_per_point);
@@ -663,7 +676,7 @@ impl App {
 
         self.frame_ms = t0.elapsed().as_secs_f32() * 1000.0;
         let delay = viewport_output.get(&egui::ViewportId::ROOT).map(|v| v.repaint_delay).unwrap_or(std::time::Duration::MAX);
-        self.continuous = delay.is_zero() || model.sweep.playing || self.tween_t0.is_some() || model.wave.is_animating();
+        self.continuous = delay.is_zero() || model.sweep.playing || self.tween_t0.is_some() || !self.canvas_current || model.wave.is_animating();
         if self.continuous {
             gfx.window.request_redraw();
             self.repaint_at = None;
@@ -933,7 +946,7 @@ fn panel_ui(ui: &mut egui::Ui, model: &mut Model, canvas_px: (u32, u32), _frame_
     });
 
     ui.separator();
-    note(ui, "Keys: space play/pause · ←/→ step · PgUp/PgDn ±10 steps · ↑/↓ rows · shift = ×10 · F fit. Drag to pan, wheel to zoom, double-click to fit. Hover a cell to inspect it.");
+    note(ui, "Keys: space play/pause · ←/→ step · PgUp/PgDn ±10 steps · ↑/↓ rows · shift = ×10 · F fit. Drag to pan, wheel to zoom, double-click to fit. Hover a cell to inspect it; click it to pin its row for the wave (Esc releases) · W wave on/off.");
 }
 
 /// Subscript digits: 7 → ₇.
@@ -1174,9 +1187,13 @@ fn canvas_interaction(ui: &mut egui::Ui, model: &mut Model, response: &egui::Res
     let pointer = pointer.filter(|_| !model.over_wave).map(to_px);
     model.hover = pointer.and_then(|(px, py)| model.view.cell_at(px, py));
     model.hover_row = pointer.and_then(|(_, py)| model.view.row_at(py));
+    model.dragging = response.dragged();
     // A click on a cell pins its row for the wave overlay; a click on the pinned row (or
-    // Esc) releases it. A double click (fit) toggles twice and leaves the pin as it was.
-    if handle && response.clicked() {
+    // Esc) releases it. A double click (fit) restores the pin from before its first click.
+    if handle && response.double_clicked() {
+        model.pinned_row = model.pin_before_click;
+    } else if handle && response.clicked() {
+        model.pin_before_click = model.pinned_row;
         if let Some((n, _)) = model.hover {
             model.pinned_row = if model.pinned_row == Some(n) { None } else { Some(n) };
         }
@@ -1202,7 +1219,8 @@ fn canvas_interaction(ui: &mut egui::Ui, model: &mut Model, response: &egui::Res
         if wave {
             model.wave.toggle();
         }
-        if esc {
+        // Esc that left a text field or closed a popup is not an unpin
+        if esc && !model.focus_last_frame {
             model.pinned_row = None;
         }
         let big: i64 = if shift { 10 } else { 1 };
@@ -1222,6 +1240,9 @@ fn canvas_interaction(ui: &mut egui::Ui, model: &mut Model, response: &egui::Res
         if fit {
             model.fit(cw, ch);
         }
+    }
+    if handle {
+        model.focus_last_frame = ui.ctx().memory(|m| m.focused().is_some()) || ui.ctx().any_popup_open();
     }
 }
 
@@ -1273,8 +1294,22 @@ fn canvas_overlays(ui: &mut egui::Ui, model: &mut Model, rect: Rect, ppp: f32, g
         painter.rect_stroke(r, 0.0, egui::Stroke::new(1.5, Color32::WHITE), egui::StrokeKind::Outside);
         let text = model.inspector_text(n, k);
         let galley = painter.layout(text, FontId::monospace(12.0), Color32::from_rgb(221, 221, 221), (rect.width() - 16.0).min(520.0));
-        let pos = rect.min + Vec2::new(8.0, 8.0);
-        let bg = Rect::from_min_size(pos, galley.size() + Vec2::new(18.0, 12.0));
+        let size = galley.size() + Vec2::new(18.0, 12.0);
+        let mut pos = rect.min + Vec2::new(8.0, 8.0);
+        // keep clear of the wave overlay: below it, else just above the status strip
+        if let Some(b) = model.wave.box_rect() {
+            let floor = rect.max.y - STATUS_H as f32;
+            let clear = |p: Pos2| {
+                let r = Rect::from_min_size(p, size);
+                !r.intersects(b.expand(4.0)) && r.max.y <= floor
+            };
+            if !clear(pos) {
+                let below = Pos2::new(pos.x, b.max.y + 8.0);
+                let bottom = Pos2::new(pos.x, floor - size.y - 8.0);
+                pos = [below, bottom].into_iter().find(|p| clear(*p)).unwrap_or(pos);
+            }
+        }
+        let bg = Rect::from_min_size(pos, size);
         painter.rect_filled(bg, 0.0, Color32::from_black_alpha(200));
         painter.galley(pos + Vec2::new(9.0, 6.0), galley, Color32::from_rgb(221, 221, 221));
     }
@@ -1326,8 +1361,8 @@ fn wave_overlay(ui: &mut egui::Ui, model: &mut Model, rect: Rect, ppp: f32, dt: 
             n
         } else if let Some(n) = model.hover_row {
             n
-        } else if model.over_wave {
-            model.wave_row // the pointer is on the overlay: keep playing the same row
+        } else if model.over_wave || model.dragging {
+            model.wave_row // on the overlay, or panning: keep playing the same row
         } else {
             model.view.visible_rows(ch).map(|r| r.1).unwrap_or(model.wave_row)
         };

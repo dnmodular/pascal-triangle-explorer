@@ -114,13 +114,15 @@ visible row; small ticks at the canvas edges mark it. Each coefficient sits at
 frequency n − 2k (the terms of (2 cos θ)ⁿ, filtered through mod m), so the maps
 are keyed by frequency and rows of different lengths line up. On a change of
 row or modulus only the target coefficients are rebuilt; the displayed ones ease
-toward them (α = 1 − e^(−dt/0.12 s), from the real frame time), and the plot is
-normalized by a running max of |w| that rises quickly and falls slowly, so the
-wave morphs instead of snapping.
+toward them (α = 1 − e^(−dt/0.12 s), from the real frame time), so the wave
+morphs instead of snapping.
 
 A whole row is symmetric (r_k = r_{n−k}), so w(θ) = cos φ · Σ r_k cos((n − 2k)θ):
 the phase drift (0.3 rad/s by default, 0 holds it) makes the wave breathe —
-swell, flatten, invert — rather than travel.
+swell, flatten, invert — rather than travel. The plot is normalized by a smoothed
+running max of |w| taken over the phase as well, i.e. the envelope
+max_θ |Σ r_k e^{i(n−2k)θ}|, which does not move with φ: the breathing stays
+visible and the peaks never clip.
 
 * Rows up to 2048 are built with Pascal's rule mod m in `u64` (any m), stepping
   forward or backward from the cached row. Longer rows use the same closed form
@@ -128,13 +130,19 @@ swell, flatten, invert — rather than travel.
   entries use a window of k centred on the part on screen, shown under the label.
   Deep rows mod a composite are mostly zeros, and the note says so when every
   r_k in the window is 0.
-* Rows longer than 2000 draw only their 256 largest coefficients.
+* Rows longer than 2000 draw only their 256 largest coefficients (an
+  approximation of the full sum). The current row's terms are ranked by their
+  target and the terms still fading out by their value, each group keeping its
+  256 largest, so the choice does not change during a morph; ties break by |f|,
+  keeping a symmetric row's ±f pairs together.
 * Samples: ~2 per pixel of plot width, 256–1024. cos(fθ_j + φ) is reduced exactly
   to a table index, so frequencies near 10⁹ cost no large trig arguments, and
   frequencies are folded by f mod P before the sum (at most P² terms a frame).
-* The per-frame path reuses its buffers: the sample, table and point vectors,
-  and the fill and line meshes (handed to egui in `Arc`s that egui releases after
-  tessellation), and the label layouts are cached.
+* The per-frame path reuses its buffers: the sample, sum, table and point
+  vectors, and the fill and line meshes (handed to egui in `Arc`s that egui
+  releases after tessellation). The two or three text lines go through egui's
+  galley cache each frame (one short string copy each), so they survive font
+  atlas rebuilds.
 
 ## Sweep
 
@@ -297,11 +305,17 @@ Verified (by `cargo test` on Mesa lavapipe, and by the headless export):
   closed-form rows equal Pascal rows; the samples equal the direct sum; easing
   converges at 30 and 144 fps alike; m = 1, n = 0, rows near 2³², moduli above
   the cap, zero-sized and resized viewports and NaN/negative frame times stay
-  finite. Under Xvfb: hover, a modulus step and a row change morph, **W** fades
-  out and in, pinning, corners, resizes, deep rows with their k window.
+  finite; long-row morphs move at most a quarter of full scale per frame (the
+  older selection jumped 0.85), ties keep ±f pairs, the normalized peaks stay
+  within ±1 through a full drift cycle, and tiny canvases draw nothing. Under
+  Xvfb: hover, a modulus step and a row change morph, **W** fades out and in,
+  pinning, corners (the inspector moves out of the box's way), resizes, deep rows
+  with their k window.
 * The app is idle when nothing moves (with the wave's drift at 0), and a redraw
   that changes no GPU input skips the triangle's passes; after a tween the canvas
-  equals a fresh render pixel for pixel.
+  equals a fresh render pixel for pixel. The on-screen canvas equals the exported
+  PNG byte for byte (checked under Xvfb with AFTERIMAGE on), and Save PNG leaves
+  the screen unchanged.
 
 Not verified here: behavior on a real GPU and display (only the software Vulkan
 device was available), light-theme appearance, Windows and macOS builds, and
