@@ -162,6 +162,7 @@ fn binom_mod_prime_power(n: u32, k: u32, F: Factor, full_nu: bool) -> BinomRes {
   let e = F.e;
   let q = F.q;
   let is2 = (p == 2u);
+  let prime = (e == 1u);
   let qm = q - 1u;
   var nn = n;
   var kk = k;
@@ -173,18 +174,25 @@ fn binom_mod_prime_power(n: u32, k: u32, F: Factor, full_nu: bool) -> BinomRes {
   var done = false;
   var j = 0u;
   while (nn != 0u && !done) {
+    // One division per number per digit; the digit is the remainder. For p = 2
+    // everything is shifts and masks. The e-digit windows N_j, K_j are the digits
+    // themselves when e = 1 (Lucas), otherwise one more remainder each.
+    var nq = 0u;
+    var kq = 0u;
     var nj = 0u;
     var kj = 0u;
     var nw = 0u;
     var kw = 0u;
     if (is2) {
-      nj = nn & 1u; kj = kk & 1u; nw = nn & qm; kw = kk & qm;
+      nq = nn >> 1u; kq = kk >> 1u; nj = nn & 1u; kj = kk & 1u; nw = nn & qm; kw = kk & qm;
     } else {
-      nj = nn % p; kj = kk % p; nw = nn % q; kw = kk % q;
+      nq = nn / p; kq = kk / p; nj = nn - nq * p; kj = kk - kq * p;
+      if (prime) { nw = nj; kw = kj; } else { nw = nn % q; kw = kk % q; }
     }
     let c_out = select(0u, 1u, nj < kj + carry);
     if (!zero) {
-      let rw = (nw + q - kw - carry) % q;   // R_j = N_j − K_j − carry (mod q)
+      let t = nw + q - kw - carry;            // in [1, 2q)
+      let rw = select(t, t - q, t >= q);      // R_j = N_j − K_j − carry (mod q)
       acc = mm(acc, tables[F.tab_off + nw], F);
       acc = mm(acc, tables[F.tab_off + q + kw], F);
       acc = mm(acc, tables[F.tab_off + q + rw], F);
@@ -197,7 +205,8 @@ fn binom_mod_prime_power(n: u32, k: u32, F: Factor, full_nu: bool) -> BinomRes {
       done = !full_nu;
     }
     carry = c_out;
-    if (is2) { nn = nn >> 1u; kk = kk >> 1u; } else { nn = nn / p; kk = kk / p; }
+    nn = nq;
+    kk = kq;
     j = j + 1u;
   }
   var r = 0u;
@@ -205,7 +214,7 @@ fn binom_mod_prime_power(n: u32, k: u32, F: Factor, full_nu: bool) -> BinomRes {
     r = acc;
     for (var t = 0u; t < nu; t = t + 1u) { r = mm(r, F.p_mont, F); }
     r = from_mont(r, F);
-    if (F.minus_one == 1u && (sc & 1u) == 1u) { r = (q - r) % q; }
+    if (F.minus_one == 1u && (sc & 1u) == 1u) { r = select(q - r, 0u, r == 0u); }
   }
   return BinomRes(r, nu);
 }

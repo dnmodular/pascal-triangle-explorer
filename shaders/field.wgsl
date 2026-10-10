@@ -152,11 +152,11 @@ fn reduce_max_abs(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_
   }
   wg_abs[lid] = bits;
   workgroupBarrier();
-  if (lid == 0u) {
-    var m = 0u;
-    for (var t = 0u; t < 256u; t = t + 1u) { m = max(m, wg_abs[t]); }
-    if (m > 0u) { atomicMax(&maxbuf[PP.slot], m); }
+  for (var s = 128u; s > 0u; s = s >> 1u) {
+    if (lid < s) { wg_abs[lid] = max(wg_abs[lid], wg_abs[lid + s]); }
+    workgroupBarrier();
   }
+  if (lid == 0u && wg_abs[0] > 0u) { atomicMax(&maxbuf[PP.slot], wg_abs[0]); }
 }
 
 @compute @workgroup_size(16, 16)

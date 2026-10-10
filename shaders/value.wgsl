@@ -32,7 +32,8 @@ fn value_main(@builtin(global_invocation_id) gid: vec3<u32>) {
       x = res.r;
     } else {
       let xq = x % F.q;
-      let diff = (res.r + F.q - xq) % F.q;
+      let t = res.r + F.q - xq;               // in (0, 2q)
+      let diff = select(t, t - F.q, t >= F.q);
       let cc = mm(diff, F.garner_inv, F);   // plain (r_f − x) · Q^{−1} mod q_f
       x = x + F.garner_q * cc;
     }

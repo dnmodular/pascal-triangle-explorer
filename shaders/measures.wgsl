@@ -37,12 +37,14 @@ const SLOT_PADIC_DIGIT: u32 = 1u;
 
 // p^t as u32, or 0 when it does not fit (the reference's Math.pow then floors to 0 digits).
 fn pow_u32(p: u32, t: u32) -> u32 {
+  let lim = 0xffffffffu / p;
   var r = 1u;
+  var ok = true;
   for (var i = 0u; i < t; i = i + 1u) {
-    if (r > 0xffffffffu / p) { return 0u; }
-    r = r * p;
+    if (r > lim) { ok = false; }
+    if (ok) { r = r * p; }
   }
-  return r;
+  return select(0u, r, ok);
 }
 
 // KUMMER: carries adding k and n−k in base p = ν_p(C(n,k)), p the smallest prime factor.
@@ -136,11 +138,12 @@ fn reduce_max(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invo
   }
   wg_vals[lid] = bits;
   workgroupBarrier();
-  if (lid == 0u) {
-    var m = 0u;
-    for (var t = 0u; t < 256u; t = t + 1u) { m = max(m, wg_vals[t]); }
-    if (m > 0u) { atomicMax(&maxbuf[PP.slot], m); }
+  // Tree reduction: 8 uniform steps over the 256 shared values.
+  for (var s = 128u; s > 0u; s = s >> 1u) {
+    if (lid < s) { wg_vals[lid] = max(wg_vals[lid], wg_vals[lid + s]); }
+    workgroupBarrier();
   }
+  if (lid == 0u && wg_vals[0] > 0u) { atomicMax(&maxbuf[PP.slot], wg_vals[0]); }
 }
 
 // ---------------------------------------------------------------------------

@@ -48,9 +48,14 @@ cargo run --release -- --help
   ```
 
   which compiles every pipeline one at a time and names the ones the driver
-  rejects; please report that output. As a workaround, another backend uses a
-  different shader compiler path: `WGPU_BACKEND=gl` on Linux and Windows, or
-  `WGPU_BACKEND=dx12` on Windows.
+  rejects, then retries each failure without naga's runtime-check wrappers
+  (index clamps and forced loop bounding, which the shaders do not need because
+  they bound every index themselves). If that mode compiles, run the app with
+  `PASCAL_UNCHECKED_SHADERS=1`. Please report the output together with the
+  driver version. Another backend uses a different shader compiler path:
+  `WGPU_BACKEND=gl` on Linux and Windows, or `WGPU_BACKEND=dx12` on Windows.
+  Debug info is left out of the SPIR-V by default; `WGPU_DEBUG=1` puts it back
+  for graphics debuggers.
 * **No adapter found.** Install a Vulkan or GL driver; on Linux without a GPU,
   `mesa-vulkan-drivers` provides a software device that runs the app slowly.
 * `RUST_LOG=info` prints the adapter and backend in use.

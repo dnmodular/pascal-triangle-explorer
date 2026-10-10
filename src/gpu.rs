@@ -337,6 +337,26 @@ impl Layouts {
     }
 }
 
+/// `PASCAL_UNCHECKED_SHADERS=1` compiles the shaders without naga's runtime-check
+/// wrappers (index clamps, forced loop bounding). The shaders bound every index
+/// themselves, so this is a legitimate workaround when a driver's compiler rejects
+/// the wrapped form; `--check-shaders` reports whether it helps.
+pub fn unchecked_shaders_requested() -> bool {
+    std::env::var("PASCAL_UNCHECKED_SHADERS").map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false)
+}
+
+fn create_module(device: &wgpu::Device, label: &str, source: &str, unchecked: bool) -> wgpu::ShaderModule {
+    let desc = wgpu::ShaderModuleDescriptor { label: Some(label), source: wgpu::ShaderSource::Wgsl(source.to_owned().into()) };
+    if unchecked {
+        // SAFETY: every buffer index in these shaders is range-checked in WGSL before use
+        // (grid bounds, table offsets derived from the uploaded sizes), and every loop
+        // terminates by construction (digit loops divide by p ≥ 2 each step).
+        unsafe { device.create_shader_module_trusted(desc, wgpu::ShaderRuntimeChecks::unchecked()) }
+    } else {
+        device.create_shader_module(desc)
+    }
+}
+
 fn make_pipeline(device: &wgpu::Device, layout: &wgpu::PipelineLayout, module: &wgpu::ShaderModule, entry: &str) -> wgpu::ComputePipeline {
     device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
         label: Some(entry),
@@ -352,7 +372,37 @@ fn make_pipeline(device: &wgpu::Device, layout: &wgpu::PipelineLayout, module: &
 pub struct ShaderCheck {
     pub module: &'static str,
     pub entry: &'static str,
+    /// With naga's runtime checks (the default build).
     pub result: Result<(), String>,
+    /// Retry without the runtime-check wrappers, only when `result` failed.
+    pub unchecked_result: Option<Result<(), String>>,
+}
+
+fn try_compile(adapter: &wgpu::Adapter, m: &ModuleSource, entry: &str, kind: LayoutKind, unchecked: bool) -> Result<(), String> {
+    let (device, _queue) = pollster::block_on(Gpu::request_device(adapter))?;
+    let lost = Arc::new(std::sync::Mutex::new(None::<String>));
+    let lost2 = lost.clone();
+    device.set_device_lost_callback(move |reason, msg| {
+        *lost2.lock().unwrap() = Some(format!("device lost ({reason:?}): {msg}"));
+    });
+    let scope_validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let scope_internal = device.push_error_scope(wgpu::ErrorFilter::Internal);
+    let module = create_module(&device, m.label, &m.source, unchecked);
+    let layouts = Layouts::new(&device);
+    let _pipe = make_pipeline(&device, layouts.for_kind(kind), &module, entry);
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    let internal = pollster::block_on(scope_internal.pop());
+    let validation = pollster::block_on(scope_validation.pop());
+    if let Some(e) = validation {
+        return Err(format!("{e}"));
+    }
+    if let Some(e) = internal {
+        return Err(format!("{e}"));
+    }
+    if let Some(l) = lost.lock().unwrap().take() {
+        return Err(l);
+    }
+    Ok(())
 }
 
 /// Compile every pipeline one at a time, each on a fresh device and inside error
@@ -362,33 +412,9 @@ pub fn check_shaders(adapter: &wgpu::Adapter) -> Vec<ShaderCheck> {
     let mut out = Vec::new();
     for m in module_sources() {
         for (entry, kind) in &m.entries {
-            let result = (|| -> Result<(), String> {
-                let (device, _queue) = pollster::block_on(Gpu::request_device(adapter))?;
-                let lost = Arc::new(std::sync::Mutex::new(None::<String>));
-                let lost2 = lost.clone();
-                device.set_device_lost_callback(move |reason, msg| {
-                    *lost2.lock().unwrap() = Some(format!("device lost ({reason:?}): {msg}"));
-                });
-                let scope_validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
-                let scope_internal = device.push_error_scope(wgpu::ErrorFilter::Internal);
-                let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some(m.label), source: wgpu::ShaderSource::Wgsl(m.source.clone().into()) });
-                let layouts = Layouts::new(&device);
-                let _pipe = make_pipeline(&device, layouts.for_kind(*kind), &module, entry);
-                let _ = device.poll(wgpu::PollType::wait_indefinitely());
-                let internal = pollster::block_on(scope_internal.pop());
-                let validation = pollster::block_on(scope_validation.pop());
-                if let Some(e) = validation {
-                    return Err(format!("{e}"));
-                }
-                if let Some(e) = internal {
-                    return Err(format!("{e}"));
-                }
-                if let Some(l) = lost.lock().unwrap().take() {
-                    return Err(l);
-                }
-                Ok(())
-            })();
-            out.push(ShaderCheck { module: m.label, entry, result });
+            let result = try_compile(adapter, &m, entry, *kind, false);
+            let unchecked_result = if result.is_err() { Some(try_compile(adapter, &m, entry, *kind, true)) } else { None };
+            out.push(ShaderCheck { module: m.label, entry, result, unchecked_result });
         }
     }
     out
@@ -558,8 +584,12 @@ impl Renderer {
         let layouts = Layouts::new(&device);
         let mut modules = HashMap::new();
         let mut pipes: HashMap<(&'static str, &'static str), wgpu::ComputePipeline> = HashMap::new();
+        let unchecked = unchecked_shaders_requested();
+        if unchecked {
+            log::warn!("PASCAL_UNCHECKED_SHADERS is set: compiling shaders without naga's runtime checks");
+        }
         for m in module_sources() {
-            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some(m.label), source: wgpu::ShaderSource::Wgsl(m.source.clone().into()) });
+            let module = create_module(&device, m.label, &m.source, unchecked);
             for (entry, kind) in &m.entries {
                 pipes.insert((m.label, entry), make_pipeline(&device, layouts.for_kind(*kind), &module, entry));
             }

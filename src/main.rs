@@ -230,29 +230,55 @@ fn main() {
     event_loop.run_app(&mut app).expect("run");
 }
 
+/// The wgpu instance. Debug info (OpName/OpSource/OpLine) is left out of the SPIR-V
+/// unless `WGPU_DEBUG=1`: it only helps graphics debuggers and has tripped driver
+/// compilers before. `WGPU_BACKEND` and `WGPU_VALIDATION` are honored as usual.
+fn instance_descriptor(window: Option<Arc<Window>>) -> wgpu::InstanceDescriptor {
+    let mut desc = match window {
+        Some(w) => wgpu::InstanceDescriptor::new_with_display_handle(Box::new(w)),
+        None => wgpu::InstanceDescriptor::new_without_display_handle(),
+    };
+    desc.flags = wgpu::InstanceFlags::empty().with_env();
+    desc.with_env()
+}
+
 /// `--check-shaders`: name the entry points the driver's shader compiler rejects.
 fn check_shaders() {
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+    let instance = wgpu::Instance::new(instance_descriptor(None));
     let adapter = pollster::block_on(Gpu::request_adapter(&instance, None)).unwrap_or_else(|e| {
         eprintln!("{e}");
         std::process::exit(1);
     });
     let info = adapter.get_info();
     println!("adapter: {} ({:?}, driver {} {})", info.name, info.backend, info.driver, info.driver_info);
+    println!("pascal-triangle-explorer {} on wgpu 30; each entry point is compiled on a fresh device", env!("CARGO_PKG_VERSION"));
     let mut failed = 0;
+    let mut unchecked_ok = 0;
     for c in pascal::gpu::check_shaders(&adapter) {
         match c.result {
             Ok(()) => println!("  ok    {}::{}", c.module, c.entry),
             Err(e) => {
                 failed += 1;
                 println!("  FAIL  {}::{}\n        {}", c.module, c.entry, e.replace('\n', "\n        "));
+                match c.unchecked_result {
+                    Some(Ok(())) => {
+                        unchecked_ok += 1;
+                        println!("        ok without naga runtime checks (PASCAL_UNCHECKED_SHADERS=1)");
+                    }
+                    Some(Err(e2)) => println!("        also fails without runtime checks: {}", e2.replace('\n', "\n        ")),
+                    None => {}
+                }
             }
         }
     }
     if failed == 0 {
         println!("all pipelines compiled");
     } else {
-        println!("{failed} pipeline(s) rejected by the driver. Please report this output. As a workaround try another backend: WGPU_BACKEND=gl (Linux/Windows), WGPU_BACKEND=dx12 (Windows).");
+        println!("{failed} pipeline(s) rejected by the driver. Please report this output together with the driver version.");
+        if unchecked_ok == failed {
+            println!("Every failing pipeline compiles without naga's runtime-check wrappers: run the app with PASCAL_UNCHECKED_SHADERS=1.");
+        }
+        println!("Other workarounds: WGPU_BACKEND=gl (Linux/Windows) or WGPU_BACKEND=dx12 (Windows) use a different shader compiler path; a newer or older driver branch may also compile it.");
         std::process::exit(1);
     }
 }
@@ -285,7 +311,7 @@ impl ApplicationHandler for App {
         }
         let attrs = Window::default_attributes().with_title("Pascal sieve").with_inner_size(winit::dpi::LogicalSize::new(1280.0, 800.0));
         let window = Arc::new(event_loop.create_window(attrs).expect("window"));
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_with_display_handle_from_env(Box::new(window.clone())));
+        let instance = wgpu::Instance::new(instance_descriptor(Some(window.clone())));
         let surface = instance.create_surface(window.clone()).expect("surface");
         let gpu = pollster::block_on(Gpu::new_async(instance, Some(&surface))).unwrap_or_else(|e| panic!("{e}"));
         log::info!("adapter: {} ({:?})", gpu.info.name, gpu.info.backend);
