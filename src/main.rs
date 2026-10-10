@@ -152,6 +152,8 @@ const USAGE: &str = "pascal-triangle-explorer [options]
   --rows R           rows to fit (default 128)
   --palette NAME     spectral | viridis | magma | inferno | turbo | cividis | coolwarm | mono
   --mode MODE        residue | mask | valuation
+  --layers a,b,c     active layers: value kummer lucas crt dlog pdigit density average bandpass afterimage
+  --field MODE       math | palette (field color mode)
   --export FILE.png  render once without a window and write a PNG
   --size WxH         canvas size for --export (default 1600x1000)";
 
@@ -177,6 +179,22 @@ fn main() {
                 "valuation" => model.layers.preset_valuation(),
                 _ => model.layers.preset_residue(),
             },
+            "--layers" => {
+                model.layers.active.clear();
+                for name in next().split(',') {
+                    let name = name.trim().to_lowercase().replace([' ', '-', '_'], "");
+                    match REGISTRY.iter().find(|d| d.label.to_lowercase().replace(' ', "") == name) {
+                        Some(d) => model.layers.set_active(d.id, true),
+                        None => {
+                            eprintln!("unknown layer {name}\n{USAGE}");
+                            std::process::exit(2);
+                        }
+                    }
+                }
+            }
+            "--field" => {
+                model.layers.color_mode = if next() == "palette" { FieldColorMode::PaletteBlend } else { FieldColorMode::MathRamp };
+            }
             "--export" => export = Some(PathBuf::from(next())),
             "--size" => {
                 let v = next();
