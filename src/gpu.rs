@@ -183,7 +183,14 @@ impl Gpu {
     }
 
     pub async fn new_async(instance: wgpu::Instance, surface: Option<&wgpu::Surface<'_>>) -> Result<Gpu, String> {
-        let adapter = instance
+        let adapter = Self::request_adapter(&instance, surface).await?;
+        let info = adapter.get_info();
+        let (device, queue) = Self::request_device(&adapter).await?;
+        Ok(Gpu { instance, adapter, device: Arc::new(device), queue: Arc::new(queue), info })
+    }
+
+    pub async fn request_adapter(instance: &wgpu::Instance, surface: Option<&wgpu::Surface<'_>>) -> Result<wgpu::Adapter, String> {
+        instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
                 force_fallback_adapter: false,
@@ -191,8 +198,12 @@ impl Gpu {
                 ..Default::default()
             })
             .await
-            .map_err(|e| format!("no suitable GPU adapter: {e}"))?;
-        let info = adapter.get_info();
+            .map_err(|e| format!("no suitable GPU adapter: {e}"))
+    }
+
+    /// A device with the limits this renderer wants (large storage bindings) and
+    /// timestamp queries when the adapter has them.
+    pub async fn request_device(adapter: &wgpu::Adapter) -> Result<(wgpu::Device, wgpu::Queue), String> {
         let al = adapter.limits();
         let mut limits = wgpu::Limits::default();
         limits.max_storage_buffer_binding_size = al.max_storage_buffer_binding_size;
@@ -200,7 +211,7 @@ impl Gpu {
         limits.max_storage_buffers_per_shader_stage = al.max_storage_buffers_per_shader_stage.min(16).max(8);
         limits.max_texture_dimension_2d = al.max_texture_dimension_2d;
         let features = adapter.features() & wgpu::Features::TIMESTAMP_QUERY;
-        let (device, queue) = adapter
+        adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("pascal"),
                 required_features: features,
@@ -210,9 +221,177 @@ impl Gpu {
                 trace: wgpu::Trace::Off,
             })
             .await
-            .map_err(|e| format!("request_device failed: {e}"))?;
-        Ok(Gpu { instance, adapter, device: Arc::new(device), queue: Arc::new(queue), info })
+            .map_err(|e| format!("request_device failed: {e}"))
     }
+}
+
+/// Which pipeline layout an entry point uses.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LayoutKind {
+    Value,
+    Scalar,
+    Field,
+}
+
+/// One shader module exactly as the renderer compiles it, with its entry points.
+pub struct ModuleSource {
+    pub label: &'static str,
+    pub source: String,
+    pub entries: Vec<(&'static str, LayoutKind)>,
+}
+
+/// The four modules: value, measures, and field.wgsl in its two element types.
+pub fn module_sources() -> Vec<ModuleSource> {
+    let measure_entries: Vec<(&'static str, LayoutKind)> = crate::layers::REGISTRY
+        .iter()
+        .filter_map(|d| d.run)
+        .map(|run| match run {
+            MeasureRun::Pointwise { entry } | MeasureRun::Blurred { entry, .. } => (entry, LayoutKind::Scalar),
+        })
+        .chain([("reduce_max", LayoutKind::Scalar), ("blur_scalar", LayoutKind::Scalar)])
+        .collect();
+    let field_entries: Vec<(&'static str, LayoutKind)> =
+        ["blend_main", "blur_field", "temporal_main", "band_diff", "reduce_max_abs", "normalize_signed", "afterimage_main", "resolve_main"].into_iter().map(|e| (e, LayoutKind::Field)).collect();
+    vec![
+        ModuleSource { label: "value", source: format!("{COMMON_WGSL}\n{VALUE_WGSL}"), entries: vec![("value_main", LayoutKind::Value)] },
+        ModuleSource { label: "measures", source: format!("{COMMON_WGSL}\n{MEASURES_WGSL}"), entries: measure_entries },
+        ModuleSource { label: "field-math", source: format!("{COMMON_WGSL}\n{}", FIELD_WGSL.replace("{{FIELD_PRELUDE}}", MATH_PRELUDE)), entries: field_entries.clone() },
+        ModuleSource { label: "field-palette", source: format!("{COMMON_WGSL}\n{}", FIELD_WGSL.replace("{{FIELD_PRELUDE}}", PALETTE_PRELUDE)), entries: field_entries },
+    ]
+}
+
+/// Bind group and pipeline layouts shared by every pass.
+struct Layouts {
+    bgl0: wgpu::BindGroupLayout,
+    bgl_scalar: wgpu::BindGroupLayout,
+    bgl_field: wgpu::BindGroupLayout,
+    value: wgpu::PipelineLayout,
+    scalar: wgpu::PipelineLayout,
+    field: wgpu::PipelineLayout,
+}
+
+impl Layouts {
+    fn new(device: &wgpu::Device) -> Layouts {
+        let bgl0 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("shared"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+                storage_entry(1, true),
+                storage_entry(2, true),
+                storage_entry(3, true),
+                storage_entry(4, false),
+                storage_entry(5, false),
+            ],
+        });
+        let pass_entry = |binding: u32| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: true,
+                min_binding_size: NonZeroU64::new(std::mem::size_of::<PassParams>() as u64),
+            },
+            count: None,
+        };
+        let bgl_scalar = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("scalar passes"),
+            entries: &[storage_entry(0, false), storage_entry(1, false), storage_entry(2, false), storage_entry(3, false), pass_entry(4)],
+        });
+        let bgl_field = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("field passes"),
+            entries: &[
+                storage_entry(0, false),
+                storage_entry(1, false),
+                storage_entry(2, false),
+                storage_entry(3, false),
+                pass_entry(4),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::StorageTexture {
+                        access: wgpu::StorageTextureAccess::WriteOnly,
+                        format: wgpu::TextureFormat::Rgba8Unorm,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let value = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("value"), bind_group_layouts: &[Some(&bgl0)], immediate_size: 0 });
+        let scalar = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("scalar"), bind_group_layouts: &[Some(&bgl0), Some(&bgl_scalar)], immediate_size: 0 });
+        let field = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("field"), bind_group_layouts: &[Some(&bgl0), Some(&bgl_field)], immediate_size: 0 });
+        Layouts { bgl0, bgl_scalar, bgl_field, value, scalar, field }
+    }
+
+    fn for_kind(&self, kind: LayoutKind) -> &wgpu::PipelineLayout {
+        match kind {
+            LayoutKind::Value => &self.value,
+            LayoutKind::Scalar => &self.scalar,
+            LayoutKind::Field => &self.field,
+        }
+    }
+}
+
+fn make_pipeline(device: &wgpu::Device, layout: &wgpu::PipelineLayout, module: &wgpu::ShaderModule, entry: &str) -> wgpu::ComputePipeline {
+    device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some(entry),
+        layout: Some(layout),
+        module,
+        entry_point: Some(entry),
+        compilation_options: Default::default(),
+        cache: None,
+    })
+}
+
+/// Result of compiling one entry point on the driver.
+pub struct ShaderCheck {
+    pub module: &'static str,
+    pub entry: &'static str,
+    pub result: Result<(), String>,
+}
+
+/// Compile every pipeline one at a time, each on a fresh device and inside error
+/// scopes, so a driver that rejects a shader (e.g. NVIDIA's "NVVM compilation
+/// failed") names the entry point instead of silently losing the device.
+pub fn check_shaders(adapter: &wgpu::Adapter) -> Vec<ShaderCheck> {
+    let mut out = Vec::new();
+    for m in module_sources() {
+        for (entry, kind) in &m.entries {
+            let result = (|| -> Result<(), String> {
+                let (device, _queue) = pollster::block_on(Gpu::request_device(adapter))?;
+                let lost = Arc::new(std::sync::Mutex::new(None::<String>));
+                let lost2 = lost.clone();
+                device.set_device_lost_callback(move |reason, msg| {
+                    *lost2.lock().unwrap() = Some(format!("device lost ({reason:?}): {msg}"));
+                });
+                let scope_validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
+                let scope_internal = device.push_error_scope(wgpu::ErrorFilter::Internal);
+                let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some(m.label), source: wgpu::ShaderSource::Wgsl(m.source.clone().into()) });
+                let layouts = Layouts::new(&device);
+                let _pipe = make_pipeline(&device, layouts.for_kind(*kind), &module, entry);
+                let _ = device.poll(wgpu::PollType::wait_indefinitely());
+                let internal = pollster::block_on(scope_internal.pop());
+                let validation = pollster::block_on(scope_validation.pop());
+                if let Some(e) = validation {
+                    return Err(format!("{e}"));
+                }
+                if let Some(e) = internal {
+                    return Err(format!("{e}"));
+                }
+                if let Some(l) = lost.lock().unwrap().take() {
+                    return Err(l);
+                }
+                Ok(())
+            })();
+            out.push(ShaderCheck { module: m.label, entry, result });
+        }
+    }
+    out
 }
 
 struct FieldPipes {
@@ -376,99 +555,40 @@ fn round_up(x: u64, to: u64) -> u64 {
 
 impl Renderer {
     pub fn new(device: Arc<wgpu::Device>, queue: Arc<wgpu::Queue>) -> Renderer {
-        let module = |label: &str, src: String| device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some(label), source: wgpu::ShaderSource::Wgsl(src.into()) });
-        let value_mod = module("value", format!("{COMMON_WGSL}\n{VALUE_WGSL}"));
-        let measures_mod = module("measures", format!("{COMMON_WGSL}\n{MEASURES_WGSL}"));
-        let field_mods = [
-            module("field-math", format!("{COMMON_WGSL}\n{}", FIELD_WGSL.replace("{{FIELD_PRELUDE}}", MATH_PRELUDE))),
-            module("field-palette", format!("{COMMON_WGSL}\n{}", FIELD_WGSL.replace("{{FIELD_PRELUDE}}", PALETTE_PRELUDE))),
-        ];
-
-        let bgl0 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("shared"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
-                    count: None,
-                },
-                storage_entry(1, true),
-                storage_entry(2, true),
-                storage_entry(3, true),
-                storage_entry(4, false),
-                storage_entry(5, false),
-            ],
-        });
-        let pass_entry = |binding: u32| wgpu::BindGroupLayoutEntry {
-            binding,
-            visibility: wgpu::ShaderStages::COMPUTE,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Uniform,
-                has_dynamic_offset: true,
-                min_binding_size: NonZeroU64::new(std::mem::size_of::<PassParams>() as u64),
-            },
-            count: None,
-        };
-        let bgl_scalar = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("scalar passes"),
-            entries: &[storage_entry(0, false), storage_entry(1, false), storage_entry(2, false), storage_entry(3, false), pass_entry(4)],
-        });
-        let bgl_field = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("field passes"),
-            entries: &[
-                storage_entry(0, false),
-                storage_entry(1, false),
-                storage_entry(2, false),
-                storage_entry(3, false),
-                pass_entry(4),
-                wgpu::BindGroupLayoutEntry {
-                    binding: 5,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::StorageTexture {
-                        access: wgpu::StorageTextureAccess::WriteOnly,
-                        format: wgpu::TextureFormat::Rgba8Unorm,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                    },
-                    count: None,
-                },
-            ],
-        });
-        let layout_value = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("value"), bind_group_layouts: &[Some(&bgl0)], immediate_size: 0 });
-        let layout_scalar = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("scalar"), bind_group_layouts: &[Some(&bgl0), Some(&bgl_scalar)], immediate_size: 0 });
-        let layout_field = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("field"), bind_group_layouts: &[Some(&bgl0), Some(&bgl_field)], immediate_size: 0 });
-        let pipe = |layout: &wgpu::PipelineLayout, m: &wgpu::ShaderModule, entry: &str| {
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some(entry),
-                layout: Some(layout),
-                module: m,
-                entry_point: Some(entry),
-                compilation_options: Default::default(),
-                cache: None,
-            })
-        };
-        let pipe_value = pipe(&layout_value, &value_mod, "value_main");
+        let layouts = Layouts::new(&device);
+        let mut modules = HashMap::new();
+        let mut pipes: HashMap<(&'static str, &'static str), wgpu::ComputePipeline> = HashMap::new();
+        for m in module_sources() {
+            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some(m.label), source: wgpu::ShaderSource::Wgsl(m.source.clone().into()) });
+            for (entry, kind) in &m.entries {
+                pipes.insert((m.label, entry), make_pipeline(&device, layouts.for_kind(*kind), &module, entry));
+            }
+            modules.insert(m.label, module);
+        }
+        let take = |pipes: &mut HashMap<(&'static str, &'static str), wgpu::ComputePipeline>, m: &'static str, e: &'static str| pipes.remove(&(m, e)).unwrap_or_else(|| panic!("pipeline {m}::{e}"));
+        let pipe_value = take(&mut pipes, "value", "value_main");
         let mut pipe_measures = HashMap::new();
         for d in crate::layers::REGISTRY {
             if let Some(run) = d.run {
                 let entry = match run {
                     MeasureRun::Pointwise { entry } | MeasureRun::Blurred { entry, .. } => entry,
                 };
-                pipe_measures.insert(entry, pipe(&layout_scalar, &measures_mod, entry));
+                pipe_measures.insert(entry, take(&mut pipes, "measures", entry));
             }
         }
-        let pipe_reduce_max = pipe(&layout_scalar, &measures_mod, "reduce_max");
-        let pipe_blur_scalar = pipe(&layout_scalar, &measures_mod, "blur_scalar");
-        let field_pipes = field_mods.each_ref().map(|m| FieldPipes {
-            blend: pipe(&layout_field, m, "blend_main"),
-            blur: pipe(&layout_field, m, "blur_field"),
-            temporal: pipe(&layout_field, m, "temporal_main"),
-            band_diff: pipe(&layout_field, m, "band_diff"),
-            reduce_max_abs: pipe(&layout_field, m, "reduce_max_abs"),
-            normalize: pipe(&layout_field, m, "normalize_signed"),
-            afterimage: pipe(&layout_field, m, "afterimage_main"),
-            resolve: pipe(&layout_field, m, "resolve_main"),
+        let pipe_reduce_max = take(&mut pipes, "measures", "reduce_max");
+        let pipe_blur_scalar = take(&mut pipes, "measures", "blur_scalar");
+        let field_pipes = ["field-math", "field-palette"].map(|m| FieldPipes {
+            blend: take(&mut pipes, m, "blend_main"),
+            blur: take(&mut pipes, m, "blur_field"),
+            temporal: take(&mut pipes, m, "temporal_main"),
+            band_diff: take(&mut pipes, m, "band_diff"),
+            reduce_max_abs: take(&mut pipes, m, "reduce_max_abs"),
+            normalize: take(&mut pipes, m, "normalize_signed"),
+            afterimage: take(&mut pipes, m, "afterimage_main"),
+            resolve: take(&mut pipes, m, "resolve_main"),
         });
+        let Layouts { bgl0, bgl_scalar, bgl_field, .. } = layouts;
 
         let params_buf = buffer(&device, "params", std::mem::size_of::<GpuParams>() as u64, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST);
         let pass_buf = buffer(&device, "pass params", PASS_STRIDE * MAX_PASSES, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST);

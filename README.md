@@ -37,6 +37,24 @@ cargo run --release -- --help
 
 `WGPU_BACKEND=vulkan|gl|metal|dx12` forces a backend.
 
+### Troubleshooting
+
+* **Black window, and the driver printed `NVVM compilation failed` (NVIDIA) or a
+  similar shader compiler message.** The driver rejected one of the compute
+  shaders and lost the device. Run
+
+  ```sh
+  cargo run --release -- --check-shaders
+  ```
+
+  which compiles every pipeline one at a time and names the ones the driver
+  rejects; please report that output. As a workaround, another backend uses a
+  different shader compiler path: `WGPU_BACKEND=gl` on Linux and Windows, or
+  `WGPU_BACKEND=dx12` on Windows.
+* **No adapter found.** Install a Vulkan or GL driver; on Linux without a GPU,
+  `mesa-vulkan-drivers` provides a software device that runs the app slowly.
+* `RUST_LOG=info` prints the adapter and backend in use.
+
 ### Tests
 
 ```sh

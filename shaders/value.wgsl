@@ -17,7 +17,7 @@ fn value_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (gid.x >= P.grid_w || gid.y >= P.grid_h) { return; }
   let idx = gid.y * P.grid_w + gid.x;
   let c = cell_of(gid.x, gid.y);
-  if (!c.valid) {
+  if (c.valid == 0u) {
     cells[idx] = vec2<u32>(0u, 0u);
     return;
   }

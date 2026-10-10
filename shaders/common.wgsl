@@ -79,12 +79,7 @@ const CELL_VALID: u32 = 0x80000000u;
 
 fn iparam(slot: u32) -> i32 {
   let v = P.iparams[slot >> 2u];
-  switch (slot & 3u) {
-    case 0u: { return v.x; }
-    case 1u: { return v.y; }
-    case 2u: { return v.z; }
-    default: { return v.w; }
-  }
+  return v[slot & 3u];
 }
 
 fn cell_valid(c: vec2<u32>) -> bool { return (c.y & CELL_VALID) != 0u; }
@@ -175,10 +170,13 @@ fn binom_mod_prime_power(n: u32, k: u32, F: Factor, full_nu: bool) -> BinomRes {
   var sc = 0u;         // carries at digit positions ≥ e − 1 (the sign)
   var acc = F.one;     // running product, Montgomery form
   var zero = false;
+  var done = false;
   var j = 0u;
-  loop {
-    if (nn == 0u) { break; }
-    var nj: u32; var kj: u32; var nw: u32; var kw: u32;
+  while (nn != 0u && !done) {
+    var nj = 0u;
+    var kj = 0u;
+    var nw = 0u;
+    var kw = 0u;
     if (is2) {
       nj = nn & 1u; kj = kk & 1u; nw = nn & qm; kw = kk & qm;
     } else {
@@ -195,17 +193,20 @@ fn binom_mod_prime_power(n: u32, k: u32, F: Factor, full_nu: bool) -> BinomRes {
     nu = nu + c_out;
     if (nu >= e) {
       zero = true;
-      if (!full_nu) { return BinomRes(0u, nu); }
+      // The residue is 0; keep walking only when the caller wants the full carry count.
+      done = !full_nu;
     }
     carry = c_out;
     if (is2) { nn = nn >> 1u; kk = kk >> 1u; } else { nn = nn / p; kk = kk / p; }
     j = j + 1u;
   }
-  if (zero) { return BinomRes(0u, nu); }
-  var r = acc;
-  for (var t = 0u; t < nu; t = t + 1u) { r = mm(r, F.p_mont, F); }
-  r = from_mont(r, F);
-  if (F.minus_one == 1u && (sc & 1u) == 1u) { r = (q - r) % q; }
+  var r = 0u;
+  if (!zero) {
+    r = acc;
+    for (var t = 0u; t < nu; t = t + 1u) { r = mm(r, F.p_mont, F); }
+    r = from_mont(r, F);
+    if (F.minus_one == 1u && (sc & 1u) == 1u) { r = (q - r) % q; }
+  }
   return BinomRes(r, nu);
 }
 
@@ -226,26 +227,32 @@ fn k0_of(n: u32) -> i32 {
   return P.x0i + i32(n >> 1u) + i32(floor(P.x0f + half + 0.5));
 }
 
-struct Cell { n: u32, k: u32, valid: bool };
+struct Cell { n: u32, k: u32, valid: u32 };
 
 fn cell_of(i: u32, j: u32) -> Cell {
+  var c = Cell(0u, 0u, 0u);
   let n = row_of(j);
-  if (n < 0 || f32(n) > MAX_ROW_F) { return Cell(0u, 0u, false); }
+  if (n < 0 || f32(n) > MAX_ROW_F) { return c; }
   let nu = u32(n);
+  c.n = nu;
   let kf = floor((f32(i) + 0.5) * P.sx);
-  if (kf > MAX_ROW_F) { return Cell(nu, 0u, false); }
+  if (kf > MAX_ROW_F) { return c; }
   let off = u32(kf);
   let k0 = k0_of(nu);
   if (k0 >= 0) {
     let k0u = u32(k0);
-    if (k0u > nu || off > nu - k0u) { return Cell(nu, 0u, false); }
-    return Cell(nu, k0u + off, true);
+    if (k0u <= nu && off <= nu - k0u) {
+      c.k = k0u + off;
+      c.valid = 1u;
+    }
+  } else {
+    let neg = u32(-k0);
+    if (off >= neg && off - neg <= nu) {
+      c.k = off - neg;
+      c.valid = 1u;
+    }
   }
-  let neg = u32(-k0);
-  if (off < neg) { return Cell(nu, 0u, false); }
-  let k = off - neg;
-  if (k > nu) { return Cell(nu, 0u, false); }
-  return Cell(nu, k, true);
+  return c;
 }
 
 // Inverse mapping for the resolve pass: continuous pixel position → texel, or (-1,-1).
@@ -276,33 +283,24 @@ fn neighbor_index(i: i32, j: i32, which: u32) -> i32 {
   let H = i32(P.grid_h);
   var ni = i;
   var nj = j;
-  switch (which) {
-    case 0u: { // up-left
-      nj = j - 1; if (nj < 0) { return -1; }
-      let n = row_of(u32(j)); let nup = row_of(u32(nj));
-      if (n < 0 || nup < 0) { return -1; }
-      ni = i + (k0_of(u32(n)) - k0_of(u32(nup))) - 1;
-    }
-    case 1u: { // up-right
-      nj = j - 1; if (nj < 0) { return -1; }
-      let n = row_of(u32(j)); let nup = row_of(u32(nj));
-      if (n < 0 || nup < 0) { return -1; }
-      ni = i + (k0_of(u32(n)) - k0_of(u32(nup)));
-    }
-    case 2u: { // down-left
-      nj = j + 1; if (nj >= H) { return -1; }
-      let n = row_of(u32(j)); let ndn = row_of(u32(nj));
-      if (n < 0 || ndn < 0) { return -1; }
-      ni = i - (k0_of(u32(ndn)) - k0_of(u32(n)));
-    }
-    case 3u: { // down-right
-      nj = j + 1; if (nj >= H) { return -1; }
-      let n = row_of(u32(j)); let ndn = row_of(u32(nj));
-      if (n < 0 || ndn < 0) { return -1; }
-      ni = i - (k0_of(u32(ndn)) - k0_of(u32(n))) + 1;
-    }
-    case 4u: { ni = i - 1; }  // left
-    default: { ni = i + 1; }  // right
+  if (which < 2u) {           // 0 up-left, 1 up-right
+    nj = j - 1;
+    if (nj < 0) { return -1; }
+    let n = row_of(u32(j));
+    let nup = row_of(u32(nj));
+    if (n < 0 || nup < 0) { return -1; }
+    ni = i + (k0_of(u32(n)) - k0_of(u32(nup))) - 1 + i32(which);
+  } else if (which < 4u) {    // 2 down-left, 3 down-right
+    nj = j + 1;
+    if (nj >= H) { return -1; }
+    let n = row_of(u32(j));
+    let ndn = row_of(u32(nj));
+    if (n < 0 || ndn < 0) { return -1; }
+    ni = i - (k0_of(u32(ndn)) - k0_of(u32(n))) + i32(which) - 2;
+  } else if (which == 4u) {   // left
+    ni = i - 1;
+  } else {                    // right
+    ni = i + 1;
   }
   if (ni < 0 || ni >= W) { return -1; }
   let idx = nj * W + ni;

@@ -36,8 +36,10 @@ struct PassParams {
 // hslToRgb from the reference (h degrees, s and l in 0..1), channels rounded to 8 bits.
 fn hsl_to_rgb(h: f32, s: f32, l: f32) -> vec3<f32> {
   let c = (1.0 - abs(2.0 * l - 1.0)) * s;
-  let hp = (((h % 360.0) + 360.0) % 360.0) / 60.0;
-  let x = c * (1.0 - abs((hp % 2.0) - 1.0));
+  let h360 = h - 360.0 * floor(h / 360.0);        // h mod 360, in [0, 360)
+  let hp = h360 / 60.0;
+  let hp2 = hp - 2.0 * floor(hp / 2.0);            // hp mod 2
+  let x = c * (1.0 - abs(hp2 - 1.0));
   var rgb = vec3<f32>(0.0);
   if (hp < 1.0) { rgb = vec3<f32>(c, x, 0.0); }
   else if (hp < 2.0) { rgb = vec3<f32>(x, c, 0.0); }
@@ -86,12 +88,10 @@ fn blend_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 fn fold(acc: f32, v: f32, mode: u32) -> f32 {
-  switch (mode) {
-    case 1u: { return acc * v; }                       // multiply: intersection
-    case 2u: { return max(acc, v); }                   // max
-    case 3u: { return 1.0 - (1.0 - acc) * (1.0 - v); } // screen: union
-    default: { return acc + v; }                       // average (sum, divided later)
-  }
+  if (mode == 1u) { return acc * v; }                       // multiply: intersection
+  if (mode == 2u) { return max(acc, v); }                   // max
+  if (mode == 3u) { return 1.0 - (1.0 - acc) * (1.0 - v); } // screen: union
+  return acc + v;                                           // average (sum, divided later)
 }
 
 // ---------------------------------------------------------------------------
@@ -138,21 +138,25 @@ fn band_diff(@builtin(global_invocation_id) gid: vec3<u32>) {
   fb[idx] = fa[idx] - fc[idx];
 }
 
-var<workgroup> wg_max_abs: atomic<u32>;
+var<workgroup> wg_abs: array<u32, 256>;
 
 @compute @workgroup_size(16, 16)
 fn reduce_max_abs(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
-  if (lid == 0u) { atomicStore(&wg_max_abs, 0u); }
-  workgroupBarrier();
+  var bits = 0u;
   if (gid.x < P.grid_w && gid.y < P.grid_h) {
     let idx = gid.y * P.grid_w + gid.x;
     if (cell_valid(cells[idx])) {
       let v = ft_max_abs(fa[idx]);
-      if (v > 0.0) { atomicMax(&wg_max_abs, bitcast<u32>(v)); }
+      if (v > 0.0) { bits = bitcast<u32>(v); }
     }
   }
+  wg_abs[lid] = bits;
   workgroupBarrier();
-  if (lid == 0u) { atomicMax(&maxbuf[PP.slot], atomicLoad(&wg_max_abs)); }
+  if (lid == 0u) {
+    var m = 0u;
+    for (var t = 0u; t < 256u; t = t + 1u) { m = max(m, wg_abs[t]); }
+    if (m > 0u) { atomicMax(&maxbuf[PP.slot], m); }
+  }
 }
 
 @compute @workgroup_size(16, 16)
@@ -183,7 +187,9 @@ fn afterimage_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   if ((PP.flag & 2u) != 0u) { a = fc[idx]; }
   fb[idx] = cur * (1.0 - w) + (ft_splat(1.0) - a) * w;
   if ((PP.flag & 1u) != 0u) {
-    fc[idx] = a + (cur - a) * select(ft_splat(dec), ft_splat(atk), cur > a);
+    // attack where the signal rose above the adaptation, decay where it fell
+    // (step(a, cur) = 1 where cur ≥ a; at equality the update is zero either way)
+    fc[idx] = a + (cur - a) * mix(ft_splat(dec), ft_splat(atk), step(a, cur));
   }
 }
 

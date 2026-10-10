@@ -60,7 +60,7 @@ fn measure_lucas(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (gid.x >= P.grid_w || gid.y >= P.grid_h) { return; }
   let idx = gid.y * P.grid_w + gid.x;
   let c = cell_of(gid.x, gid.y);
-  if (!c.valid) { buf_a[idx] = 0.0; return; }
+  if (c.valid == 0u) { buf_a[idx] = 0.0; return; }
   let p = P.p;
   let L = u32(clamp(iparam(SLOT_LUCAS_SCALE), 0, 12));
   let pl = pow_u32(p, L);
@@ -122,20 +122,25 @@ fn measure_density(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 // ---------------------------------------------------------------------------
 // reduce_max: maxbuf[PP.slot] = max over buf_a (non-negative floats compare as
-// their bit patterns, so an integer atomicMax is exact).
+// their bit patterns, so an integer atomicMax is exact). The workgroup reduces
+// through a plain shared array; only thread 0 touches the global atomic.
 // ---------------------------------------------------------------------------
-var<workgroup> wg_max: atomic<u32>;
+var<workgroup> wg_vals: array<u32, 256>;
 
 @compute @workgroup_size(16, 16)
 fn reduce_max(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
-  if (lid == 0u) { atomicStore(&wg_max, 0u); }
-  workgroupBarrier();
+  var bits = 0u;
   if (gid.x < P.grid_w && gid.y < P.grid_h) {
     let v = buf_a[gid.y * P.grid_w + gid.x];
-    if (v > 0.0) { atomicMax(&wg_max, bitcast<u32>(v)); }
+    if (v > 0.0) { bits = bitcast<u32>(v); }
   }
+  wg_vals[lid] = bits;
   workgroupBarrier();
-  if (lid == 0u) { atomicMax(&maxbuf[PP.slot], atomicLoad(&wg_max)); }
+  if (lid == 0u) {
+    var m = 0u;
+    for (var t = 0u; t < 256u; t = t + 1u) { m = max(m, wg_vals[t]); }
+    if (m > 0u) { atomicMax(&maxbuf[PP.slot], m); }
+  }
 }
 
 // ---------------------------------------------------------------------------

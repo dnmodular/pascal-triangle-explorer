@@ -145,6 +145,8 @@ struct App {
     /// Redraw counter: egui may run the UI closure more than once per frame, but
     /// input (keys, wheel, drag, clicks) must move the camera only once.
     frame_nr: u64,
+    surface_errors: u32,
+    fatal: bool,
 }
 
 const USAGE: &str = "pascal-triangle-explorer [options]
@@ -155,7 +157,8 @@ const USAGE: &str = "pascal-triangle-explorer [options]
   --layers a,b,c     active layers: value kummer lucas crt dlog pdigit density average bandpass afterimage
   --field MODE       math | palette (field color mode)
   --export FILE.png  render once without a window and write a PNG
-  --size WxH         canvas size for --export (default 1600x1000)";
+  --size WxH         canvas size for --export (default 1600x1000)
+  --check-shaders    compile every shader pipeline one by one and report what the driver rejects";
 
 fn main() {
     env_logger::init();
@@ -202,6 +205,10 @@ fn main() {
                     size = (w.parse().unwrap_or(1600), h.parse().unwrap_or(1000));
                 }
             }
+            "--check-shaders" => {
+                check_shaders();
+                return;
+            }
             "--help" | "-h" => {
                 println!("{USAGE}");
                 return;
@@ -219,8 +226,35 @@ fn main() {
     }
     let event_loop = EventLoop::new().expect("event loop");
     event_loop.set_control_flow(ControlFlow::Wait);
-    let mut app = App { gfx: None, model, last_inputs: None, frame_ms: 0.0, frame_nr: 0 };
+    let mut app = App { gfx: None, model, last_inputs: None, frame_ms: 0.0, frame_nr: 0, surface_errors: 0, fatal: false };
     event_loop.run_app(&mut app).expect("run");
+}
+
+/// `--check-shaders`: name the entry points the driver's shader compiler rejects.
+fn check_shaders() {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+    let adapter = pollster::block_on(Gpu::request_adapter(&instance, None)).unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(1);
+    });
+    let info = adapter.get_info();
+    println!("adapter: {} ({:?}, driver {} {})", info.name, info.backend, info.driver, info.driver_info);
+    let mut failed = 0;
+    for c in pascal::gpu::check_shaders(&adapter) {
+        match c.result {
+            Ok(()) => println!("  ok    {}::{}", c.module, c.entry),
+            Err(e) => {
+                failed += 1;
+                println!("  FAIL  {}::{}\n        {}", c.module, c.entry, e.replace('\n', "\n        "));
+            }
+        }
+    }
+    if failed == 0 {
+        println!("all pipelines compiled");
+    } else {
+        println!("{failed} pipeline(s) rejected by the driver. Please report this output. As a workaround try another backend: WGPU_BACKEND=gl (Linux/Windows), WGPU_BACKEND=dx12 (Windows).");
+        std::process::exit(1);
+    }
 }
 
 /// `--export`: the same pipeline as the window, on a headless device.
@@ -255,6 +289,10 @@ impl ApplicationHandler for App {
         let surface = instance.create_surface(window.clone()).expect("surface");
         let gpu = pollster::block_on(Gpu::new_async(instance, Some(&surface))).unwrap_or_else(|e| panic!("{e}"));
         log::info!("adapter: {} ({:?})", gpu.info.name, gpu.info.backend);
+        gpu.device.set_device_lost_callback(|reason, msg| {
+            eprintln!("GPU device lost ({reason:?}): {msg}");
+            eprintln!("If the driver printed a shader compiler error above, run with --check-shaders to see which pipeline it rejects, and try WGPU_BACKEND=gl (or dx12 on Windows) as a workaround.");
+        });
         let size = window.inner_size();
         let caps = surface.get_capabilities(&gpu.adapter);
         // A non-sRGB surface keeps egui on its gamma path, so the canvas bytes reach the
@@ -290,7 +328,12 @@ impl ApplicationHandler for App {
                 }
                 gfx.window.request_redraw();
             }
-            WindowEvent::RedrawRequested => self.redraw(),
+            WindowEvent::RedrawRequested => {
+                self.redraw();
+                if self.fatal {
+                    event_loop.exit();
+                }
+            }
             _ => {}
         }
     }
@@ -312,10 +355,18 @@ impl App {
                 return;
             }
             wgpu::CurrentSurfaceTexture::Validation => {
-                log::error!("surface validation error");
+                self.surface_errors += 1;
+                if self.surface_errors == 1 {
+                    eprintln!("The surface returned a validation error; the GPU device is probably lost (see messages above).");
+                }
+                if self.surface_errors >= 3 {
+                    eprintln!("Giving up after repeated surface errors. Run with --check-shaders for a diagnosis.");
+                    self.fatal = true;
+                }
                 return;
             }
         };
+        self.surface_errors = 0;
         let ppp = egui_winit::pixels_per_point(&gfx.egui_ctx, &gfx.window);
         let raw_input = gfx.egui_state.take_egui_input(&gfx.window);
         let gpu_ms = gfx.renderer.gpu_ms();
