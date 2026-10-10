@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Pascal · Square Scanner</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="top">
+    <div>
+      <p class="eyebrow">PATTERN EXPLORER</p>
+      <h1>Pascal · Square Scanner</h1>
+      <p class="sub">Explore Pascal's triangle through modular arithmetic, color, and motion.</p>
+    </div>
+    <div class="actions">
+      <button id="playBtn" class="primary">▶ Play</button>
+      <button id="resetBtn">Reset</button>
+      <button id="saveBtn">Save SVG</button>
+    </div>
+  </header>
+
+  <main class="layout">
+    <aside class="panel">
+      <section>
+        <h2>Pattern & window</h2>
+        <label>Rows <output id="rowsOut">64</output>
+          <input id="rows" type="range" min="8" max="180" value="64">
+        </label>
+        <label>Modulus <output id="modOut">7</output>
+          <input id="modulus" type="range" min="2" max="31" value="7">
+        </label>
+        <label>Fractional offset <output id="offsetOut">0.00</output>
+          <input id="offset" type="range" min="-1" max="1" step="0.01" value="0">
+        </label>
+        <label>Cell scale <output id="scaleOut">8</output>
+          <input id="scale" type="range" min="3" max="16" value="8">
+        </label>
+      </section>
+      <section>
+        <h2>Appearance</h2>
+        <label>Palette
+          <select id="palette">
+            <option value="ember">Ember</option>
+            <option value="ocean">Ocean</option>
+            <option value="moss">Moss</option>
+            <option value="mono">Monochrome</option>
+          </select>
+        </label>
+        <label class="check"><input id="showLines" type="checkbox" checked> Cell outlines</label>
+        <label class="check"><input id="glow" type="checkbox" checked> Glow active cells</label>
+      </section>
+      <section>
+        <h2>Motion</h2>
+        <label>Speed <output id="speedOut">1.0×</output>
+          <input id="speed" type="range" min="0.1" max="3" step="0.1" value="1">
+        </label>
+        <label>Direction
+          <select id="direction">
+            <option value="down">Downward</option>
+            <option value="up">Upward</option>
+            <option value="pulse">Pulse</option>
+          </select>
+        </label>
+      </section>
+      <section>
+        <h2>Examples</h2>
+        <div class="preset-row">
+          <button data-mod="2" data-rows="80">Mod 2</button>
+          <button data-mod="3" data-rows="80">Mod 3</button>
+          <button data-mod="5" data-rows="80">Mod 5</button>
+          <button data-mod="11" data-rows="64">Mod 11</button>
+        </div>
+      </section>
+      <p class="note">Standalone reconstruction. It runs locally in your browser and uses no external libraries.</p>
+    </aside>
+
+    <section class="visual">
+      <div class="visual-head">
+        <div><span class="live-dot"></span> <span id="status">Ready</span></div>
+        <div class="legend"><span class="swatch"></span> residue intensity</div>
+      </div>
+      <div id="canvasWrap"><canvas id="canvas" aria-label="Pascal triangle visualization"></canvas></div>
+      <div class="foot">
+        <span id="stats">Rows: 64 · Modulus: 7</span>
+        <span>Pascal coefficients · residue mapping</span>
+      </div>
+    </section>
+  </main>
+  <script src="app.js"></script>
+</body>
+</html>
