@@ -255,10 +255,20 @@ pub fn module_sources() -> Vec<ModuleSource> {
         ["blend_main", "blur_field", "temporal_main", "band_diff", "reduce_max_abs", "normalize_signed", "afterimage_main", "resolve_main"].into_iter().map(|e| (e, LayoutKind::Field)).collect();
     vec![
         ModuleSource { label: "value", source: format!("{COMMON_WGSL}\n{VALUE_WGSL}"), entries: vec![("value_main", LayoutKind::Value)] },
-        ModuleSource { label: "measures", source: format!("{COMMON_WGSL}\n{MEASURES_WGSL}"), entries: measure_entries },
+        ModuleSource { label: "measures", source: format!("{COMMON_WGSL}\n{}\n{MEASURES_WGSL}", dslot_constants()), entries: measure_entries },
         ModuleSource { label: "field-math", source: format!("{COMMON_WGSL}\n{}", FIELD_WGSL.replace("{{FIELD_PRELUDE}}", MATH_PRELUDE)), entries: field_entries.clone() },
         ModuleSource { label: "field-palette", source: format!("{COMMON_WGSL}\n{}", FIELD_WGSL.replace("{{FIELD_PRELUDE}}", PALETTE_PRELUDE)), entries: field_entries },
     ]
+}
+
+/// `const DSLOT_<LABEL>: u32 = n;` for every registry entry with a `derive`, so the
+/// shader's slot numbers come from the registry and cannot drift from it.
+pub fn dslot_constants() -> String {
+    crate::layers::REGISTRY
+        .iter()
+        .filter(|d| d.derive.is_some())
+        .map(|d| format!("const DSLOT_{}: u32 = {}u;\n", d.label.replace(|c: char| !c.is_ascii_alphanumeric(), ""), d.dslot))
+        .collect()
 }
 
 /// Bind group and pipeline layouts shared by every pass.

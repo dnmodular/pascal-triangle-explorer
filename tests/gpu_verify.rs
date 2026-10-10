@@ -334,6 +334,7 @@ fn measures_match_cpu() {
         (8, LayerId::PDigit, "padicDigit", 0),
         (5, LayerId::PDigit, "padicDigit", 12), // 5^12 fits: digit 12 of residues < 25 is 0
         (2, LayerId::PDigit, "padicDigit", 12),
+        (7, LayerId::PDigit, "padicDigit", 12), // 7^12 overflows u32: every cell reads 0
         (3, LayerId::Density, "", 0),
         (6, LayerId::Density, "", 0),
     ] {

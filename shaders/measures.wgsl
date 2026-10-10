@@ -31,9 +31,10 @@ struct PassParams {
 @group(1) @binding(3) var<storage, read_write> buf_d: array<f32>;
 @group(1) @binding(4) var<uniform> PP: PassParams;
 
-// Slots in P.dparams filled by the registry's `derive` functions (layers.rs).
-const DSLOT_LUCAS: u32 = 0u;  // .x = p^L, or 0 when it does not fit a u32; .y = L
-const DSLOT_PADIC: u32 = 1u;  // .x = p^J, or 0 when it does not fit a u32; .y = J
+// Slots in P.dparams are filled by the registry's `derive` functions (layers.rs);
+// the DSLOT_<LABEL> constants are generated from the registry (gpu::dslot_constants)
+// and prepended to this file. DSLOT_LUCAS.x = p^L, DSLOT_PDIGIT.x = p^J, each 0 when
+// the power does not fit a u32.
 
 // KUMMER: carries adding k and n−k in base p = ν_p(C(n,k)), p the smallest prime factor.
 @compute @workgroup_size(16, 16)
@@ -95,7 +96,7 @@ fn measure_padic(@builtin(global_invocation_id) gid: vec3<u32>) {
   let c = cells[idx];
   if (!cell_valid(c)) { buf_a[idx] = 0.0; return; }
   let p = P.p;
-  let pj = P.dparams[DSLOT_PADIC].x;   // p^J from the CPU
+  let pj = P.dparams[DSLOT_PDIGIT].x;   // p^J from the CPU
   var v = 0u;
   if (pj != 0u) { v = (c.x / pj) % p; }
   buf_a[idx] = f32(v);
