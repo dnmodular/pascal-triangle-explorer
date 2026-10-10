@@ -99,8 +99,10 @@ When cells are at least 18 px wide their residue is printed inside them.
 
 ## Sweep
 
-The SWEEP section plays the modulus through a range, ported from the reference's
-MODULUS SWEEP group (`playBounds`, `nextModInDir`, `buildSeqMods`):
+The sweep bar under the canvas plays the modulus through a range, ported from the reference's
+MODULUS SWEEP group (`playBounds`, `nextModInDir`, `buildSeqMods`). Every control
+sits in a fixed-width slot and the explanations are tooltips, so nothing moves
+while the modulus or the mode changes:
 
 * **Transport:** jump to the range start, play reverse, play / pause, play forward,
   step back and forward one frame. Steps and typed or slider values always snap to

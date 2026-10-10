@@ -20,6 +20,8 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Window, WindowId};
 
 const PANEL_W: f32 = 300.0;
+/// Height of the sweep bar under the canvas (two rows of controls).
+const SWEEP_BAR_H: f32 = 64.0;
 const CANVAS_BG: Color32 = Color32::from_rgb(10, 10, 10);
 /// Cells at least this wide (px) get their residue printed inside.
 const NUMBERS_MIN_PX: f64 = 18.0;
@@ -193,6 +195,7 @@ const USAGE: &str = "pascal-triangle-explorer [options]
   --rows R           rows to fit (default 128)
   --palette NAME     spectral | viridis | magma | inferno | turbo | cividis | coolwarm | mono
   --mode MODE        residue | mask | valuation
+  --visit MODE       sweep selection: all | primes | composites | even | odd | interval
   --layers a,b,c     active layers: value kummer lucas crt dlog pdigit gradient distzero magnitude
                      density variance rarity moire primes stripes lagdiff average bandpass afterimage
   --field MODE       math | palette (field color mode)
@@ -238,6 +241,11 @@ fn main() {
             }
             "--field" => {
                 model.layers.color_mode = if next() == "palette" { FieldColorMode::PaletteBlend } else { FieldColorMode::MathRamp };
+            }
+            "--visit" => {
+                if let Some(m) = ModMode::ALL.iter().find(|m| m.label() == next()) {
+                    model.sweep.mode = *m;
+                }
             }
             "--export" => export = Some(PathBuf::from(next())),
             "--size" => {
@@ -456,6 +464,14 @@ impl App {
                 });
             });
 
+            // ---- sweep bar under the canvas: fixed height, fixed slots ----
+            let bar_fill = ui.visuals().panel_fill;
+            egui::Panel::bottom("sweep")
+                .exact_size(SWEEP_BAR_H)
+                .resizable(false)
+                .frame(egui::Frame::NONE.fill(bar_fill).inner_margin(egui::Margin::symmetric(10, 6)))
+                .show(ui, |ui| sweep_bar(ui, model));
+
             // ---- canvas ----
             egui::CentralPanel::default().frame(egui::Frame::NONE.fill(CANVAS_BG)).show(ui, |ui| {
                 let rect = ui.available_rect_before_wrap();
@@ -611,6 +627,12 @@ fn mono_drag<N: egui::emath::Numeric>(ui: &mut egui::Ui, v: &mut N, range: std::
     r
 }
 
+/// A single monospace line that never wraps (long text is cut with …, full text on hover),
+/// for readouts that change while you work.
+fn mono_line(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    ui.add(egui::Label::new(egui::RichText::new(text).font(FontId::monospace(12.0)).color(ui.visuals().weak_text_color())).truncate())
+}
+
 fn mono_note(ui: &mut egui::Ui, text: &str) {
     ui.add(egui::Label::new(egui::RichText::new(text).font(FontId::monospace(12.0)).color(ui.visuals().weak_text_color())).wrap());
 }
@@ -657,13 +679,9 @@ fn panel_ui(ui: &mut egui::Ui, model: &mut Model, canvas_px: (u32, u32), _frame_
         }
         let fs = &model.modulus.factors.iter().map(|t| t.f).collect::<Vec<_>>();
         let info = if model.modulus.is_prime() { format!("{} is prime", model.m) } else { format!("{} = {}", model.m, math::factor_string(fs)) };
-        mono_note(ui, &info);
-        if !model.modulus.is_prime() {
-            note(ui, "Zeros are where every prime-power factor divides C(n,k); the CRT layer shows which ones do.");
-        }
+        // one fixed line, so nothing below moves while the modulus changes
+        mono_line(ui, &info).on_hover_text("Zeros are where every prime-power factor of m divides C(n,k); the CRT layer shows which ones do.");
     });
-
-    section(ui, "Sweep", |ui| sweep_ui(ui, model));
 
     section(ui, "View", |ui| {
         ui.horizontal(|ui| {
@@ -679,7 +697,7 @@ fn panel_ui(ui: &mut egui::Ui, model: &mut Model, canvas_px: (u32, u32), _frame_
             }
         });
         if let Some((a, b)) = model.view.visible_rows(canvas_px.1 as f64) {
-            mono_note(ui, &format!("rows {}–{} in view · {:.3} px per cell", group(a as u64), group(b as u64), model.view.ppc));
+            mono_line(ui, &format!("rows {}–{} · {:.3} px/cell", group(a as u64), group(b as u64), model.view.ppc));
         }
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("supersample").color(ui.visuals().weak_text_color()));
@@ -808,7 +826,7 @@ fn panel_ui(ui: &mut egui::Ui, model: &mut Model, canvas_px: (u32, u32), _frame_
             ui.label(egui::RichText::new("folder").color(ui.visuals().weak_text_color()));
             ui.add(egui::TextEdit::singleline(&mut model.export_dir).font(FontId::monospace(12.0)).desired_width(f32::INFINITY));
         });
-        mono_note(ui, &format!("{} × {} px", canvas_px.0, canvas_px.1));
+        mono_line(ui, &format!("{} × {} px", canvas_px.0, canvas_px.1));
         if !model.export_note.is_empty() {
             mono_note(ui, &model.export_note);
         }
@@ -824,121 +842,164 @@ fn sub(n: u32) -> String {
     n.to_string().chars().map(|c| SUB[c as usize - '0' as usize]).collect()
 }
 
-fn small_button(ui: &mut egui::Ui, label: &str, selected: bool, tip: &str) -> bool {
-    ui.add(egui::Button::new(egui::RichText::new(label).font(FontId::monospace(12.0))).selected(selected).min_size(Vec2::new(30.0, 0.0))).on_hover_text(tip).clicked()
+/// A child area of exactly `w` points wide, so its contents can change (a combo box
+/// appearing, a number growing) without moving anything after it.
+fn slot<R>(ui: &mut egui::Ui, w: f32, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    let h = ui.spacing().interact_size.y;
+    ui.allocate_ui_with_layout(Vec2::new(w, h), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+        ui.set_min_size(Vec2::new(w, h));
+        ui.set_max_width(w);
+        add(ui)
+    })
+    .inner
 }
 
-fn sweep_ui(ui: &mut egui::Ui, model: &mut Model) {
-    let weak = ui.visuals().weak_text_color();
+fn bar_label(ui: &mut egui::Ui, text: &str) {
+    ui.label(egui::RichText::new(text).color(ui.visuals().weak_text_color()));
+}
+
+/// Fixed-size monospace number field.
+fn bar_drag<N: egui::emath::Numeric>(ui: &mut egui::Ui, w: f32, v: &mut N, range: std::ops::RangeInclusive<N>, speed: f64) -> egui::Response {
+    let old = ui.style().override_font_id.clone();
+    ui.style_mut().override_font_id = Some(FontId::monospace(12.0));
+    let h = ui.spacing().interact_size.y;
+    let r = ui.add_sized([w, h], egui::DragValue::new(v).range(range).speed(speed));
+    ui.style_mut().override_font_id = old;
+    r
+}
+
+fn bar_button(ui: &mut egui::Ui, label: &str, selected: bool, tip: &str) -> bool {
+    let h = ui.spacing().interact_size.y;
+    ui.add_sized([30.0, h], egui::Button::new(egui::RichText::new(label).font(FontId::monospace(12.0))).selected(selected)).on_hover_text(tip).clicked()
+}
+
+fn bar_sep(ui: &mut egui::Ui) {
+    ui.add_space(6.0);
+    ui.separator();
+    ui.add_space(6.0);
+}
+
+/// The sweep controls as a two-row bar under the canvas. Every control sits in a
+/// fixed-width slot and explanatory text lives in tooltips, so nothing reflows while
+/// the modulus or the mode changes.
+fn sweep_bar(ui: &mut egui::Ui, model: &mut Model) {
     let sw = &mut model.sweep;
-    // transport
-    let mut action: Option<i32> = None; // Some(n) = step n frames
+    let mut action: Option<i32> = None; // Some(0) = jump to start, Some(n) = step n frames
+    let before = (sw.mode, sw.prime_order, sw.seq, sw.step, sw.start);
+    ui.spacing_mut().item_spacing = Vec2::new(4.0, 6.0);
+
+    // ---- row 1: transport · selection mode · mode options · range ----
     ui.horizontal(|ui| {
-        if small_button(ui, "⇤", false, "Jump to the range start") {
+        bar_label(ui, "SWEEP");
+        ui.add_space(4.0);
+        if bar_button(ui, "⇤", false, "Jump to the range start") {
             sw.playing = false;
             action = Some(0);
         }
-        if small_button(ui, "◀◀", sw.playing && sw.dir < 0, "Play in reverse") {
+        if bar_button(ui, "◀◀", sw.playing && sw.dir < 0, "Play in reverse") {
             sw.dir = -1;
             sw.playing = true;
         }
-        let label = if sw.playing { "❚❚" } else { "▶" };
-        if small_button(ui, label, false, "Play / pause (space)") {
+        if bar_button(ui, if sw.playing { "❚❚" } else { "▶" }, false, "Play / pause (space)") {
             sw.playing = !sw.playing;
         }
-        if small_button(ui, "▶▶", sw.playing && sw.dir > 0, "Play forward") {
+        if bar_button(ui, "▶▶", sw.playing && sw.dir > 0, "Play forward") {
             sw.dir = 1;
             sw.playing = true;
         }
-        if small_button(ui, "◀|", false, "Step back one frame (←)") {
+        if bar_button(ui, "◀|", false, "Step back one frame (←)") {
             action = Some(-1);
         }
-        if small_button(ui, "|▶", false, "Step forward one frame (→)") {
+        if bar_button(ui, "|▶", false, "Step forward one frame (→)") {
             action = Some(1);
         }
-    });
-    // selection mode
-    let before = (sw.mode, sw.prime_order, sw.seq, sw.step, sw.start);
-    ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("visit").color(weak));
-        egui::ComboBox::from_id_salt("modmode").selected_text(sw.mode.label()).show_ui(ui, |ui| {
-            for m in ModMode::ALL {
-                ui.selectable_value(&mut sw.mode, m, m.label());
+        bar_sep(ui);
+        bar_label(ui, "visit");
+        egui::ComboBox::from_id_salt("modmode")
+            .width(96.0)
+            .selected_text(sw.mode.label())
+            .show_ui(ui, |ui| {
+                for m in ModMode::ALL {
+                    ui.selectable_value(&mut sw.mode, m, m.label()).on_hover_text(m.note());
+                }
+            })
+            .response
+            .on_hover_text(sw.mode.note());
+        // the mode's own options, in a slot of constant width
+        slot(ui, 270.0, |ui| match sw.mode {
+            ModMode::Prime => {
+                egui::ComboBox::from_id_salt("primeorder").width(150.0).selected_text(sw.prime_order.label()).show_ui(ui, |ui| {
+                    for o in PrimeOrder::ALL {
+                        ui.selectable_value(&mut sw.prime_order, o, o.label());
+                    }
+                });
             }
-        });
-    });
-    note(ui, sw.mode.note());
-    if sw.mode == ModMode::Prime {
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("order").color(weak));
-            egui::ComboBox::from_id_salt("primeorder").width(150.0).selected_text(sw.prime_order.label()).show_ui(ui, |ui| {
-                for o in PrimeOrder::ALL {
-                    ui.selectable_value(&mut sw.prime_order, o, o.label());
+            ModMode::Interval => {
+                let prev = sw.seq;
+                let note = if sw.seq == Seq::Fixed {
+                    "Constant step from the range start."
+                } else if sw.seq.absolute() {
+                    "Lands directly on the sequence's values at or above the range start."
+                } else {
+                    "Increments follow the sequence from the range start; zero increments are skipped."
+                };
+                egui::ComboBox::from_id_salt("seq")
+                    .width(150.0)
+                    .selected_text(sw.seq.label())
+                    .show_ui(ui, |ui| {
+                        for q in Seq::ALL {
+                            ui.selectable_value(&mut sw.seq, q, q.label());
+                        }
+                    })
+                    .response
+                    .on_hover_text(note);
+                // as in the reference, the 2×Pn and 3×Pn walks start on their first term
+                if sw.seq != prev {
+                    match sw.seq {
+                        Seq::Semi2p => sw.start = 4,
+                        Seq::Semi3p => sw.start = 6,
+                        _ => {}
+                    }
                 }
-            });
-        });
-    }
-    if sw.mode == ModMode::Interval {
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("sequence").color(weak));
-            let prev = sw.seq;
-            egui::ComboBox::from_id_salt("seq").width(150.0).selected_text(sw.seq.label()).show_ui(ui, |ui| {
-                for q in Seq::ALL {
-                    ui.selectable_value(&mut sw.seq, q, q.label());
-                }
-            });
-            // as in the reference, the 2×Pn and 3×Pn walks start on their first term
-            if sw.seq != prev {
-                match sw.seq {
-                    Seq::Semi2p => sw.start = 4,
-                    Seq::Semi3p => sw.start = 6,
-                    _ => {}
+                if sw.seq == Seq::Fixed {
+                    bar_label(ui, "step");
+                    bar_drag(ui, 56.0, &mut sw.step, 1..=10000u32, 0.2);
                 }
             }
+            _ => {}
         });
-        if sw.seq == Seq::Fixed {
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("step").color(weak));
-                mono_drag(ui, &mut sw.step, 1..=10000u32, 0.2);
-            });
-        }
-        note(ui, if sw.seq == Seq::Fixed {
-            "Constant step from the range start."
-        } else if sw.seq.absolute() {
-            "Lands directly on the sequence's values at or above the range start."
-        } else {
-            "Increments follow the sequence from the range start; zero increments are skipped."
-        });
-    }
-    // range
-    ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("range").color(weak));
-        mono_drag(ui, &mut sw.start, 2..=MOD_CAP, 1.0);
-        ui.label(egui::RichText::new("to").color(weak));
-        mono_drag(ui, &mut sw.end, 2..=MOD_CAP, 1.0);
+        bar_sep(ui);
+        bar_label(ui, "range");
+        bar_drag(ui, 70.0, &mut sw.start, 2..=MOD_CAP, 1.0);
+        bar_label(ui, "to");
+        bar_drag(ui, 70.0, &mut sw.end, 2..=MOD_CAP, 1.0);
     });
-    let preview = sw.preview(8);
-    let frames = sw.frames_in_range(100_000);
-    let mut pv: Vec<String> = preview.iter().map(|v| v.to_string()).collect();
-    if preview.len() >= 8 {
-        pv.push("…".into());
-    }
-    mono_note(ui, &format!("{} · {} frame{} in range", pv.join(", "), group(frames as u64), if frames == 1 { "" } else { "s" }));
-    // speed, loop, tween
+
+    // ---- row 2: frame speed · loop · tween · what the range visits ----
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("frame").color(weak));
-        ui.spacing_mut().slider_width = 130.0;
+        ui.add_space(54.0);
+        bar_label(ui, "frame");
+        ui.spacing_mut().slider_width = 110.0;
         ui.add(egui::Slider::new(&mut sw.speed_ms, 16..=1000).show_value(false));
-        ui.label(egui::RichText::new(format!("{} ms", sw.speed_ms)).font(FontId::monospace(12.0)));
+        slot(ui, 56.0, |ui| {
+            ui.label(egui::RichText::new(format!("{:>4} ms", sw.speed_ms)).font(FontId::monospace(12.0)));
+        });
+        ui.checkbox(&mut sw.looping, "loop").on_hover_text("Wrap at the range ends; off stops on the last frame.");
+        bar_sep(ui);
+        bar_label(ui, "tween");
+        bar_drag(ui, 56.0, &mut sw.tween_ms, 0..=3000u32, 5.0).on_hover_text("Display-only transition between moduli: fields morph, plain residue coloring cross-dissolves. Exports, layer history and the inspector use the true frames. 0 = hard cuts.");
+        bar_label(ui, "ms");
+        bar_sep(ui);
+        let preview = sw.preview(8);
+        let frames = sw.frames_in_range(100_000);
+        let mut pv: Vec<String> = preview.iter().map(|v| v.to_string()).collect();
+        if preview.len() >= 8 {
+            pv.push("…".into());
+        }
+        let text = format!("{} frame{} · {}", group(frames as u64), if frames == 1 { "" } else { "s" }, pv.join(", "));
+        mono_line(ui, &text);
     });
-    ui.checkbox(&mut sw.looping, "loop at range ends");
-    ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("tween").color(weak));
-        mono_drag(ui, &mut sw.tween_ms, 0..=3000u32, 5.0);
-        ui.label(egui::RichText::new("ms").color(weak));
-    });
-    note(ui, "Smooths transitions between moduli: fields morph, plain residue coloring cross-dissolves. Display only; exports, layer history and the inspector use the true frames. 0 = hard cuts.");
-    // re-snap when the mode or its parameters changed, as the reference does
+
     let changed = before != (sw.mode, sw.prime_order, sw.seq, sw.step, sw.start);
     match action {
         Some(0) => {
@@ -949,6 +1010,7 @@ fn sweep_ui(ui: &mut egui::Ui, model: &mut Model) {
         Some(n) => model.step(n),
         None => {}
     }
+    // re-snap when the mode or its parameters changed, as the reference does
     if changed {
         model.goto(model.m as i64);
     }
