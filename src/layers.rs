@@ -12,6 +12,8 @@
 
 use std::collections::HashMap;
 
+use crate::math::Modulus;
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum LayerId {
     Value,
@@ -61,8 +63,38 @@ pub struct LayerDef {
     pub params: &'static [ParamDef],
     /// Measures only.
     pub run: Option<MeasureRun>,
+    /// Values the shader needs that are computed on the CPU each frame (powers of p,
+    /// anything loop-derived), uploaded as `Params::dparams[dslot]`. Keeps the GPU side
+    /// free of data-dependent loops that some driver compilers reject.
+    pub derive: Option<Derive>,
+    pub dslot: u32,
     /// Compares frames: reads flat until something changes.
     pub sweep: bool,
+}
+
+/// CPU-side derivation of a layer's shader constants (see `LayerDef::derive`).
+pub type Derive = fn(&LayerState, &Modulus) -> [u32; 4];
+
+/// `p^e`, or 0 when it does not fit in a u32 (the shaders treat 0 as "digit out of range").
+pub fn pow_or_zero(p: u32, e: u32) -> u32 {
+    let mut r: u32 = 1;
+    for _ in 0..e {
+        match r.checked_mul(p) {
+            Some(v) => r = v,
+            None => return 0,
+        }
+    }
+    r
+}
+
+fn derive_lucas(s: &LayerState, md: &Modulus) -> [u32; 4] {
+    let l = s.param("lucasScale").max(0) as u32;
+    [pow_or_zero(md.p, l), l, 0, 0]
+}
+
+fn derive_padic(s: &LayerState, md: &Modulus) -> [u32; 4] {
+    let j = s.param("padicDigit").max(0) as u32;
+    [pow_or_zero(md.p, j), j, 0, 0]
 }
 
 /// Measures first (console order), then the transforms in the order they run.
@@ -74,6 +106,8 @@ pub const REGISTRY: &[LayerDef] = &[
         desc: "Colors each cell by its residue directly — the raw sieve, and the base layer every other map replaces or blends with.",
         params: &[],
         run: None,
+        derive: None,
+        dslot: 0,
         sweep: false,
     },
     LayerDef {
@@ -83,6 +117,8 @@ pub const REGISTRY: &[LayerDef] = &[
         desc: "Carry count when adding k and n−k in base p (p = smallest prime factor of the modulus). By Kummer's theorem that count is exactly the power of p dividing C(n,k) — the depth of every zero, not just its location.",
         params: &[],
         run: Some(MeasureRun::Pointwise { entry: "measure_kummer" }),
+        derive: None,
+        dslot: 0,
         sweep: false,
     },
     LayerDef {
@@ -92,6 +128,8 @@ pub const REGISTRY: &[LayerDef] = &[
         desc: "Colors each cell by its base-p digit pair at the chosen scale. Raise SCALE to step through the self-similar block levels; holes (k digit > n digit) show dark.",
         params: &[ParamDef { key: "lucasScale", label: "scale", min: 0, max: 12, default: 0 }],
         run: Some(MeasureRun::Pointwise { entry: "measure_lucas" }),
+        derive: Some(derive_lucas),
+        dslot: 0,
         sweep: false,
     },
     LayerDef {
@@ -101,6 +139,8 @@ pub const REGISTRY: &[LayerDef] = &[
         desc: "Splits a composite modulus into its prime-power layers: each cell is colored by which factors divide it. Two primes (6 = 2·3) give four zones — neither, each, or both (the true zeros).",
         params: &[],
         run: Some(MeasureRun::Pointwise { entry: "measure_crt" }),
+        derive: None,
+        dslot: 0,
         sweep: false,
     },
     LayerDef {
@@ -110,6 +150,8 @@ pub const REGISTRY: &[LayerDef] = &[
         desc: "Recolors each nonzero cell by its discrete log to a primitive root of p. Lucas makes values products across digit scales; in log space those products become sums. Multiples of p stay dark.",
         params: &[],
         run: Some(MeasureRun::Pointwise { entry: "measure_dlog" }),
+        derive: None,
+        dslot: 0,
         sweep: false,
     },
     LayerDef {
@@ -119,6 +161,8 @@ pub const REGISTRY: &[LayerDef] = &[
         desc: "The chosen base-p digit of each residue. Digit 0 is fully Lucas-explained; digits ≥ 1 are what a prime-power modulus knows beyond mod p. Most meaningful on p, p², p³ moduli (try 9, 27, 25).",
         params: &[ParamDef { key: "padicDigit", label: "digit", min: 0, max: 12, default: 1 }],
         run: Some(MeasureRun::Pointwise { entry: "measure_padic" }),
+        derive: Some(derive_padic),
+        dslot: 1,
         sweep: false,
     },
     LayerDef {
@@ -128,6 +172,8 @@ pub const REGISTRY: &[LayerDef] = &[
         desc: "Local fraction of nonzero cells — the fractal's mass. A larger radius blurs toward broad density structure.",
         params: &[ParamDef { key: "densityR", label: "radius", min: 1, max: 16, default: 4 }],
         run: Some(MeasureRun::Blurred { entry: "measure_density", passes: "densityR" }),
+        derive: None,
+        dslot: 0,
         sweep: false,
     },
     LayerDef {
@@ -137,6 +183,8 @@ pub const REGISTRY: &[LayerDef] = &[
         desc: "Blurs the layers beneath it over the triangular lattice, or averages them over recent frames (temporal).",
         params: &[ParamDef { key: "avgAmount", label: "amount", min: 1, max: 64, default: 2 }],
         run: None,
+        derive: None,
+        dslot: 0,
         sweep: false,
     },
     LayerDef {
@@ -149,6 +197,8 @@ pub const REGISTRY: &[LayerDef] = &[
             ParamDef { key: "bandHi", label: "cut", min: 1, max: 24, default: 6 },
         ],
         run: None,
+        derive: None,
+        dslot: 0,
         sweep: false,
     },
     LayerDef {
@@ -162,6 +212,8 @@ pub const REGISTRY: &[LayerDef] = &[
             ParamDef { key: "aiDecay", label: "decay", min: 1, max: 64, default: 16 },
         ],
         run: None,
+        derive: None,
+        dslot: 0,
         sweep: true,
     },
 ];
@@ -353,6 +405,27 @@ mod tests {
         assert!(!p.field_active);
         assert!(p.measures.is_empty());
         assert_eq!(s.preset(), Some(Preset::Residue));
+    }
+
+    #[test]
+    fn derived_powers_match_checked_arithmetic() {
+        assert_eq!(pow_or_zero(2, 31), 1 << 31);
+        assert_eq!(pow_or_zero(2, 32), 0);
+        assert_eq!(pow_or_zero(3, 20), 3486784401);
+        assert_eq!(pow_or_zero(3, 21), 0);
+        assert_eq!(pow_or_zero(7, 0), 1);
+        let mut s = LayerState::default();
+        s.params.insert("lucasScale", 12);
+        s.params.insert("padicDigit", 3);
+        let md = Modulus::new(7);
+        assert_eq!(derive_lucas(&s, &md), [0, 12, 0, 0]);
+        assert_eq!(derive_padic(&s, &md), [343, 3, 0, 0]);
+        let dslots: Vec<u32> = REGISTRY.iter().filter(|d| d.derive.is_some()).map(|d| d.dslot).collect();
+        let mut sorted = dslots.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), dslots.len(), "derived slots are unique");
+        assert!(dslots.iter().all(|&d| d < 4));
     }
 
     #[test]

@@ -31,21 +31,9 @@ struct PassParams {
 @group(1) @binding(3) var<storage, read_write> buf_d: array<f32>;
 @group(1) @binding(4) var<uniform> PP: PassParams;
 
-// Parameter slots (see layers.rs: ParamDef::slot).
-const SLOT_LUCAS_SCALE: u32 = 0u;
-const SLOT_PADIC_DIGIT: u32 = 1u;
-
-// p^t as u32, or 0 when it does not fit (the reference's Math.pow then floors to 0 digits).
-fn pow_u32(p: u32, t: u32) -> u32 {
-  let lim = 0xffffffffu / p;
-  var r = 1u;
-  var ok = true;
-  for (var i = 0u; i < t; i = i + 1u) {
-    if (r > lim) { ok = false; }
-    if (ok) { r = r * p; }
-  }
-  return select(0u, r, ok);
-}
+// Slots in P.dparams filled by the registry's `derive` functions (layers.rs).
+const DSLOT_LUCAS: u32 = 0u;  // .x = p^L, or 0 when it does not fit a u32; .y = L
+const DSLOT_PADIC: u32 = 1u;  // .x = p^J, or 0 when it does not fit a u32; .y = J
 
 // KUMMER: carries adding k and n−k in base p = ν_p(C(n,k)), p the smallest prime factor.
 @compute @workgroup_size(16, 16)
@@ -64,8 +52,7 @@ fn measure_lucas(@builtin(global_invocation_id) gid: vec3<u32>) {
   let c = cell_of(gid.x, gid.y);
   if (c.valid == 0u) { buf_a[idx] = 0.0; return; }
   let p = P.p;
-  let L = u32(clamp(iparam(SLOT_LUCAS_SCALE), 0, 12));
-  let pl = pow_u32(p, L);
+  let pl = P.dparams[DSLOT_LUCAS].x;   // p^L from the CPU: no loop, no power here
   var nd = 0u;
   var kd = 0u;
   if (pl != 0u) {
@@ -108,9 +95,10 @@ fn measure_padic(@builtin(global_invocation_id) gid: vec3<u32>) {
   let c = cells[idx];
   if (!cell_valid(c)) { buf_a[idx] = 0.0; return; }
   let p = P.p;
-  let J = u32(clamp(iparam(SLOT_PADIC_DIGIT), 0, 12));
-  let pj = pow_u32(p, J);
-  buf_a[idx] = select(f32((c.x / pj) % p), 0.0, pj == 0u);
+  let pj = P.dparams[DSLOT_PADIC].x;   // p^J from the CPU
+  var v = 0u;
+  if (pj != 0u) { v = (c.x / pj) % p; }
+  buf_a[idx] = f32(v);
 }
 
 // DENSITY: nonzero indicator; the registry then hex-blurs it R passes.

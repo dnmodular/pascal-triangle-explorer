@@ -316,35 +316,41 @@ fn measures_match_cpu() {
     let pal = Palette::new(Scheme::Viridis);
     let rows = 100u32;
     let (_, grid) = cell_grid(rows);
-    for &(m, id) in &[
-        (2u32, LayerId::Kummer),
-        (3, LayerId::Kummer),
-        (30, LayerId::Kummer),
-        (5, LayerId::Lucas),
-        (12, LayerId::Crt),
-        (360, LayerId::Crt),
-        (7, LayerId::Dlog),
-        (2, LayerId::Dlog),
-        (49, LayerId::Dlog),
-        (25, LayerId::PDigit),
-        (27, LayerId::PDigit),
-        (3, LayerId::Density),
-        (6, LayerId::Density),
+    for &(m, id, key, val) in &[
+        (2u32, LayerId::Kummer, "", 0),
+        (3, LayerId::Kummer, "", 0),
+        (30, LayerId::Kummer, "", 0),
+        (5, LayerId::Lucas, "lucasScale", 1),
+        (5, LayerId::Lucas, "lucasScale", 0),
+        (3, LayerId::Lucas, "lucasScale", 3),
+        (7, LayerId::Lucas, "lucasScale", 12), // 7^12 overflows u32: every cell reads 1
+        (12, LayerId::Crt, "", 0),
+        (360, LayerId::Crt, "", 0),
+        (7, LayerId::Dlog, "", 0),
+        (2, LayerId::Dlog, "", 0),
+        (49, LayerId::Dlog, "", 0),
+        (25, LayerId::PDigit, "padicDigit", 1),
+        (27, LayerId::PDigit, "padicDigit", 2),
+        (8, LayerId::PDigit, "padicDigit", 0),
+        (5, LayerId::PDigit, "padicDigit", 12), // 5^12 fits: digit 12 of residues < 25 is 0
+        (2, LayerId::PDigit, "padicDigit", 12),
+        (3, LayerId::Density, "", 0),
+        (6, LayerId::Density, "", 0),
     ] {
         let cg = CpuGrid::new(grid, m);
         let mut layers = LayerState::default();
         layers.set_active(LayerId::Value, false);
         layers.set_active(id, true);
-        if id == LayerId::Lucas {
-            layers.params.insert("lucasScale", 1);
+        if !key.is_empty() {
+            layers.params.insert(key, val);
         }
         r.render_blocking(&frame(grid, &cg.md, &pal, &layers));
         let got = r.read_field(0);
         let want = cg.measure(id, &layers);
         let tol = if id == LayerId::Density { 1e-5 } else { 0.0 };
-        assert_close(&got, &want, tol, &format!("m={m} {id:?}"));
+        assert_close(&got, &want, tol, &format!("m={m} {id:?} {key}={val}"));
         let mx = r.read_max()[0];
-        assert!((mx - want.iter().cloned().fold(0.0, f32::max)).abs() <= tol, "m={m} {id:?}: max");
+        assert!((mx - want.iter().cloned().fold(0.0, f32::max)).abs() <= tol, "m={m} {id:?} {key}={val}: max");
     }
 }
 

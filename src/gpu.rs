@@ -102,6 +102,7 @@ pub struct GpuParams {
     pub pad_c: u32,
     pub pad_d: u32,
     pub iparams: [[i32; 4]; 4],
+    pub dparams: [[u32; 4]; 4],
     pub factors: [GpuFactor; MAX_FACTORS],
 }
 
@@ -985,6 +986,9 @@ impl Renderer {
                 if let Some(slot) = param_slot(p.key) {
                     params.iparams[(slot / 4) as usize][(slot % 4) as usize] = input.layers.param(p.key);
                 }
+            }
+            if let Some(derive) = d.derive {
+                params.dparams[d.dslot as usize] = derive(input.layers, input.modulus);
             }
         }
         self.queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));

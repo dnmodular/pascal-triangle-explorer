@@ -187,9 +187,13 @@ compiled once per element type.
 PRIMES, STRIPES, LAG DIFF, TEMPORAL, COLOR FLOW, MAGNIFY, TRAIL, CENSUS from the
 reference): add a `LayerDef` with `kind: Measure`, its parameters and a `run`
 recipe, and one `@compute` entry point in `measures.wgsl` that writes `buf_a`.
-Parameters reach the shader through `iparam(slot)` (slots in `gpu::param_slot`).
-Measures that need extra passes (several blurred fields, frame history) extend
-the `MeasureRun` recipe rather than the driver's control flow.
+Parameters reach the shader through `iparam(slot)` (slots in `gpu::param_slot`);
+anything loop-derived (powers of `p`, table sizes) is computed on the CPU by the
+entry's `derive` function and read from `P.dparams[dslot]`, so the measure
+shaders stay free of data-dependent loops, which NVIDIA's compiler rejected for
+LUCAS and P DIGIT. Measures that need extra passes (several blurred fields,
+frame history) extend the `MeasureRun` recipe rather than the driver's control
+flow.
 
 **Export** reads back the same `rgba8` texture the live view shows, so the two
 cannot differ.

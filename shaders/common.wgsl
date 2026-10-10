@@ -65,6 +65,7 @@ struct Params {
   pad_d: u32,
 
   iparams: array<vec4<i32>, 4>, // layer parameters by slot (see layers.rs)
+  dparams: array<vec4<u32>, 4>, // per-layer values derived on the CPU (LayerDef::derive / dslot)
   factors: array<Factor, 9>,
 };
 
@@ -79,7 +80,8 @@ const CELL_VALID: u32 = 0x80000000u;
 
 fn iparam(slot: u32) -> i32 {
   let v = P.iparams[slot >> 2u];
-  return v[slot & 3u];
+  let c = slot & 3u;
+  return select(select(v.x, v.y, c == 1u), select(v.z, v.w, c == 3u), c >= 2u);
 }
 
 fn cell_valid(c: vec2<u32>) -> bool { return (c.y & CELL_VALID) != 0u; }
