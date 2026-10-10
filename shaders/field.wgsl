@@ -1,0 +1,218 @@
+// ============================================================================
+// field.wgsl — the working field: blend, transforms and resolve.
+//
+// This file is compiled twice. FT is the field element type:
+//   MATH RAMP      FT = f32          one value per texel, painted through the ramp
+//   PALETTE BLEND  FT = vec4<f32>    the palette image (rgb), transforms per channel
+// The FIELD_PRELUDE marker below is replaced with the variant's helper functions.
+//
+// Passes (fixed order): blend → [AVERAGE] → [BAND PASS] → [AFTERIMAGE] → resolve.
+// ============================================================================
+
+struct PassParams {
+  slot: u32,
+  count: u32,
+  mode: u32,
+  flag: u32,
+  f0: f32,
+  f1: f32,
+  f2: f32,
+  f3: f32,
+  hist_start: u32,
+  hist_len: u32,
+  hist_cap: u32,
+  stride: u32,
+};
+
+{{FIELD_PRELUDE}}
+
+@group(1) @binding(0) var<storage, read_write> fa: array<FT>;      // source / current
+@group(1) @binding(1) var<storage, read_write> fb: array<FT>;      // destination
+@group(1) @binding(2) var<storage, read_write> fc: array<FT>;      // aux: cut blur, history ring, adaptation
+@group(1) @binding(3) var<storage, read_write> fields: array<f32>; // the measures' fields, slot-strided
+@group(1) @binding(4) var<uniform> PP: PassParams;
+@group(1) @binding(5) var out_tex: texture_storage_2d<rgba8unorm, write>;
+
+// hslToRgb from the reference (h degrees, s and l in 0..1), channels rounded to 8 bits.
+fn hsl_to_rgb(h: f32, s: f32, l: f32) -> vec3<f32> {
+  let c = (1.0 - abs(2.0 * l - 1.0)) * s;
+  let hp = (((h % 360.0) + 360.0) % 360.0) / 60.0;
+  let x = c * (1.0 - abs((hp % 2.0) - 1.0));
+  var rgb = vec3<f32>(0.0);
+  if (hp < 1.0) { rgb = vec3<f32>(c, x, 0.0); }
+  else if (hp < 2.0) { rgb = vec3<f32>(x, c, 0.0); }
+  else if (hp < 3.0) { rgb = vec3<f32>(0.0, c, x); }
+  else if (hp < 4.0) { rgb = vec3<f32>(0.0, x, c); }
+  else if (hp < 5.0) { rgb = vec3<f32>(x, 0.0, c); }
+  else { rgb = vec3<f32>(c, 0.0, x); }
+  let m0 = l - c / 2.0;
+  return floor((rgb + m0) * 255.0 + 0.5) / 255.0;
+}
+
+// ---------------------------------------------------------------------------
+// blend: fold the active measures (normalized by their maxima) and optionally
+// the residue ratio into one 0..1 value per texel, then turn it into FT.
+// ---------------------------------------------------------------------------
+@compute @workgroup_size(16, 16)
+fn blend_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  if (gid.x >= P.grid_w || gid.y >= P.grid_h) { return; }
+  let idx = gid.y * P.grid_w + gid.x;
+  let c = cells[idx];
+  let valid = cell_valid(c);
+  let denom = max(f32(P.m) - 1.0, 1.0);
+  let nm = P.n_measures;
+  var b = 0.0;
+  if (nm == 0u) {
+    // AVERAGE / BAND PASS alone (or with VALUE): operate on the residue ratio.
+    b = f32(c.x) / denom;
+  } else {
+    let mode = P.blend_mode;
+    var acc = select(0.0, 1.0, mode == 1u);
+    var nl = 0.0;
+    for (var s = 0u; s < nm; s = s + 1u) {
+      let mx = bitcast<f32>(atomicLoad(&maxbuf[s]));
+      let inv = select(1.0 / mx, 1.0, mx == 0.0);
+      let v = fields[s * P.field_stride + idx] * inv;
+      acc = fold(acc, v, mode);
+      nl = nl + 1.0;
+    }
+    if (P.wants_value == 1u) {
+      acc = fold(acc, f32(c.x) / denom, mode);
+      nl = nl + 1.0;
+    }
+    b = select(acc, acc / nl, mode == 0u);
+  }
+  fb[idx] = ft_from_blend(b, valid, c.x, nm > 0u);
+}
+
+fn fold(acc: f32, v: f32, mode: u32) -> f32 {
+  switch (mode) {
+    case 1u: { return acc * v; }                       // multiply: intersection
+    case 2u: { return max(acc, v); }                   // max
+    case 3u: { return 1.0 - (1.0 - acc) * (1.0 - v); } // screen: union
+    default: { return acc + v; }                       // average (sum, divided later)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// blur_field: one hex-neighbourhood pass over the lattice, fa → fb.
+// ---------------------------------------------------------------------------
+@compute @workgroup_size(16, 16)
+fn blur_field(@builtin(global_invocation_id) gid: vec3<u32>) {
+  if (gid.x >= P.grid_w || gid.y >= P.grid_h) { return; }
+  let idx = gid.y * P.grid_w + gid.x;
+  if (!cell_valid(cells[idx])) { fb[idx] = fa[idx]; return; }
+  var s = fa[idx];
+  var cnt = 1.0;
+  for (var w = 0u; w < 6u; w = w + 1u) {
+    let ni = neighbor_index(i32(gid.x), i32(gid.y), w);
+    if (ni >= 0) { s = s + fa[ni]; cnt = cnt + 1.0; }
+  }
+  fb[idx] = s / cnt;
+}
+
+// ---------------------------------------------------------------------------
+// temporal_main: AVERAGE over recent frames. fc is a ring of past under-fields
+// (frame t at fc[t·stride + idx]); the current frame counts as one.
+// ---------------------------------------------------------------------------
+@compute @workgroup_size(16, 16)
+fn temporal_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  if (gid.x >= P.grid_w || gid.y >= P.grid_h) { return; }
+  let idx = gid.y * P.grid_w + gid.x;
+  var s = fa[idx];
+  for (var t = 0u; t < PP.hist_len; t = t + 1u) {
+    let f = (PP.hist_start + t) % PP.hist_cap;
+    s = s + fc[f * PP.stride + idx];
+  }
+  fb[idx] = s / (1.0 + f32(PP.hist_len));
+}
+
+// ---------------------------------------------------------------------------
+// BAND PASS: fb = fa − fc (keep blur minus cut blur), then reduce_max_abs finds
+// max |d| and normalize_signed recenters it on 0.5.
+// ---------------------------------------------------------------------------
+@compute @workgroup_size(16, 16)
+fn band_diff(@builtin(global_invocation_id) gid: vec3<u32>) {
+  if (gid.x >= P.grid_w || gid.y >= P.grid_h) { return; }
+  let idx = gid.y * P.grid_w + gid.x;
+  fb[idx] = fa[idx] - fc[idx];
+}
+
+var<workgroup> wg_max_abs: atomic<u32>;
+
+@compute @workgroup_size(16, 16)
+fn reduce_max_abs(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
+  if (lid == 0u) { atomicStore(&wg_max_abs, 0u); }
+  workgroupBarrier();
+  if (gid.x < P.grid_w && gid.y < P.grid_h) {
+    let idx = gid.y * P.grid_w + gid.x;
+    if (cell_valid(cells[idx])) {
+      let v = ft_max_abs(fa[idx]);
+      if (v > 0.0) { atomicMax(&wg_max_abs, bitcast<u32>(v)); }
+    }
+  }
+  workgroupBarrier();
+  if (lid == 0u) { atomicMax(&maxbuf[PP.slot], atomicLoad(&wg_max_abs)); }
+}
+
+@compute @workgroup_size(16, 16)
+fn normalize_signed(@builtin(global_invocation_id) gid: vec3<u32>) {
+  if (gid.x >= P.grid_w || gid.y >= P.grid_h) { return; }
+  let idx = gid.y * P.grid_w + gid.x;
+  let mx = bitcast<f32>(atomicLoad(&maxbuf[PP.slot]));
+  let inv = select(1.0 / mx, 1.0, mx == 0.0);
+  fa[idx] = ft_splat(0.5) + fa[idx] * (0.5 * inv);
+}
+
+// ---------------------------------------------------------------------------
+// AFTERIMAGE: the ghost is the complement of what past frames fatigued.
+//   out = cur·(1 − w) + (1 − A)·w
+// and the adaptation A follows cur as an envelope follower (attack when rising,
+// decay when falling), stepped only when the frame advanced (PP.flag bit 0).
+// PP.flag bit 1: A holds a value (else the unfatigued baseline 0.5 is used).
+// ---------------------------------------------------------------------------
+@compute @workgroup_size(16, 16)
+fn afterimage_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  if (gid.x >= P.grid_w || gid.y >= P.grid_h) { return; }
+  let idx = gid.y * P.grid_w + gid.x;
+  let w = PP.f0;
+  let atk = PP.f1;
+  let dec = PP.f2;
+  let cur = fa[idx];
+  var a = ft_splat(0.5);
+  if ((PP.flag & 2u) != 0u) { a = fc[idx]; }
+  fb[idx] = cur * (1.0 - w) + (ft_splat(1.0) - a) * w;
+  if ((PP.flag & 1u) != 0u) {
+    fc[idx] = a + (cur - a) * select(ft_splat(dec), ft_splat(atk), cur > a);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// resolve: canvas pixels → colors. ss × ss sub-samples per pixel, each mapped to
+// its grid texel; the same shader serves the live view and the export.
+// ---------------------------------------------------------------------------
+@compute @workgroup_size(16, 16)
+fn resolve_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  if (gid.x >= P.canvas_w || gid.y >= P.canvas_h) { return; }
+  let ss = max(P.ss, 1u);
+  var sum = vec3<f32>(0.0);
+  for (var a = 0u; a < ss; a = a + 1u) {
+    for (var b = 0u; b < ss; b = b + 1u) {
+      let px = f32(gid.x) + (f32(a) + 0.5) / f32(ss);
+      let py = f32(gid.y) + (f32(b) + 0.5) / f32(ss);
+      sum = sum + sample_color(px, py);
+    }
+  }
+  textureStore(out_tex, vec2<i32>(i32(gid.x), i32(gid.y)), vec4<f32>(sum / f32(ss * ss), 1.0));
+}
+
+fn sample_color(px: f32, py: f32) -> vec3<f32> {
+  let t = texel_of(px, py);
+  if (t.x < 0) { return BG_COLOR; }
+  let idx = u32(t.y) * P.grid_w + u32(t.x);
+  let c = cells[idx];
+  if (!cell_valid(c)) { return BG_COLOR; }
+  if (P.field_active == 1u) { return ft_resolve_color(fa[idx]); }
+  if (P.value_style == 1u) { return select(BG_COLOR, LIGHT_COLOR, c.x != 0u); }
+  return unpack_rgb(palette[level_of(c.x)]);
+}
