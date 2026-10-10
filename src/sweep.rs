@@ -457,7 +457,7 @@ impl Sweep {
                 clamp_mod(a + k * n)
             }
             ModMode::Even => {
-                if x % 2 == 0 {
+                if x.is_multiple_of(2) {
                     x
                 } else if x < MOD_CAP {
                     x + 1

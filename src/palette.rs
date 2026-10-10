@@ -153,7 +153,7 @@ pub fn residue_level(r: u32, m: u32, spectral: bool) -> u8 {
 
 /// Level of every residue `0..m`, packed four per u32 for the GPU.
 pub fn residue_levels_packed(m: u32, spectral: bool) -> Vec<u32> {
-    let mut out = vec![0u32; (m as usize + 3) / 4];
+    let mut out = vec![0u32; (m as usize).div_ceil(4)];
     for r in 0..m {
         out[(r / 4) as usize] |= (residue_level(r, m, spectral) as u32) << (8 * (r % 4));
     }

@@ -228,11 +228,13 @@ impl Gpu {
     /// timestamp queries when the adapter has them.
     pub async fn request_device(adapter: &wgpu::Adapter) -> Result<(wgpu::Device, wgpu::Queue), String> {
         let al = adapter.limits();
-        let mut limits = wgpu::Limits::default();
-        limits.max_storage_buffer_binding_size = al.max_storage_buffer_binding_size;
-        limits.max_buffer_size = al.max_buffer_size;
-        limits.max_storage_buffers_per_shader_stage = al.max_storage_buffers_per_shader_stage.min(16).max(8);
-        limits.max_texture_dimension_2d = al.max_texture_dimension_2d;
+        let limits = wgpu::Limits {
+            max_storage_buffer_binding_size: al.max_storage_buffer_binding_size,
+            max_buffer_size: al.max_buffer_size,
+            max_storage_buffers_per_shader_stage: al.max_storage_buffers_per_shader_stage.clamp(8, 16),
+            max_texture_dimension_2d: al.max_texture_dimension_2d,
+            ..Default::default()
+        };
         let features = adapter.features() & wgpu::Features::TIMESTAMP_QUERY;
         adapter
             .request_device(&wgpu::DeviceDescriptor {
@@ -717,7 +719,7 @@ pub const FIELD_WGSL: &str = include_str!("../shaders/field.wgsl");
 pub const TWEEN_WGSL: &str = include_str!("../shaders/tween.wgsl");
 
 fn round_up(x: u64, to: u64) -> u64 {
-    (x + to - 1) / to * to
+    x.div_ceil(to) * to
 }
 
 impl Renderer {
@@ -886,6 +888,7 @@ impl Renderer {
         &self.canvas.display_sampled
     }
 
+    #[allow(clippy::too_many_arguments)] // one argument per binding of the shared group
     fn make_bg0(
         device: &wgpu::Device,
         bgl0: &wgpu::BindGroupLayout,
@@ -918,7 +921,7 @@ impl Renderer {
     /// buffer binding, and a vec4 working buffer must fit in one buffer.
     pub fn max_texels(&self) -> u64 {
         let lim = self.device.limits();
-        let by_binding = lim.max_storage_buffer_binding_size as u64 / (MAX_MEASURE_SLOTS as u64 * 4);
+        let by_binding = lim.max_storage_buffer_binding_size / (MAX_MEASURE_SLOTS as u64 * 4);
         let by_buffer = lim.max_buffer_size / 16;
         by_binding.min(by_buffer).min(64_000_000)
     }
@@ -953,7 +956,7 @@ impl Renderer {
             self.tween_prev = buffer(d, "tween prev", wbytes, STORAGE_RW);
             self.morphing = false;
             // History: as many frames as fit in a quarter of the binding limit, at most HIST_CAP.
-            let limit = self.device.limits().max_storage_buffer_binding_size as u64 / 4;
+            let limit = self.device.limits().max_storage_buffer_binding_size / 4;
             self.hist_cap = ((limit / wbytes.max(1)) as u32).clamp(2, HIST_CAP);
             self.hist_buf = buffer(d, "history", self.hist_cap as u64 * wbytes, STORAGE_RW);
             self.hist_next = 0;
@@ -1037,7 +1040,7 @@ impl Renderer {
     }
 
     fn groups(w: u32, h: u32) -> (u32, u32) {
-        ((w + WG - 1) / WG, (h + WG - 1) / WG)
+        (w.div_ceil(WG), h.div_ceil(WG))
     }
 
     fn dispatch_scalar(&self, enc: &mut wgpu::CommandEncoder, passes: &mut Vec<PassParams>, pipe: &wgpu::ComputePipeline, binds: [Bind<'_>; 4], pp: PassParams) {
@@ -1066,6 +1069,7 @@ impl Renderer {
         pass.dispatch_workgroups(gx, gy, 1);
     }
 
+    #[allow(clippy::too_many_arguments)] // the field passes' bindings, by position
     fn dispatch_field(&self, enc: &mut wgpu::CommandEncoder, passes: &mut Vec<PassParams>, pipe: &wgpu::ComputePipeline, a: Bind<'_>, b: Bind<'_>, c: Bind<'_>, fields: Bind<'_>, pp: PassParams, canvas: bool) {
         let off = Self::push_pass(passes, pp);
         let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {

@@ -175,10 +175,14 @@ struct Gfx {
     canvas_size: (u32, u32),
 }
 
+/// Everything that changes what the GPU renders: modulus, palette, layers, camera,
+/// supersampling and canvas size.
+type FrameKey = (u32, Scheme, LayerState, View, u32, (u32, u32));
+
 struct App {
     gfx: Option<Gfx>,
     model: Model,
-    last_inputs: Option<(u32, Scheme, LayerState, View, u32, (u32, u32))>,
+    last_inputs: Option<FrameKey>,
     frame_ms: f32,
     /// Redraw counter: egui may run the UI closure more than once per frame, but
     /// input (keys, wheel, drag, clicks) must move the camera only once.
@@ -1028,7 +1032,7 @@ fn group(n: u64) -> String {
     let s = n.to_string();
     let mut out = String::new();
     for (i, c) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i) % 3 == 0 {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(c);

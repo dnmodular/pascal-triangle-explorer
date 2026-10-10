@@ -368,7 +368,8 @@ impl CpuGrid {
                 return self.per_cell(|_, _, v| ((total as f64).log2() - (counts[&v] as f64).log2()).max(0.0) as f32);
             }
             LayerId::Variance => {
-                let ang = |v: u32| 6.2831853f32 * v as f32 / m as f32;
+                // same f32 bits as the shader's TAU literal 6.2831853
+                let ang = |v: u32| std::f32::consts::TAU * v as f32 / m as f32;
                 let r = layers.param("varR") as u32;
                 let bc = self.hex_blur(&self.per_cell(|_, _, v| ang(v).cos()), r);
                 let bs = self.hex_blur(&self.per_cell(|_, _, v| ang(v).sin()), r);
@@ -758,7 +759,8 @@ fn ported_measures_match_cpu() {
     let rows = 100u32;
     let (_, grid) = cell_grid(rows);
     // (modulus, layer, parameters, tolerance)
-    let cases: &[(u32, LayerId, &[(&str, i32)], f32)] = &[
+    type Case = (u32, LayerId, &'static [(&'static str, i32)], f32);
+    let cases: &[Case] = &[
         (7, LayerId::Gradient, &[], 0.0),
         (12, LayerId::Gradient, &[], 0.0),
         (65537, LayerId::Gradient, &[], 0.0),

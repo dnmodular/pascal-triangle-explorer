@@ -41,10 +41,10 @@ pub fn factorize(mut m: u32) -> Vec<PrimePower> {
     let mut out = Vec::new();
     let mut p = 2u32;
     while (p as u64) * (p as u64) <= m as u64 {
-        if m % p == 0 {
+        if m.is_multiple_of(p) {
             let mut e = 0;
             let mut q = 1u32;
-            while m % p == 0 {
+            while m.is_multiple_of(p) {
                 m /= p;
                 e += 1;
                 q *= p;
@@ -191,12 +191,12 @@ impl PrimePowerTables {
         let p = f.p as u64;
         let mut fp = vec![1u32; f.q as usize];
         for x in 1..f.q as usize {
-            fp[x] = if x as u64 % p == 0 { fp[x - 1] } else { (fp[x - 1] as u64 * x as u64 % q) as u32 };
+            fp[x] = if (x as u64).is_multiple_of(p) { fp[x - 1] } else { (fp[x - 1] as u64 * x as u64 % q) as u32 };
         }
         let mut ifp = vec![1u32; f.q as usize];
         ifp[f.q as usize - 1] = modinv(fp[f.q as usize - 1] as u64, q) as u32;
         for x in (1..f.q as usize).rev() {
-            ifp[x - 1] = if x as u64 % p == 0 { ifp[x] } else { (ifp[x] as u64 * x as u64 % q) as u32 };
+            ifp[x - 1] = if (x as u64).is_multiple_of(p) { ifp[x] } else { (ifp[x] as u64 * x as u64 % q) as u32 };
         }
         let garner_inv = if garner_q == 1 { 1 } else { modinv(garner_q as u64 % q, q) as u32 };
         Self {
@@ -493,7 +493,7 @@ mod tests {
                     let b = binom_exact(n, k).unwrap();
                     let mut v = 0;
                     let mut x = b;
-                    while x > 0 && x % p as u128 == 0 {
+                    while x > 0 && x.is_multiple_of(p as u128) {
                         x /= p as u128;
                         v += 1;
                     }

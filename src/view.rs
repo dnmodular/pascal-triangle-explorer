@@ -78,7 +78,7 @@ impl View {
     /// The cell under pixel `(px, py)`, if inside the triangle.
     pub fn cell_at(&self, px: f64, py: f64) -> Option<(u32, u32)> {
         let wy = self.y0 + py * self.rows_per_px();
-        if wy < 0.0 || wy >= MAX_ROW {
+        if !(0.0..MAX_ROW).contains(&wy) {
             return None;
         }
         let n = wy.floor();
