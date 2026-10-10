@@ -8,7 +8,7 @@ use std::time::Instant;
 
 use egui::{Align2, Color32, FontId, Pos2, Rect, Sense, Vec2};
 use pascal::export;
-use pascal::gpu::{FrameInput, Gpu, Renderer, Tween};
+use pascal::gpu::{CanvasStyle, FrameInput, Gpu, Renderer, Tween};
 use pascal::layers::{AvgMode, BlendMode, FieldColorMode, Kind, LayerId, LayerState, Preset, REGISTRY};
 use pascal::math::{self, Modulus, MOD_CAP};
 use pascal::palette::{Palette, Scheme};
@@ -36,6 +36,8 @@ struct Model {
     m_text: String,
     scheme: Scheme,
     palette: Palette,
+    /// Color offset and cell decorations (outlines, glow around zeros).
+    style: CanvasStyle,
     layers: LayerState,
     view: View,
     fit_rows: f64,
@@ -75,6 +77,7 @@ impl Model {
             m_text: m.to_string(),
             scheme: Scheme::Spectral,
             palette: Palette::new(Scheme::Spectral),
+            style: CanvasStyle::default(),
             layers: LayerState::default(),
             view: View::fit(800.0, 600.0, 128.0),
             fit_rows: 128.0,
@@ -135,6 +138,22 @@ impl Model {
         let moved = v != self.m;
         self.set_m(v);
         moved
+    }
+
+    /// Back to the defaults (the export folder stays), fitted to the canvas.
+    fn reset(&mut self, cw: f64, ch: f64) {
+        let dir = std::mem::take(&mut self.export_dir);
+        *self = Model::new();
+        self.export_dir = dir;
+        self.fit(cw, ch);
+    }
+
+    /// One of the square scanner's examples: modulus `m` with `rows` rows fitted.
+    fn example(&mut self, m: u32, rows: u32, cw: f64, ch: f64) {
+        self.sweep.playing = false;
+        self.set_m(m);
+        self.fit_rows = rows as f64;
+        self.fit(cw, ch);
     }
 
     fn set_scheme(&mut self, s: Scheme) {
@@ -200,9 +219,9 @@ struct Gfx {
     canvas_size: (u32, u32),
 }
 
-/// Everything that changes what the GPU renders: modulus, palette, layers, camera,
+/// Everything that changes what the GPU renders: modulus, palette, style, layers, camera,
 /// supersampling and canvas size.
-type FrameKey = (u32, Scheme, LayerState, View, u32, (u32, u32));
+type FrameKey = (u32, Scheme, CanvasStyle, LayerState, View, u32, (u32, u32));
 
 struct App {
     gfx: Option<Gfx>,
@@ -236,12 +255,17 @@ const USAGE: &str = "pascal-triangle-explorer [options]
   --m N              modulus (default 7)
   --rows R           rows to fit (default 128)
   --palette NAME     spectral | viridis | magma | inferno | turbo | cividis | coolwarm | mono
+                     | ember | ocean | moss
+  --offset X         fractional color offset (−1..1)
+  --outlines         outline each cell when zoomed in
+  --glow             glow around zero cells when zoomed in
   --mode MODE        residue | mask | valuation
   --visit MODE       sweep selection: all | primes | composites | even | odd | interval
   --layers a,b,c     active layers: value kummer lucas crt dlog pdigit gradient distzero magnitude
                      density variance rarity moire primes stripes lagdiff average bandpass afterimage
   --field MODE       math | palette (field color mode)
   --export FILE.png  render once without a window and write a PNG
+  --svg FILE.svg     write rows 0..R−1 (--rows, at most 1024) as an SVG (residue / mask / valuation)
   --size WxH         canvas size for --export (default 1600x1000)
   --check-shaders    compile every shader pipeline one by one and report what the driver rejects";
 
@@ -250,6 +274,7 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut model = Model::new();
     let mut export: Option<PathBuf> = None;
+    let mut svg: Option<PathBuf> = None;
     let mut size = (1600u32, 1000u32);
     let mut i = 0;
     while i < args.len() {
@@ -290,6 +315,17 @@ fn main() {
                 }
             }
             "--export" => export = Some(PathBuf::from(next())),
+            "--svg" => svg = Some(PathBuf::from(next())),
+            "--offset" => model.style.offset = next().parse().unwrap_or(0.0),
+            "--outlines" | "--glow" => {
+                if args[i] == "--outlines" {
+                    model.style.outlines = true;
+                } else {
+                    model.style.glow = true;
+                }
+                i += 1;
+                continue;
+            }
             "--size" => {
                 let v = next();
                 if let Some((w, h)) = v.split_once('x') {
@@ -310,6 +346,23 @@ fn main() {
             }
         }
         i += 2;
+    }
+    if let Some(path) = svg {
+        let rows = model.fit_rows.round().clamp(1.0, export::SVG_MAX_ROWS as f64) as u32;
+        let Some(colors) = export::preset_colors(rows, &model.modulus, &model.palette, &model.layers, &model.style) else {
+            eprintln!("--svg draws the residue, mask and valuation colorings only");
+            std::process::exit(2);
+        };
+        match export::write_svg(&path, &export::svg_document(&colors, &model.style)) {
+            Ok(()) => eprintln!("wrote rows 0–{} to {}", rows - 1, path.display()),
+            Err(e) => {
+                eprintln!("export failed: {e}");
+                std::process::exit(1);
+            }
+        }
+        if export.is_none() {
+            return;
+        }
     }
     if let Some(path) = export {
         headless_export(model, size, &path);
@@ -374,6 +427,19 @@ fn check_shaders() {
     }
 }
 
+/// Write rows `0..rows` as an SVG into the export folder; returns the note to show.
+fn save_svg(model: &Model, rows: u32) -> String {
+    let Some(colors) = export::preset_colors(rows, &model.modulus, &model.palette, &model.layers, &model.style) else {
+        return "SVG export draws the residue, mask and valuation colorings only.".into();
+    };
+    let dir = PathBuf::from(model.export_dir.trim());
+    let path = export::export_path(&dir, model.m, (0, rows - 1), model.scheme, &model.layers, "svg");
+    match export::write_svg(&path, &export::svg_document(&colors, &model.style)) {
+        Ok(()) => format!("Saved {rows} rows to {}", path.display()),
+        Err(e) => format!("Export failed: {e}"),
+    }
+}
+
 /// `--export`: the same pipeline as the window, on a headless device.
 fn headless_export(mut model: Model, size: (u32, u32), path: &std::path::Path) {
     let gpu = Gpu::new_headless().unwrap_or_else(|e| {
@@ -384,7 +450,7 @@ fn headless_export(mut model: Model, size: (u32, u32), path: &std::path::Path) {
     let mut renderer = Renderer::new(gpu.device.clone(), gpu.queue.clone());
     model.fit(size.0 as f64, size.1 as f64);
     let grid = GridSpec::new(&model.view, size.0, size.1, model.ss, renderer.max_texels());
-    renderer.render_blocking(&FrameInput { grid, modulus: &model.modulus, palette: &model.palette, layers: &model.layers, advance: true, tween: Tween::Off });
+    renderer.render_blocking(&FrameInput { grid, modulus: &model.modulus, palette: &model.palette, layers: &model.layers, advance: true, tween: Tween::Off, style: model.style });
     let (w, h, rgba) = renderer.read_output_rgba();
     match export::write_png(path, w, h, &rgba) {
         Ok(()) => eprintln!("wrote {}×{} px to {}", w, h, path.display()),
@@ -520,7 +586,9 @@ impl App {
             self.fps_frames = 0;
             self.fps_t0 = Some(now);
         }
-        let mut canvas_px = (gfx.config.width.saturating_sub((PANEL_W * ppp) as u32).max(1), gfx.config.height.max(1));
+        // The panel runs before the canvas is laid out: give it last frame's canvas size
+        // (the first frame estimates it), so its Fit / Reset / examples fit the real canvas.
+        let mut canvas_px = if gfx.canvas_size.0 > 0 { gfx.canvas_size } else { (gfx.config.width.saturating_sub((PANEL_W * ppp) as u32).max(1), gfx.config.height.saturating_sub((SWEEP_BAR_H * ppp) as u32).max(1)) };
         let model = &mut self.model;
         let frame_ms = self.frame_ms;
         self.frame_nr += 1;
@@ -587,7 +655,7 @@ impl App {
 
         // ---- GPU frame ----
         let grid = GridSpec::new(&model.view, canvas_px.0, canvas_px.1, model.ss, gfx.renderer.max_texels());
-        let inputs = (model.m, model.scheme, model.layers.clone(), model.view, model.ss, canvas_px);
+        let inputs = (model.m, model.scheme, model.style, model.layers.clone(), model.view, model.ss, canvas_px);
         let advance = self.last_inputs.as_ref() != Some(&inputs);
         self.last_inputs = Some(inputs);
         // Display-only tween between moduli (smoothstep over tween_ms, as in the reference).
@@ -612,7 +680,7 @@ impl App {
         let tween_off = matches!(tween, Tween::Off);
         let render_canvas = advance || !tween_off || !self.canvas_current;
         if render_canvas {
-            gfx.renderer.render(&mut encoder, &FrameInput { grid, modulus: &model.modulus, palette: &model.palette, layers: &model.layers, advance, tween });
+            gfx.renderer.render(&mut encoder, &FrameInput { grid, modulus: &model.modulus, palette: &model.palette, layers: &model.layers, advance, tween, style: model.style });
             gfx.renderer.flush_pass_params();
         }
         // After a change, render once more without advancing: the history layers
@@ -661,12 +729,12 @@ impl App {
         if model.pending_export {
             model.pending_export = false;
             // Render the true frame (no tween) with the same pipeline, then read it back.
-            gfx.renderer.render_blocking(&FrameInput { grid, modulus: &model.modulus, palette: &model.palette, layers: &model.layers, advance: false, tween: Tween::Off });
+            gfx.renderer.render_blocking(&FrameInput { grid, modulus: &model.modulus, palette: &model.palette, layers: &model.layers, advance: false, tween: Tween::Off, style: model.style });
             self.tween_t0 = None;
             let (w, h, rgba) = gfx.renderer.read_output_rgba();
             let rows = model.view.visible_rows(h as f64).unwrap_or((0, 0));
             let dir = PathBuf::from(model.export_dir.trim());
-            let path = export::export_path(&dir, model.m, rows, model.scheme, &model.layers);
+            let path = export::export_path(&dir, model.m, rows, model.scheme, &model.layers, "png");
             model.export_note = match export::write_png(&path, w, h, &rgba) {
                 Ok(()) => format!("Saved {w}×{h} px to {}", path.display()),
                 Err(e) => format!("Export failed: {e}"),
@@ -736,7 +804,14 @@ fn section<R>(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui) ->
 fn panel_ui(ui: &mut egui::Ui, model: &mut Model, canvas_px: (u32, u32), _frame_ms: f32) {
     ui.spacing_mut().item_spacing = Vec2::new(6.0, 5.0);
     ui.add_space(4.0);
-    ui.label(egui::RichText::new("Pascal sieve").size(15.0).strong());
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Pascal sieve").size(15.0).strong());
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.small_button("Reset").on_hover_text("Every setting back to its default (the export folder stays)").clicked() {
+                model.reset(canvas_px.0 as f64, canvas_px.1 as f64);
+            }
+        });
+    });
     note(ui, "C(n,k) mod m. Every pixel computes its own residue on the GPU — Lucas's theorem for primes, Granville's for prime powers, the Chinese remainder theorem for the rest — so there is no row above to wait for.");
 
     section(ui, "Modulus", |ui| {
@@ -769,6 +844,14 @@ fn panel_ui(ui: &mut egui::Ui, model: &mut Model, canvas_px: (u32, u32), _frame_
         let info = if model.modulus.is_prime() { format!("{} is prime", model.m) } else { format!("{} = {}", model.m, math::factor_string(fs)) };
         // one fixed line, so nothing below moves while the modulus changes
         mono_line(ui, &info).on_hover_text("Zeros are where every prime-power factor of m divides C(n,k); the CRT layer shows which ones do.");
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("examples  m =").color(ui.visuals().weak_text_color()));
+            for (m, rows) in [(2u32, 80u32), (3, 80), (5, 80), (11, 64)] {
+                if ui.small_button(m.to_string()).on_hover_text(format!("m = {m} with {rows} rows")).clicked() {
+                    model.example(m, rows, canvas_px.0 as f64, canvas_px.1 as f64);
+                }
+            }
+        });
     });
 
     section(ui, "View", |ui| {
@@ -856,6 +939,12 @@ fn panel_ui(ui: &mut egui::Ui, model: &mut Model, canvas_px: (u32, u32), _frame_
             Scheme::Spectral => "Zeros are void, 1 is near-white, the other residues run red → violet.",
             _ => "Zeros are void; residues 1..m−1 run along the ramp.",
         });
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("offset").color(ui.visuals().weak_text_color()));
+            mono_drag(ui, &mut model.style.offset, -1.0..=1.0, 0.005).on_hover_text("Fractional color offset: moves every residue color this far along the palette, wrapping around (0 and spectral's 1 stay)");
+            ui.checkbox(&mut model.style.outlines, "outlines").on_hover_text("A faint outline around each cell once cells are a few pixels wide");
+            ui.checkbox(&mut model.style.glow, "glow").on_hover_text("A soft halo around zero cells — where m divides C(n,k) — once cells are a few pixels wide");
+        });
     });
 
     section(ui, "Layers", |ui| {
@@ -932,9 +1021,17 @@ fn panel_ui(ui: &mut egui::Ui, model: &mut Model, canvas_px: (u32, u32), _frame_
     });
 
     section(ui, "Export", |ui| {
-        if ui.button("Save PNG").on_hover_text("The canvas at its native pixel size, from the same shader as the live view").clicked() {
-            model.pending_export = true;
-        }
+        ui.horizontal(|ui| {
+            if ui.button("Save PNG").on_hover_text("The canvas at its native pixel size, from the same shader as the live view").clicked() {
+                model.pending_export = true;
+            }
+            let rows = model.fit_rows.round().max(1.0) as u32;
+            let svg_ok = rows <= export::SVG_MAX_ROWS && model.layers.preset().is_some();
+            let tip = format!("Rows 0–{} as vector cells (residue, mask and valuation colorings, up to {} rows; outlines included, glow not)", rows - 1, export::SVG_MAX_ROWS);
+            if ui.add_enabled(svg_ok, egui::Button::new("Save SVG")).on_hover_text(tip).on_disabled_hover_text(format!("SVG export draws the residue, mask and valuation colorings of up to {} rows", export::SVG_MAX_ROWS)).clicked() {
+                model.export_note = save_svg(model, rows);
+            }
+        });
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("folder").color(ui.visuals().weak_text_color()));
             ui.add(egui::TextEdit::singleline(&mut model.export_dir).font(FontId::monospace(12.0)).desired_width(f32::INFINITY));
@@ -1265,7 +1362,7 @@ fn canvas_overlays(ui: &mut egui::Ui, model: &mut Model, rect: Rect, ppp: f32, g
                     let Some(text) = model.cell_value(n, k) else { break };
                     let r = model.modulus.binom(n, k);
                     let (rgb, show) = match model.layers.preset() {
-                        Some(Preset::Residue) => (model.palette.residue_color(r, model.m), r != 0),
+                        Some(Preset::Residue) => (model.palette.residue_color_shifted(r, model.m, pascal::palette::offset_shift(model.style.offset)), r != 0),
                         Some(Preset::Mask) => (pascal::palette::LIGHT, r != 0),
                         Some(Preset::Valuation) => {
                             let nu = math::carries(n, k, model.modulus.p) as f64;

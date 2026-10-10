@@ -90,7 +90,11 @@ pub struct GpuParams {
     pub field_active: u32,
     pub field_stride: u32,
     pub signed_mask: u32,
-    pub pad_d: u32,
+    pub res_shift: u32,
+    pub style_flags: u32,
+    pub glow_rgb: u32,
+    pub pad_e: u32,
+    pub pad_f: u32,
     pub dparams: [[u32; 4]; 8],
     pub factors: [GpuFactor; MAX_FACTORS],
 }
@@ -508,7 +512,27 @@ pub struct FrameInput<'a> {
     pub advance: bool,
     /// Display-only transition into this frame (see [`Tween`]).
     pub tween: Tween,
+    /// Color offset and cell decorations (part of the true frame: exports include them).
+    pub style: CanvasStyle,
 }
+
+/// How the resolve pass colors and decorates cells: the appearance options of
+/// `reference/ChatGPT-version-pascal-square-scanner`.
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub struct CanvasStyle {
+    /// Fractional color offset: residue colors move this fraction along the palette
+    /// ramp, wrapping (0 void and spectral's white 1 stay).
+    pub offset: f32,
+    /// A thin light outline around every cell once cells are a few pixels wide.
+    pub outlines: bool,
+    /// A soft halo in the palette's 0.8 color spilling from zero cells (where m divides
+    /// C(n,k)) onto their neighbours, once cells are a few pixels wide.
+    pub glow: bool,
+}
+
+/// `style_flags` bits.
+pub const STYLE_OUTLINES: u32 = 1;
+pub const STYLE_GLOW: u32 = 2;
 
 /// A display-only transition between sweep frames. `e` is the eased progress 0..1.
 /// `Start` marks the first frame of a new transition (it snapshots what is on screen);
@@ -699,7 +723,7 @@ fn ft_max_abs(v: FT) -> f32 { return max(max(abs(v.x), abs(v.y)), abs(v.z)); }
 // lightness (zeros keep their void color: measures never re-light them).
 fn ft_from_blend(b: f32, valid: bool, residue: u32, have_measures: bool) -> FT {
   if (!valid) { return vec4<f32>(BG_COLOR, 0.0); }
-  let lvl = level_of(residue);
+  let lvl = shift_level(level_of(residue));
   if (have_measures && residue != 0u) {
     let q = floor(clamp(b, 0.0, 1.0) * 255.0 + 0.5);
     let h = bitcast<f32>(palette[512u + lvl]);
@@ -1143,6 +1167,12 @@ impl Renderer {
             field_active: plan.field_active as u32,
             field_stride: self.stride,
             signed_mask: plan.measures.iter().take(n_measures as usize).enumerate().fold(0u32, |acc, (i, d)| acc | ((d.signed as u32) << i)),
+            res_shift: crate::palette::offset_shift(input.style.offset),
+            style_flags: (input.style.outlines as u32 * STYLE_OUTLINES) | (input.style.glow as u32 * STYLE_GLOW),
+            glow_rgb: {
+                let [r, g, b] = input.palette.glow_color();
+                (r as u32) << 16 | (g as u32) << 8 | b as u32
+            },
             factors: md.factors,
             ..Default::default()
         };

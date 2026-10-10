@@ -240,12 +240,92 @@ fn sample_color(px: f32, py: f32) -> vec3<f32> {
   let idx = u32(t.y) * P.grid_w + u32(t.x);
   let c = cells[idx];
   if (!cell_valid(c)) { return BG_COLOR; }
+  var col: vec3<f32>;
   if (P.field_active == 1u) {
     // display-only morph (PP.flag bit 0): fc holds the field shown when it began
     var f = fa[idx];
     if ((PP.flag & 1u) != 0u) { f = mix(fc[idx], fa[idx], PP.f0); }
-    return ft_resolve_color(f);
+    col = ft_resolve_color(f);
+  } else if (P.value_style == 1u) {
+    col = select(BG_COLOR, LIGHT_COLOR, c.x != 0u);
+  } else {
+    col = unpack_rgb(palette[shift_level(level_of(c.x))]);
   }
-  if (P.value_style == 1u) { return select(BG_COLOR, LIGHT_COLOR, c.x != 0u); }
-  return unpack_rgb(palette[level_of(c.x)]);
+  if (P.style_flags != 0u) {
+    col = decorate(col, px, py, t, c.x);
+  }
+  return col;
+}
+
+// ---------------------------------------------------------------------------
+// Cell decorations (outlines, glow around zeros). Only when a texel is one cell
+// (sx = sy = 1) and cells are a few pixels wide; they fade in between 3 and 6 px.
+// Geometry in pixels relative to the cell's top-left corner: the cell is
+// [0, cw] × [0, ch]; the rows above and below are offset by half a cell.
+// ---------------------------------------------------------------------------
+const OUTLINE_RGB: vec3<f32> = vec3<f32>(235.0 / 255.0, 238.0 / 255.0, 250.0 / 255.0);
+const OUTLINE_ALPHA: f32 = 0.12;  // the square scanner's rgba(235, 238, 250, .12)
+const OUTLINE_HALF_PX: f32 = 0.5; // each cell draws half of a 1 px line
+const GLOW_MAX_PX: f32 = 10.0;    // its shadowBlur = min(10, 0.8 · cell)
+const GLOW_STRENGTH: f32 = 0.55;
+
+// Position of (px, py) inside its cell, in [0, 1)²: the fractional parts of the
+// coordinates texel_of floors (with sx = sy = 1).
+fn cell_uv(px: f32, py: f32, nu: u32) -> vec2<f32> {
+  let yf = P.y0f + py * P.rows_per_px;
+  let ibase = P.x0i - k0_of(nu) + i32(nu >> 1u);
+  let half = select(0.0, 0.5, (nu & 1u) == 1u);
+  let xf = P.x0f + px * P.cells_per_px;
+  return vec2<f32>(fract(f32(ibase) + xf + half + 0.5), fract(yf));
+}
+
+// Distance (px) from p to the rectangle [lo, hi].
+fn rect_dist(p: vec2<f32>, lo: vec2<f32>, hi: vec2<f32>) -> f32 {
+  return length(max(vec2<f32>(0.0), max(lo - p, p - hi)));
+}
+
+fn decorate(col_in: vec3<f32>, px: f32, py: f32, t: vec2<i32>, residue: u32) -> vec3<f32> {
+  if (P.sx != 1.0 || P.sy != 1.0) { return col_in; }
+  let cw = 1.0 / P.cells_per_px;
+  let ch = 1.0 / P.rows_per_px;
+  let size = min(cw, ch);
+  let fade = smoothstep(3.0, 6.0, size);
+  if (fade <= 0.0) { return col_in; }
+  let n = row_of(u32(t.y));
+  if (n < 0) { return col_in; }
+  let uv = cell_uv(px, py, u32(n));
+  let p = uv * vec2<f32>(cw, ch);
+  var col = col_in;
+  if ((P.style_flags & 2u) != 0u && residue != 0u) {
+    // the nearest zero among the six lattice neighbours (a zero cell itself stays dark)
+    let r = min(GLOW_MAX_PX, 0.8 * size);
+    var d = 1.0e9;
+    for (var w = 0u; w < 6u; w = w + 1u) {
+      let ni = neighbor_index(t.x, t.y, w);
+      if (ni < 0) { continue; }
+      if (cells[ni].x != 0u) { continue; }
+      var lo: vec2<f32>;
+      var hi: vec2<f32>;
+      switch w {
+        case 0u: { lo = vec2<f32>(-0.5 * cw, -ch); hi = vec2<f32>(0.5 * cw, 0.0); }  // up-left
+        case 1u: { lo = vec2<f32>(0.5 * cw, -ch); hi = vec2<f32>(1.5 * cw, 0.0); }   // up-right
+        case 2u: { lo = vec2<f32>(-0.5 * cw, ch); hi = vec2<f32>(0.5 * cw, 2.0 * ch); } // down-left
+        case 3u: { lo = vec2<f32>(0.5 * cw, ch); hi = vec2<f32>(1.5 * cw, 2.0 * ch); }  // down-right
+        case 4u: { lo = vec2<f32>(-cw, 0.0); hi = vec2<f32>(0.0, ch); }              // left
+        default: { lo = vec2<f32>(cw, 0.0); hi = vec2<f32>(2.0 * cw, ch); }          // right
+      }
+      d = min(d, rect_dist(p, lo, hi));
+    }
+    if (d < r) {
+      let g = 1.0 - d / r;
+      col = mix(col, unpack_rgb(P.glow_rgb), GLOW_STRENGTH * g * g * fade);
+    }
+  }
+  if ((P.style_flags & 1u) != 0u) {
+    let edge = min(min(p.x, cw - p.x), min(p.y, ch - p.y));
+    if (edge < OUTLINE_HALF_PX) {
+      col = mix(col, OUTLINE_RGB, OUTLINE_ALPHA * fade);
+    }
+  }
+  return col;
 }

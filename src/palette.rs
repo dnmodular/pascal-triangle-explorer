@@ -17,10 +17,14 @@ pub enum Scheme {
     Cividis,
     CoolWarm,
     Mono,
+    /// The three gradients of `reference/ChatGPT-version-pascal-square-scanner`.
+    Ember,
+    Ocean,
+    Moss,
 }
 
 impl Scheme {
-    pub const ALL: [Scheme; 8] = [
+    pub const ALL: [Scheme; 11] = [
         Scheme::Spectral,
         Scheme::Viridis,
         Scheme::Magma,
@@ -29,6 +33,9 @@ impl Scheme {
         Scheme::Cividis,
         Scheme::CoolWarm,
         Scheme::Mono,
+        Scheme::Ember,
+        Scheme::Ocean,
+        Scheme::Moss,
     ];
 
     pub fn label(self) -> &'static str {
@@ -41,6 +48,9 @@ impl Scheme {
             Scheme::Cividis => "cividis",
             Scheme::CoolWarm => "cool–warm",
             Scheme::Mono => "mono",
+            Scheme::Ember => "ember",
+            Scheme::Ocean => "ocean",
+            Scheme::Moss => "moss",
         }
     }
 
@@ -54,6 +64,9 @@ impl Scheme {
             Scheme::Cividis => "cividis",
             Scheme::CoolWarm => "coolwarm",
             Scheme::Mono => "mono",
+            Scheme::Ember => "ember",
+            Scheme::Ocean => "ocean",
+            Scheme::Moss => "moss",
         }
     }
 
@@ -66,6 +79,10 @@ impl Scheme {
         const TURBO: &[[u8; 3]] = &[[48, 18, 59], [70, 107, 227], [40, 174, 227], [27, 229, 181], [124, 253, 90], [201, 237, 50], [252, 184, 49], [245, 109, 29], [191, 40, 9], [122, 4, 3]];
         const CIVIDIS: &[[u8; 3]] = &[[0, 32, 76], [0, 42, 102], [39, 63, 108], [75, 82, 107], [110, 101, 105], [146, 120, 99], [185, 141, 85], [223, 164, 65], [253, 190, 44], [255, 233, 69]];
         const COOLWARM: &[[u8; 3]] = &[[59, 76, 192], [98, 130, 234], [141, 176, 254], [184, 208, 249], [221, 221, 221], [245, 196, 173], [244, 154, 123], [222, 96, 77], [180, 4, 38]];
+        // the square scanner's `paletteColor` stops
+        const EMBER: &[[u8; 3]] = &[[17, 19, 26], [92, 39, 45], [255, 111, 74], [255, 226, 155]];
+        const OCEAN: &[[u8; 3]] = &[[10, 19, 31], [22, 76, 109], [54, 190, 201], [197, 255, 239]];
+        const MOSS: &[[u8; 3]] = &[[16, 24, 20], [46, 88, 57], [131, 178, 92], [231, 235, 164]];
         match self {
             Scheme::Viridis => Some(VIRIDIS),
             Scheme::Magma => Some(MAGMA),
@@ -73,6 +90,9 @@ impl Scheme {
             Scheme::Turbo => Some(TURBO),
             Scheme::Cividis => Some(CIVIDIS),
             Scheme::CoolWarm => Some(COOLWARM),
+            Scheme::Ember => Some(EMBER),
+            Scheme::Ocean => Some(OCEAN),
+            Scheme::Moss => Some(MOSS),
             Scheme::Spectral | Scheme::Mono => None,
         }
     }
@@ -149,6 +169,29 @@ pub fn residue_level(r: u32, m: u32, spectral: bool) -> u8 {
         x / (mu - 1.0)
     };
     2 + js_round(253.0 * t.clamp(0.0, 1.0)) as u8
+}
+
+/// Palette positions a color offset rotates: levels 2..=255 (0 is the void of a zero
+/// residue and 1 the white of residue 1 in spectral; both stay put).
+pub const RAMP_LEVELS: u32 = 254;
+
+/// The level shift for a fractional color offset (the square scanner's "fractional
+/// offset": colors move by `offset` of the ramp, wrapping around), in 0..RAMP_LEVELS.
+pub fn offset_shift(offset: f32) -> u32 {
+    if !offset.is_finite() {
+        return 0;
+    }
+    let s = (offset.rem_euclid(1.0) * RAMP_LEVELS as f32).round() as u32;
+    s % RAMP_LEVELS
+}
+
+/// `level` moved `shift` positions along the ramp, wrapping (levels 0 and 1 are fixed).
+/// The WGSL `shift_level` is the same function.
+pub fn shift_level(level: u8, shift: u32) -> u8 {
+    if level < 2 {
+        return level;
+    }
+    (2 + (level as u32 - 2 + shift) % RAMP_LEVELS) as u8
 }
 
 /// Level of every residue `0..m`, packed four per u32 for the GPU.
@@ -232,7 +275,18 @@ impl Palette {
 
     /// Color of residue `r` under modulus `m` (what the residue layer paints).
     pub fn residue_color(&self, r: u32, m: u32) -> [u8; 3] {
-        self.res[residue_level(r, m, self.scheme == Scheme::Spectral) as usize]
+        self.residue_color_shifted(r, m, 0)
+    }
+
+    /// The same with the color offset's level shift (see [`offset_shift`]).
+    pub fn residue_color_shifted(&self, r: u32, m: u32, shift: u32) -> [u8; 3] {
+        self.res[shift_level(residue_level(r, m, self.scheme == Scheme::Spectral), shift) as usize]
+    }
+
+    /// The glow color around zero cells: the ramp at 0.8, as the square scanner's
+    /// `paletteColor(.8)`.
+    pub fn glow_color(&self) -> [u8; 3] {
+        ramp_rgb(self.scheme, 0.8)
     }
 }
 
@@ -270,6 +324,35 @@ mod tests {
         assert_eq!(ramp_rgb(Scheme::Mono, 0.5), [128, 128, 128]);
         // halfway between the first two viridis stops: (68+72)/2 = 70, (1+40)/2 = 20.5 -> 21, (84+120)/2 = 102
         assert_eq!(ramp_rgb(Scheme::Viridis, 0.5 / 9.0), [70, 21, 102]);
+    }
+
+    #[test]
+    fn scanner_palettes_and_offsets() {
+        // the square scanner's stops, end to end
+        assert_eq!(ramp_rgb(Scheme::Ember, 0.0), [17, 19, 26]);
+        assert_eq!(ramp_rgb(Scheme::Ocean, 1.0), [197, 255, 239]);
+        assert_eq!(ramp_rgb(Scheme::Moss, 1.0 / 3.0), [46, 88, 57]);
+        // its paletteColor(.8) for ember: 0.8·3 = 2.4 → 0.4 of the way from stop 2 to 3
+        assert_eq!(Palette::new(Scheme::Ember).glow_color(), [255, 157, 106]);
+        // offsets rotate levels 2..=255 and leave void / white alone
+        assert_eq!(offset_shift(0.0), 0);
+        assert_eq!(offset_shift(1.0), 0);
+        assert_eq!(offset_shift(0.5), 127);
+        assert_eq!(offset_shift(-0.25), offset_shift(0.75));
+        assert_eq!(offset_shift(f32::NAN), 0);
+        for sh in [0u32, 1, 127, 253] {
+            assert_eq!(shift_level(0, sh), 0);
+            assert_eq!(shift_level(1, sh), 1);
+            for lv in 2..=255u8 {
+                let s = shift_level(lv, sh);
+                assert!(s >= 2);
+                assert_eq!(shift_level(s, RAMP_LEVELS - sh), lv, "inverse shift");
+            }
+        }
+        assert_eq!(shift_level(255, 1), 2, "wraps");
+        let p = Palette::new(Scheme::Spectral);
+        assert_eq!(p.residue_color_shifted(3, 7, 0), p.residue_color(3, 7));
+        assert_eq!(p.residue_color_shifted(0, 7, 99), BG);
     }
 
     #[test]

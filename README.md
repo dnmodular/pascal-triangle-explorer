@@ -32,6 +32,7 @@ display:
 
 ```sh
 cargo run --release -- --export pascal.png --m 30 --rows 256 --palette turbo --size 1920x1080
+cargo run --release -- --svg pascal.svg --m 5 --rows 80 --palette ocean --outlines
 cargo run --release -- --help
 ```
 
@@ -94,10 +95,43 @@ driver works: `sudo apt install mesa-vulkan-drivers` (lavapipe) and run
 | click a cell | pin its row for the wave overlay (click the row again, or **Esc**, to release) |
 | **W** | show / hide the wave overlay (it fades) |
 
-The panel on the left has the modulus (text, ◀ ▶, log slider), the rows to fit,
-supersampling, the palette, the three color presets (residue → palette,
-zero/nonzero mask, p-adic valuation heatmap), the layer stack and PNG export.
-When cells are at least 18 px wide their residue is printed inside them.
+The panel on the left has the modulus (text, ◀ ▶, log slider, and the examples
+m = 2, 3, 5, 11), the rows to fit, supersampling, the palette, the three color
+presets (residue → palette, zero/nonzero mask, p-adic valuation heatmap), the
+color offset, cell outlines and zero glow, the layer stack, PNG and SVG export, and
+a Reset button. When cells are at least 18 px wide their residue is printed inside
+them.
+
+## From the square scanner
+
+`reference/ChatGPT-version-pascal-square-scanner` is a small canvas page ("Pascal ·
+Square Scanner"). These of its features earned a place here:
+
+* **Color offset** (its "fractional offset"): residue colors move that fraction
+  along the palette, wrapping around; the void of 0 and spectral's white 1 stay. It
+  applies to the residue coloring and PALETTE BLEND, on the GPU, so exports carry it.
+* **Cell outlines**: the scanner's faint `rgba(235, 238, 250, .12)` outline around
+  every cell (zeros included), a 1 px line between neighbours.
+* **Zero glow** (its glow on residue-0 cells): a halo in the palette's 0.8 color
+  spills from each zero cell onto its six lattice neighbours, out to min(10 px,
+  0.8 cell) — the outline of every void lights up. A zero cell itself stays dark.
+* Outlines and glow are drawn by the resolve pass, so exports include them; they
+  fade in as cells grow from 3 to 6 px and vanish when zoomed out.
+* **Palettes** Ember, Ocean and Moss (its four-stop gradients).
+* **Examples**: one click to m = 2, 3, 5 (80 rows) or 11 (64 rows), as its presets.
+* **SVG export** (its "Save SVG"): rows 0..R−1 (the rows setting, up to 1024) as
+  vector cells — one path per color — for the residue, mask and valuation
+  colorings, which the CPU reproduces exactly (verified against the GPU); with
+  outlines if they are on. The glow is a raster effect and stays out.
+* **Reset**: every setting back to its default.
+
+Left out: its BigInt coefficients (the closed form here is exact at any row), the
+square-cell geometry and cell-scale slider (cells here keep the √3/2 lattice the
+neighbour measures rely on; zoom sets the scale), the 2–31 modulus slider, the page
+chrome, and its motion modes (only "pulse" animates there — "down" and "up" are
+static ramps — and the sweep already moves the picture). Its README names an atlas,
+determinant motion and a Lava renderer from the original site that the
+reconstruction does not contain, so there was nothing to port.
 
 ## Modular wave
 
@@ -311,6 +345,10 @@ Verified (by `cargo test` on Mesa lavapipe, and by the headless export):
   Xvfb: hover, a modulus step and a row change morph, **W** fades out and in,
   pinning, corners (the inspector moves out of the box's way), resizes, deep rows
   with their k window.
+* Square-scanner features: the resolve pass's color offset, outlines and zero
+  glow equal a CPU twin within one level on ~400k pixels (spectral and ember, m = 4
+  and 7, each feature alone and all together) and vanish on 2 px cells; the SVG
+  export's colors equal the GPU's for the residue, mask and valuation colorings.
 * The app is idle when nothing moves (with the wave's drift at 0), and a redraw
   that changes no GPU input skips the triangle's passes; after a tween the canvas
   equals a fresh render pixel for pixel. The on-screen canvas equals the exported

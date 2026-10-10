@@ -62,7 +62,12 @@ struct Params {
   field_active: u32, // the field pipeline ran: resolve reads the working field
   field_stride: u32, // elements per field slot
   signed_mask: u32,  // bit s set when measure slot s is signed (normalized around 0.5)
-  pad_d: u32,
+  res_shift: u32,    // color offset: residue levels 2..255 move this far along the ramp
+
+  style_flags: u32,  // resolve decorations: bit 0 cell outlines, bit 1 glow around zeros
+  glow_rgb: u32,     // 0xRRGGBB of the glow (the palette ramp at 0.8)
+  pad_e: u32,
+  pad_f: u32,
 
   dparams: array<vec4<u32>, 8>, // per-layer values derived on the CPU (LayerDef::derive / dslot)
   factors: array<Factor, 9>,
@@ -86,6 +91,13 @@ fn cell_mask(c: vec2<u32>) -> u32 { return (c.y >> 8u) & 0xffffu; }
 
 fn level_of(residue: u32) -> u32 {
   return (levels[residue >> 2u] >> (8u * (residue & 3u))) & 0xffu;
+}
+
+// The color offset: levels 2..255 rotate by P.res_shift (< 254); 0 (void) and 1
+// (spectral's white) stay. Same as palette::shift_level on the CPU.
+fn shift_level(level: u32) -> u32 {
+  if (level < 2u) { return level; }
+  return 2u + (level - 2u + P.res_shift) % 254u;
 }
 
 fn unpack_rgb(c: u32) -> vec3<f32> {
