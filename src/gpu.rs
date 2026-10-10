@@ -632,11 +632,12 @@ impl Renderer {
         self.bg0 = Self::make_bg0(&self.device, &self.bgl0, &self.params_buf, &self.tables_buf, &self.levels_buf, &self.palette_buf, &self.cells_buf, &self.maxbuf);
     }
 
-    /// Largest grid (texels) the device limits allow for the field buffers.
+    /// Largest grid (texels) the device limits allow: the measure fields share one
+    /// buffer binding, and a vec4 working buffer must fit in one buffer.
     pub fn max_texels(&self) -> u64 {
         let lim = self.device.limits();
         let by_binding = lim.max_storage_buffer_binding_size as u64 / (MAX_MEASURE_SLOTS as u64 * 4);
-        let by_buffer = lim.max_buffer_size / (HIST_CAP as u64 * 16);
+        let by_buffer = lim.max_buffer_size / 16;
         by_binding.min(by_buffer).min(64_000_000)
     }
 

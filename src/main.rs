@@ -111,9 +111,9 @@ impl Model {
         let composite = md.factors.len() > 1 || md.factors[0].f.e > 1;
         for t in &md.factors {
             let nu = math::carries(n, k, t.f.p);
-            let mut s = format!("ν_{} = {}", t.f.p, nu);
+            let mut s = format!("ν{} = {}", sub(t.f.p), nu);
             if composite {
-                s.push_str(&format!("   ({}{} {})", t.f.p, if t.f.e > 1 { format!("^{}", t.f.e) } else { String::new() }, if nu >= t.f.e { "divides" } else { "does not divide" }));
+                s.push_str(&format!("   ({} {})", math::factor_string(&[t.f]), if nu >= t.f.e { "divides" } else { "does not divide" }));
             }
             lines.push(s);
         }
@@ -142,14 +142,88 @@ struct App {
     model: Model,
     last_inputs: Option<(u32, Scheme, LayerState, View, u32, (u32, u32))>,
     frame_ms: f32,
+    /// Redraw counter: egui may run the UI closure more than once per frame, but
+    /// input (keys, wheel, drag, clicks) must move the camera only once.
+    frame_nr: u64,
 }
+
+const USAGE: &str = "pascal-triangle-explorer [options]
+  --m N              modulus (default 7)
+  --rows R           rows to fit (default 128)
+  --palette NAME     spectral | viridis | magma | inferno | turbo | cividis | coolwarm | mono
+  --mode MODE        residue | mask | valuation
+  --export FILE.png  render once without a window and write a PNG
+  --size WxH         canvas size for --export (default 1600x1000)";
 
 fn main() {
     env_logger::init();
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut model = Model::new();
+    let mut export: Option<PathBuf> = None;
+    let mut size = (1600u32, 1000u32);
+    let mut i = 0;
+    while i < args.len() {
+        let next = || args.get(i + 1).cloned().unwrap_or_default();
+        match args[i].as_str() {
+            "--m" => model.set_m(next().parse().unwrap_or(7)),
+            "--rows" => model.fit_rows = next().parse::<f64>().unwrap_or(128.0).max(2.0),
+            "--palette" => {
+                if let Some(s) = Scheme::ALL.iter().find(|s| s.id() == next()) {
+                    model.set_scheme(*s);
+                }
+            }
+            "--mode" => match next().as_str() {
+                "mask" => model.layers.preset_mask(),
+                "valuation" => model.layers.preset_valuation(),
+                _ => model.layers.preset_residue(),
+            },
+            "--export" => export = Some(PathBuf::from(next())),
+            "--size" => {
+                let v = next();
+                if let Some((w, h)) = v.split_once('x') {
+                    size = (w.parse().unwrap_or(1600), h.parse().unwrap_or(1000));
+                }
+            }
+            "--help" | "-h" => {
+                println!("{USAGE}");
+                return;
+            }
+            other => {
+                eprintln!("unknown option {other}\n{USAGE}");
+                std::process::exit(2);
+            }
+        }
+        i += 2;
+    }
+    if let Some(path) = export {
+        headless_export(model, size, &path);
+        return;
+    }
     let event_loop = EventLoop::new().expect("event loop");
     event_loop.set_control_flow(ControlFlow::Wait);
-    let mut app = App { gfx: None, model: Model::new(), last_inputs: None, frame_ms: 0.0 };
+    let mut app = App { gfx: None, model, last_inputs: None, frame_ms: 0.0, frame_nr: 0 };
     event_loop.run_app(&mut app).expect("run");
+}
+
+/// `--export`: the same pipeline as the window, on a headless device.
+fn headless_export(mut model: Model, size: (u32, u32), path: &std::path::Path) {
+    let gpu = Gpu::new_headless().unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(1);
+    });
+    eprintln!("adapter: {} ({:?})", gpu.info.name, gpu.info.backend);
+    let mut renderer = Renderer::new(gpu.device.clone(), gpu.queue.clone());
+    model.fit(size.0 as f64, size.1 as f64);
+    let grid = GridSpec::new(&model.view, size.0, size.1, model.ss, renderer.max_texels());
+    renderer.render_blocking(&FrameInput { grid, modulus: &model.modulus, palette: &model.palette, layers: &model.layers, advance: true });
+    let (w, h, rgba) = renderer.read_output_rgba();
+    match export::write_png(path, w, h, &rgba) {
+        Ok(()) => eprintln!("wrote {}×{} px to {}", w, h, path.display()),
+        Err(e) => {
+            eprintln!("export failed: {e}");
+            std::process::exit(1);
+        }
+    }
 }
 
 impl ApplicationHandler for App {
@@ -230,6 +304,9 @@ impl App {
         let mut canvas_px = (gfx.config.width.saturating_sub((PANEL_W * ppp) as u32).max(1), gfx.config.height.max(1));
         let model = &mut self.model;
         let frame_ms = self.frame_ms;
+        self.frame_nr += 1;
+        let frame_nr = self.frame_nr;
+        let mut handled_frame = 0u64;
         let ctx = gfx.egui_ctx.clone();
         let Gfx { renderer, egui_renderer, gpu, canvas_tex, canvas_size, .. } = gfx;
 
@@ -237,6 +314,7 @@ impl App {
             // ---- left panel ----
             egui::Panel::left("panel").exact_size(PANEL_W).resizable(false).show(ui, |ui| {
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                    ui.set_max_width(PANEL_W - 24.0);
                     panel_ui(ui, model, canvas_px, frame_ms);
                 });
             });
@@ -270,11 +348,14 @@ impl App {
                 };
                 let response = ui.allocate_rect(rect, Sense::click_and_drag());
                 ui.painter().image(id, rect, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
-                canvas_interaction(ui, model, &response, rect, ppp);
-                canvas_overlays(ui, model, rect, ppp, gpu_ms, frame_ms);
+                let handle = handled_frame != frame_nr;
+                handled_frame = frame_nr;
+                canvas_interaction(ui, model, &response, rect, ppp, handle);
+                canvas_overlays(ui, model, rect, ppp, gpu_ms, frame_ms, handle);
             });
         });
-        gfx.egui_state.handle_platform_output(&gfx.window, full_output.platform_output);
+        let egui::FullOutput { platform_output, mut textures_delta, shapes, pixels_per_point, viewport_output } = full_output;
+        gfx.egui_state.handle_platform_output(&gfx.window, platform_output);
 
         // ---- GPU frame ----
         let grid = GridSpec::new(&model.view, canvas_px.0, canvas_px.1, model.ss, gfx.renderer.max_texels());
@@ -286,9 +367,9 @@ impl App {
         gfx.renderer.flush_pass_params();
 
         // ---- egui paint ----
-        let paint_jobs = ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
-        let screen = egui_wgpu::ScreenDescriptor { size_in_pixels: [gfx.config.width, gfx.config.height], pixels_per_point: full_output.pixels_per_point };
-        for (id, deltas) in &full_output.textures_delta.set {
+        let paint_jobs = ctx.tessellate(shapes, pixels_per_point);
+        let screen = egui_wgpu::ScreenDescriptor { size_in_pixels: [gfx.config.width, gfx.config.height], pixels_per_point };
+        for (id, deltas) in &textures_delta.set {
             for delta in deltas {
                 gfx.egui_renderer.update_texture(&gfx.gpu.device, &gfx.gpu.queue, *id, delta);
             }
@@ -317,9 +398,10 @@ impl App {
         gfx.renderer.begin_timing_readback();
         gfx.window.pre_present_notify();
         gfx.gpu.queue.present(frame);
-        for id in &full_output.textures_delta.free {
+        for id in &textures_delta.free {
             gfx.egui_renderer.free_texture(id);
         }
+        textures_delta.clear();
 
         if model.pending_export {
             model.pending_export = false;
@@ -335,7 +417,7 @@ impl App {
         }
 
         self.frame_ms = t0.elapsed().as_secs_f32() * 1000.0;
-        let repaint = full_output.viewport_output.get(&egui::ViewportId::ROOT).map(|v| v.repaint_delay.is_zero()).unwrap_or(false);
+        let repaint = viewport_output.get(&egui::ViewportId::ROOT).map(|v| v.repaint_delay.is_zero()).unwrap_or(false);
         if repaint {
             gfx.window.request_redraw();
         }
@@ -360,6 +442,15 @@ fn header(ui: &mut egui::Ui, text: &str) {
 
 fn note(ui: &mut egui::Ui, text: &str) {
     ui.add(egui::Label::new(egui::RichText::new(text).size(12.0).color(ui.visuals().weak_text_color())).wrap());
+}
+
+/// A number field in the monospace font.
+fn mono_drag<N: egui::emath::Numeric>(ui: &mut egui::Ui, v: &mut N, range: std::ops::RangeInclusive<N>, speed: f64) -> egui::Response {
+    let old = ui.style().override_font_id.clone();
+    ui.style_mut().override_font_id = Some(FontId::monospace(12.0));
+    let r = ui.add(egui::DragValue::new(v).range(range).speed(speed));
+    ui.style_mut().override_font_id = old;
+    r
 }
 
 fn mono_note(ui: &mut egui::Ui, text: &str) {
@@ -414,7 +505,7 @@ fn panel_ui(ui: &mut egui::Ui, model: &mut Model, canvas_px: (u32, u32), _frame_
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("rows").color(ui.visuals().weak_text_color()));
             let mut rows = model.fit_rows.round() as u32;
-            let resp = ui.add(egui::DragValue::new(&mut rows).range(2..=1_000_000_000u32).speed(1.0));
+            let resp = mono_drag(ui, &mut rows, 2..=1_000_000_000u32, 1.0);
             if resp.changed() {
                 model.fit_rows = rows.max(2) as f64;
                 model.fit(canvas_px.0 as f64, canvas_px.1 as f64);
@@ -490,8 +581,8 @@ fn panel_ui(ui: &mut egui::Ui, model: &mut Model, canvas_px: (u32, u32), _frame_
                     ui.selectable_value(&mut model.layers.blend, b, b.label());
                 }
             });
-            ui.label(egui::RichText::new(model.layers.blend.note()).size(12.0).color(ui.visuals().weak_text_color()));
         });
+        note(ui, model.layers.blend.note());
         let mut last_kind = None;
         for d in REGISTRY {
             if last_kind != Some(d.kind) {
@@ -509,6 +600,7 @@ fn panel_ui(ui: &mut egui::Ui, model: &mut Model, canvas_px: (u32, u32), _frame_
             resp.on_hover_text(d.desc);
             if on {
                 ui.indent(d.id as u8, |ui| {
+                    ui.set_max_width(ui.available_width());
                     if d.id == LayerId::Average {
                         ui.horizontal(|ui| {
                             ui.selectable_value(&mut model.layers.avg_mode, AvgMode::Spatial, "spatial");
@@ -520,7 +612,7 @@ fn panel_ui(ui: &mut egui::Ui, model: &mut Model, canvas_px: (u32, u32), _frame_
                             ui.label(egui::RichText::new(p.label).color(ui.visuals().weak_text_color()));
                             let mut v = model.layers.param(p.key);
                             let (lo, hi) = if p.key == "avgAmount" && model.layers.avg_mode == AvgMode::Spatial { (1, 12) } else { (p.min, p.max) };
-                            if ui.add(egui::DragValue::new(&mut v).range(lo..=hi).speed(0.1)).changed() {
+                            if mono_drag(ui, &mut v, lo..=hi, 0.1).changed() {
                                 model.layers.params.insert(p.key, v);
                             }
                         });
@@ -549,6 +641,12 @@ fn panel_ui(ui: &mut egui::Ui, model: &mut Model, canvas_px: (u32, u32), _frame_
     note(ui, "Keys: ←/→ step m · PgUp/PgDn ±10 · ↑/↓ rows · shift = ×10 · F fit. Drag to pan, wheel to zoom, double-click to fit. Hover a cell to inspect it.");
 }
 
+/// Subscript digits: 7 → ₇.
+fn sub(n: u32) -> String {
+    const SUB: [char; 10] = ['₀', '₁', '₂', '₃', '₄', '₅', '₆', '₇', '₈', '₉'];
+    n.to_string().chars().map(|c| SUB[c as usize - '0' as usize]).collect()
+}
+
 fn first_sentence(s: &str) -> &str {
     match s.find(". ") {
         Some(i) => &s[..i + 1],
@@ -573,22 +671,22 @@ fn group(n: u64) -> String {
 // Canvas interaction and overlays
 // ---------------------------------------------------------------------------------
 
-fn canvas_interaction(ui: &mut egui::Ui, model: &mut Model, response: &egui::Response, rect: Rect, ppp: f32) {
+fn canvas_interaction(ui: &mut egui::Ui, model: &mut Model, response: &egui::Response, rect: Rect, ppp: f32, handle: bool) {
     let cw = (rect.width() * ppp) as f64;
     let ch = (rect.height() * ppp) as f64;
     let to_px = |p: Pos2| ((p.x - rect.min.x) as f64 * ppp as f64, (p.y - rect.min.y) as f64 * ppp as f64);
 
-    if response.dragged_by(egui::PointerButton::Primary) {
+    if handle && response.dragged_by(egui::PointerButton::Primary) {
         let d = response.drag_delta();
         if d != Vec2::ZERO {
             model.view.pan(d.x as f64 * ppp as f64, d.y as f64 * ppp as f64);
             model.auto_fit = false;
         }
     }
-    if response.double_clicked() {
+    if handle && response.double_clicked() {
         model.fit(cw, ch);
     }
-    if response.hovered() {
+    if handle && response.hovered() {
         let (scroll, zoom, pointer) = ui.input(|i| (i.smooth_scroll_delta.y, i.zoom_delta(), i.pointer.hover_pos()));
         if let Some(p) = pointer {
             let (px, py) = to_px(p);
@@ -612,7 +710,7 @@ fn canvas_interaction(ui: &mut egui::Ui, model: &mut Model, response: &egui::Res
     };
 
     // Keyboard, when no text field has focus.
-    if !ui.ctx().egui_wants_keyboard_input() {
+    if handle && !ui.ctx().egui_wants_keyboard_input() {
         let (shift, right, left, pgup, pgdn, up, down, fit) = ui.input(|i| {
             (
                 i.modifiers.shift,
@@ -641,7 +739,7 @@ fn canvas_interaction(ui: &mut egui::Ui, model: &mut Model, response: &egui::Res
     }
 }
 
-fn canvas_overlays(ui: &mut egui::Ui, model: &mut Model, rect: Rect, ppp: f32, gpu_ms: Option<f32>, frame_ms: f32) {
+fn canvas_overlays(ui: &mut egui::Ui, model: &mut Model, rect: Rect, ppp: f32, gpu_ms: Option<f32>, frame_ms: f32, handle: bool) {
     let painter = ui.painter_at(rect);
     let cw = (rect.width() * ppp) as f64;
     let ch = (rect.height() * ppp) as f64;
@@ -688,7 +786,7 @@ fn canvas_overlays(ui: &mut egui::Ui, model: &mut Model, rect: Rect, ppp: f32, g
         painter.rect_stroke(r, 0.0, egui::Stroke::new(3.0, Color32::BLACK), egui::StrokeKind::Outside);
         painter.rect_stroke(r, 0.0, egui::Stroke::new(1.5, Color32::WHITE), egui::StrokeKind::Outside);
         let text = model.inspector_text(n, k);
-        let galley = painter.layout(text, FontId::monospace(12.0), Color32::from_rgb(221, 221, 221), (rect.width() - 16.0).min(400.0));
+        let galley = painter.layout(text, FontId::monospace(12.0), Color32::from_rgb(221, 221, 221), (rect.width() - 16.0).min(520.0));
         let pos = rect.min + Vec2::new(8.0, 8.0);
         let bg = Rect::from_min_size(pos, galley.size() + Vec2::new(18.0, 12.0));
         painter.rect_filled(bg, 0.0, Color32::from_black_alpha(200));
@@ -702,7 +800,7 @@ fn canvas_overlays(ui: &mut egui::Ui, model: &mut Model, rect: Rect, ppp: f32, g
         let w = if action == 2 { 34.0 } else { 24.0 };
         x -= w;
         let r = Rect::from_min_size(Pos2::new(x, rect.min.y + 8.0), Vec2::new(w, btn_h));
-        if ui.put(r, egui::Button::new(label)).clicked() {
+        if ui.put(r, egui::Button::new(label)).clicked() && handle {
             match action {
                 0 => model.view.zoom_at(cw / 2.0, ch / 2.0, 1.0 / 1.4),
                 1 => model.view.zoom_at(cw / 2.0, ch / 2.0, 1.4),
