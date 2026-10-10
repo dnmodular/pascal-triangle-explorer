@@ -37,21 +37,6 @@ const MAX_PASSES: u64 = 512;
 /// Temporal AVERAGE keeps at most this many past frames.
 pub const HIST_CAP: u32 = 64;
 
-// Parameter slots in `Params::iparams`, by key (see layers.rs).
-pub fn param_slot(key: &str) -> Option<u32> {
-    Some(match key {
-        "lucasScale" => 0,
-        "padicDigit" => 1,
-        "densityR" => 2,
-        "avgAmount" => 3,
-        "bandLo" => 4,
-        "bandHi" => 5,
-        "aiStrength" => 6,
-        "aiAttack" => 7,
-        "aiDecay" => 8,
-        _ => return None,
-    })
-}
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
@@ -66,7 +51,7 @@ pub struct GpuFactor {
     pub minus_one: u32,
     pub garner_q: u32,
     pub garner_inv: u32,
-    pub pad0: u32,
+    pub ppow_off: u32,
     pub pad1: u32,
 }
 
@@ -87,8 +72,8 @@ pub struct GpuParams {
     pub sy: f32,
     pub cells_per_px: f32,
     pub rows_per_px: f32,
-    pub pad_a: f32,
-    pub pad_b: f32,
+    pub lnf_off: u32,
+    pub prank_off: u32,
     pub m: u32,
     pub p: u32,
     pub dlog_off: u32,
@@ -99,10 +84,9 @@ pub struct GpuParams {
     pub value_style: u32,
     pub field_active: u32,
     pub field_stride: u32,
-    pub pad_c: u32,
+    pub signed_mask: u32,
     pub pad_d: u32,
-    pub iparams: [[i32; 4]; 4],
-    pub dparams: [[u32; 4]; 4],
+    pub dparams: [[u32; 4]; 8],
     pub factors: [GpuFactor; MAX_FACTORS],
 }
 
@@ -129,6 +113,25 @@ pub struct ModulusGpuData {
     pub nfactors: u32,
     pub tables: Vec<u32>,
     pub dlog_off: u32,
+    pub lnf_off: u32,
+    pub prank_off: u32,
+}
+
+/// `ln(i!)` for `i < LNF_TABLE`, rounded to f32 (shared by the shader and the tests).
+pub const LNF_TABLE: usize = 4096;
+pub fn ln_factorial_table() -> &'static [f32] {
+    static T: std::sync::OnceLock<Vec<f32>> = std::sync::OnceLock::new();
+    T.get_or_init(|| {
+        let mut acc = 0f64;
+        (0..LNF_TABLE)
+            .map(|i| {
+                if i >= 2 {
+                    acc += (i as f64).ln();
+                }
+                acc as f32
+            })
+            .collect()
+    })
 }
 
 impl ModulusGpuData {
@@ -142,6 +145,13 @@ impl ModulusGpuData {
             let tab_off = tables.len() as u32;
             tables.extend(t.fp.iter().map(|&x| conv(x)));
             tables.extend(t.ifp.iter().map(|&x| conv(x)));
+            // p^t mod q for t < e, so the shader never loops to form a power
+            let ppow_off = tables.len() as u32;
+            let mut pw = 1u64;
+            for _ in 0..t.f.e {
+                tables.push(conv(pw as u32));
+                pw = pw * t.f.p as u64 % q as u64;
+            }
             factors[i] = GpuFactor {
                 p: t.f.p,
                 e: t.f.e,
@@ -153,16 +163,23 @@ impl ModulusGpuData {
                 minus_one: t.minus_one as u32,
                 garner_q: t.garner_q,
                 garner_inv: conv(t.garner_inv),
-                pad0: 0,
+                ppow_off,
                 pad1: 0,
             };
         }
         let dlog_off = tables.len() as u32;
         tables.extend_from_slice(&md.dlog);
+        // ln(i!) for i < LNF_TABLE, as f32 bits (MAGNITUDE)
+        let lnf_off = tables.len() as u32;
+        tables.extend(ln_factorial_table().iter().map(|v| v.to_bits()));
+        // 1-based prime index of every residue 0..m (PRIMES)
+        let prank_off = tables.len() as u32;
+        let pt = crate::sweep::prime_tables();
+        tables.extend((0..md.m).map(|v| pt.rank(v)));
         if tables.len() % 4 != 0 {
             tables.resize(tables.len() + 4 - tables.len() % 4, 0);
         }
-        Self { factors, nfactors: md.factors.len() as u32, tables, dlog_off }
+        Self { factors, nfactors: md.factors.len() as u32, tables, dlog_off, lnf_off, prank_off }
     }
 }
 
@@ -232,6 +249,7 @@ pub enum LayoutKind {
     Value,
     Scalar,
     Field,
+    Tween,
 }
 
 /// One shader module exactly as the renderer compiles it, with its entry points.
@@ -252,12 +270,13 @@ pub fn module_sources() -> Vec<ModuleSource> {
         .chain([("reduce_max", LayoutKind::Scalar), ("blur_scalar", LayoutKind::Scalar)])
         .collect();
     let field_entries: Vec<(&'static str, LayoutKind)> =
-        ["blend_main", "blur_field", "temporal_main", "band_diff", "reduce_max_abs", "normalize_signed", "afterimage_main", "resolve_main"].into_iter().map(|e| (e, LayoutKind::Field)).collect();
+        ["blend_main", "blur_field", "temporal_main", "band_diff", "reduce_max_abs", "normalize_signed", "afterimage_main", "tween_capture", "resolve_main"].into_iter().map(|e| (e, LayoutKind::Field)).collect();
     vec![
         ModuleSource { label: "value", source: format!("{COMMON_WGSL}\n{VALUE_WGSL}"), entries: vec![("value_main", LayoutKind::Value)] },
         ModuleSource { label: "measures", source: format!("{COMMON_WGSL}\n{}\n{MEASURES_WGSL}", dslot_constants()), entries: measure_entries },
         ModuleSource { label: "field-math", source: format!("{COMMON_WGSL}\n{}", FIELD_WGSL.replace("{{FIELD_PRELUDE}}", MATH_PRELUDE)), entries: field_entries.clone() },
         ModuleSource { label: "field-palette", source: format!("{COMMON_WGSL}\n{}", FIELD_WGSL.replace("{{FIELD_PRELUDE}}", PALETTE_PRELUDE)), entries: field_entries },
+        ModuleSource { label: "tween", source: TWEEN_WGSL.to_string(), entries: vec![("tween_main", LayoutKind::Tween)] },
     ]
 }
 
@@ -276,9 +295,11 @@ struct Layouts {
     bgl0: wgpu::BindGroupLayout,
     bgl_scalar: wgpu::BindGroupLayout,
     bgl_field: wgpu::BindGroupLayout,
+    bgl_tween: wgpu::BindGroupLayout,
     value: wgpu::PipelineLayout,
     scalar: wgpu::PipelineLayout,
     field: wgpu::PipelineLayout,
+    tween: wgpu::PipelineLayout,
 }
 
 impl Layouts {
@@ -333,10 +354,36 @@ impl Layouts {
                 },
             ],
         });
+        let tex_entry = |binding: u32| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: false }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
+            count: None,
+        };
+        let bgl_tween = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("tween"),
+            entries: &[
+                tex_entry(0),
+                tex_entry(1),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::StorageTexture { access: wgpu::StorageTextureAccess::WriteOnly, format: wgpu::TextureFormat::Rgba8Unorm, view_dimension: wgpu::TextureViewDimension::D2 },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+            ],
+        });
+        let tween = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("tween"), bind_group_layouts: &[Some(&bgl_tween)], immediate_size: 0 });
         let value = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("value"), bind_group_layouts: &[Some(&bgl0)], immediate_size: 0 });
         let scalar = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("scalar"), bind_group_layouts: &[Some(&bgl0), Some(&bgl_scalar)], immediate_size: 0 });
         let field = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("field"), bind_group_layouts: &[Some(&bgl0), Some(&bgl_field)], immediate_size: 0 });
-        Layouts { bgl0, bgl_scalar, bgl_field, value, scalar, field }
+        Layouts { bgl0, bgl_scalar, bgl_field, bgl_tween, value, scalar, field, tween }
     }
 
     fn for_kind(&self, kind: LayoutKind) -> &wgpu::PipelineLayout {
@@ -344,6 +391,7 @@ impl Layouts {
             LayoutKind::Value => &self.value,
             LayoutKind::Scalar => &self.scalar,
             LayoutKind::Field => &self.field,
+            LayoutKind::Tween => &self.tween,
         }
     }
 }
@@ -439,6 +487,7 @@ struct FieldPipes {
     reduce_max_abs: wgpu::ComputePipeline,
     normalize: wgpu::ComputePipeline,
     afterimage: wgpu::ComputePipeline,
+    capture: wgpu::ComputePipeline,
     resolve: wgpu::ComputePipeline,
 }
 
@@ -451,6 +500,67 @@ pub struct FrameInput<'a> {
     /// The frame counts as new for the history-keeping layers (temporal average,
     /// afterimage). False when only the UI repainted.
     pub advance: bool,
+    /// Display-only transition into this frame (see [`Tween`]).
+    pub tween: Tween,
+}
+
+/// A display-only transition between sweep frames. `e` is the eased progress 0..1.
+/// `Start` marks the first frame of a new transition (it snapshots what is on screen);
+/// `Continue` advances it. Exports render with `Off` and always see the true frame.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Tween {
+    Off,
+    Start(f32),
+    Continue(f32),
+}
+
+/// The canvas textures: the true frame the resolve pass writes, the display texture
+/// the window shows (the frame, or a dissolve into it), and the dissolve's snapshot.
+struct Canvas {
+    frame: wgpu::Texture,
+    frame_storage: wgpu::TextureView,
+    frame_load: wgpu::TextureView,
+    display: wgpu::Texture,
+    display_storage: wgpu::TextureView,
+    display_sampled: wgpu::TextureView,
+    snap: wgpu::Texture,
+    snap_load: wgpu::TextureView,
+}
+
+impl Canvas {
+    fn new(device: &wgpu::Device, w: u32, h: u32) -> Canvas {
+        let make = |label: &str, usage: wgpu::TextureUsages| {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d { width: w.max(1), height: h.max(1), depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage,
+                view_formats: &[wgpu::TextureFormat::Rgba8UnormSrgb],
+            })
+        };
+        let view = |t: &wgpu::Texture, format: wgpu::TextureFormat, usage: wgpu::TextureUsages| {
+            t.create_view(&wgpu::TextureViewDescriptor { label: None, format: Some(format), usage: Some(usage), ..Default::default() })
+        };
+        use wgpu::TextureFormat::{Rgba8Unorm, Rgba8UnormSrgb};
+        use wgpu::TextureUsages as U;
+        let frame = make("canvas frame", U::STORAGE_BINDING | U::TEXTURE_BINDING | U::COPY_SRC);
+        let display = make("canvas display", U::STORAGE_BINDING | U::TEXTURE_BINDING | U::COPY_SRC);
+        let snap = make("canvas snapshot", U::TEXTURE_BINDING | U::COPY_DST);
+        Canvas {
+            frame_storage: view(&frame, Rgba8Unorm, U::STORAGE_BINDING),
+            frame_load: view(&frame, Rgba8Unorm, U::TEXTURE_BINDING),
+            display_storage: view(&display, Rgba8Unorm, U::STORAGE_BINDING),
+            // sRGB view so egui (which expects linear samples) shows the stored bytes unchanged
+            display_sampled: view(&display, Rgba8UnormSrgb, U::TEXTURE_BINDING),
+            snap_load: view(&snap, Rgba8Unorm, U::TEXTURE_BINDING),
+            frame,
+            display,
+            snap,
+        }
+    }
 }
 
 struct EncodeOut {
@@ -500,10 +610,20 @@ pub struct Renderer {
     work: [wgpu::Buffer; 4],
     hist_buf: wgpu::Buffer,
     adapt_buf: wgpu::Buffer,
-    out_tex: wgpu::Texture,
-    out_view_storage: wgpu::TextureView,
-    pub out_view_sampled: wgpu::TextureView,
+    canvas: Canvas,
     bg0: wgpu::BindGroup,
+    bgl_tween: wgpu::BindGroupLayout,
+    pipe_tween: wgpu::ComputePipeline,
+    tween_buf: wgpu::Buffer,
+    /// The field shown at the start of a morph (`tween_capture` writes it).
+    tween_prev: wgpu::Buffer,
+    morphing: bool,
+    dissolving: bool,
+    frame_morph: Option<f32>,
+    canvas_fresh: bool,
+    last_e: f32,
+    /// Grid and field variant of the last frame that ran the field pipeline.
+    last_field: Option<(GridSpec, usize)>,
 
     grid: Option<GridSpec>,
     stride: u32,
@@ -585,6 +705,7 @@ pub const COMMON_WGSL: &str = include_str!("../shaders/common.wgsl");
 pub const VALUE_WGSL: &str = include_str!("../shaders/value.wgsl");
 pub const MEASURES_WGSL: &str = include_str!("../shaders/measures.wgsl");
 pub const FIELD_WGSL: &str = include_str!("../shaders/field.wgsl");
+pub const TWEEN_WGSL: &str = include_str!("../shaders/tween.wgsl");
 
 fn round_up(x: u64, to: u64) -> u64 {
     (x + to - 1) / to * to
@@ -627,9 +748,11 @@ impl Renderer {
             reduce_max_abs: take(&mut pipes, m, "reduce_max_abs"),
             normalize: take(&mut pipes, m, "normalize_signed"),
             afterimage: take(&mut pipes, m, "afterimage_main"),
+            capture: take(&mut pipes, m, "tween_capture"),
             resolve: take(&mut pipes, m, "resolve_main"),
         });
-        let Layouts { bgl0, bgl_scalar, bgl_field, .. } = layouts;
+        let pipe_tween = take(&mut pipes, "tween", "tween_main");
+        let Layouts { bgl0, bgl_scalar, bgl_field, bgl_tween, .. } = layouts;
 
         let params_buf = buffer(&device, "params", std::mem::size_of::<GpuParams>() as u64, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST);
         let pass_buf = buffer(&device, "pass params", PASS_STRIDE * MAX_PASSES, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST);
@@ -648,7 +771,9 @@ impl Renderer {
         ];
         let hist_buf = buffer(&device, "history", 1024, STORAGE_RW);
         let adapt_buf = buffer(&device, "adapt", 1024, STORAGE_RW);
-        let (out_tex, out_view_storage, out_view_sampled) = Self::make_out_tex(&device, 16, 16);
+        let canvas = Canvas::new(&device, 16, 16);
+        let tween_buf = buffer(&device, "tween", 16, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST);
+        let tween_prev = buffer(&device, "tween prev", 1024, STORAGE_RW);
         let bg0 = Self::make_bg0(&device, &bgl0, &params_buf, &tables_buf, &levels_buf, &palette_buf, &cells_buf, &maxbuf);
 
         Renderer {
@@ -674,10 +799,18 @@ impl Renderer {
             work,
             hist_buf,
             adapt_buf,
-            out_tex,
-            out_view_storage,
-            out_view_sampled,
+            canvas,
             bg0,
+            bgl_tween,
+            pipe_tween,
+            tween_buf,
+            tween_prev,
+            morphing: false,
+            dissolving: false,
+            frame_morph: None,
+            canvas_fresh: true,
+            last_e: 1.0,
+            last_field: None,
             grid: None,
             stride: 0,
             work_elem: 4,
@@ -729,40 +862,16 @@ impl Renderer {
 
     /// Size the canvas texture before the UI references it (also done by `render`).
     pub fn ensure_canvas(&mut self, w: u32, h: u32) {
-        if self.out_tex.width() != w.max(1) || self.out_tex.height() != h.max(1) {
-            let (t, s, v) = Self::make_out_tex(&self.device, w, h);
-            self.out_tex = t;
-            self.out_view_storage = s;
-            self.out_view_sampled = v;
+        if self.canvas.frame.width() != w.max(1) || self.canvas.frame.height() != h.max(1) {
+            self.canvas = Canvas::new(&self.device, w, h);
+            self.dissolving = false;
+            self.canvas_fresh = true;
         }
     }
 
-    fn make_out_tex(device: &wgpu::Device, w: u32, h: u32) -> (wgpu::Texture, wgpu::TextureView, wgpu::TextureView) {
-        let tex = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("canvas"),
-            size: wgpu::Extent3d { width: w.max(1), height: h.max(1), depth_or_array_layers: 1 },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[wgpu::TextureFormat::Rgba8UnormSrgb],
-        });
-        let storage = tex.create_view(&wgpu::TextureViewDescriptor {
-            label: Some("canvas storage"),
-            format: Some(wgpu::TextureFormat::Rgba8Unorm),
-            usage: Some(wgpu::TextureUsages::STORAGE_BINDING),
-            ..Default::default()
-        });
-        // The sampled view is sRGB so that egui (which expects linear samples) shows the
-        // stored bytes unchanged.
-        let sampled = tex.create_view(&wgpu::TextureViewDescriptor {
-            label: Some("canvas sampled"),
-            format: Some(wgpu::TextureFormat::Rgba8UnormSrgb),
-            usage: Some(wgpu::TextureUsages::TEXTURE_BINDING),
-            ..Default::default()
-        });
-        (tex, storage, sampled)
+    /// The view egui samples: the display texture (true frame, or a tween of it).
+    pub fn display_view(&self) -> &wgpu::TextureView {
+        &self.canvas.display_sampled
     }
 
     fn make_bg0(
@@ -803,12 +912,12 @@ impl Renderer {
     }
 
     pub fn canvas_size(&self) -> (u32, u32) {
-        (self.out_tex.width(), self.out_tex.height())
+        (self.canvas.frame.width(), self.canvas.frame.height())
     }
 
-    /// The texture egui draws (sRGB view). Changes when the canvas is resized.
+    /// The true-frame texture (exports read this). Changes when the canvas is resized.
     pub fn output_texture(&self) -> &wgpu::Texture {
-        &self.out_tex
+        &self.canvas.frame
     }
 
     fn ensure_grid(&mut self, grid: &GridSpec, work_elem: u64) {
@@ -828,6 +937,8 @@ impl Renderer {
             let wbytes = stride as u64 * work_elem;
             self.work = [buffer(d, "work0", wbytes, STORAGE_RW), buffer(d, "work1", wbytes, STORAGE_RW), buffer(d, "work2", wbytes, STORAGE_RW), buffer(d, "work3", wbytes, STORAGE_RW)];
             self.adapt_buf = buffer(d, "adapt", wbytes, STORAGE_RW);
+            self.tween_prev = buffer(d, "tween prev", wbytes, STORAGE_RW);
+            self.morphing = false;
             // History: as many frames as fit in a quarter of the binding limit, at most HIST_CAP.
             let limit = self.device.limits().max_storage_buffer_binding_size as u64 / 4;
             self.hist_cap = ((limit / wbytes.max(1)) as u32).clamp(2, HIST_CAP);
@@ -933,7 +1044,7 @@ impl Renderer {
                     binding: 4,
                     resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding { buffer: &self.pass_buf, offset: 0, size: NonZeroU64::new(std::mem::size_of::<PassParams>() as u64) }),
                 },
-                wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&self.out_view_storage) },
+                wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&self.canvas.frame_storage) },
             ],
         });
         let g = self.grid.unwrap();
@@ -981,6 +1092,8 @@ impl Renderer {
             m: input.modulus.m,
             p: input.modulus.p,
             dlog_off: md.dlog_off,
+            lnf_off: md.lnf_off,
+            prank_off: md.prank_off,
             blend_mode: input.layers.blend.code(),
             color_mode: variant as u32,
             wants_value: plan.wants_value as u32,
@@ -992,11 +1105,6 @@ impl Renderer {
             ..Default::default()
         };
         for d in crate::layers::REGISTRY {
-            for p in d.params {
-                if let Some(slot) = param_slot(p.key) {
-                    params.iparams[(slot / 4) as usize][(slot % 4) as usize] = input.layers.param(p.key);
-                }
-            }
             if let Some(derive) = d.derive {
                 params.dparams[d.dslot as usize] = derive(input.layers, input.modulus);
             }
@@ -1005,8 +1113,55 @@ impl Renderer {
         self.queue.write_buffer(&self.maxbuf, 0, &[0u8; (MAXBUF_LEN * 4) as usize]);
         self.last_n_measures = n_measures;
 
+        // Display-only tween: decide morph (field lerp in the resolve pass) or dissolve
+        // (color mix in the tween pass). Neither touches the true frame's inputs.
+        let same_field = plan.field_active && self.last_field == Some((input.grid, variant));
+        let mut capture: Option<f32> = None;
+        let e = match input.tween {
+            Tween::Off => {
+                self.morphing = false;
+                self.dissolving = false;
+                1.0
+            }
+            Tween::Start(e) => {
+                if same_field {
+                    capture = Some(if self.morphing { self.last_e } else { 1.0 });
+                    self.morphing = true;
+                    self.dissolving = false;
+                } else {
+                    self.morphing = false;
+                    self.dissolving = !self.canvas_fresh;
+                    if self.dissolving {
+                        let c = &self.canvas;
+                        enc.copy_texture_to_texture(c.display.as_image_copy(), c.snap.as_image_copy(), c.display.size());
+                    }
+                }
+                e
+            }
+            Tween::Continue(e) => {
+                if self.morphing && !same_field {
+                    self.morphing = false; // the view or pipeline changed under the morph: cut
+                }
+                e
+            }
+        };
+        let e = e.clamp(0.0, 1.0);
+        self.frame_morph = if self.morphing { Some(e) } else { None };
+        let dissolve_e: f32 = if self.dissolving { e } else { 1.0 };
+        self.queue.write_buffer(&self.tween_buf, 0, bytemuck::cast_slice(&[dissolve_e, 0.0, 0.0, 0.0]));
+
         let mut passes = Vec::new();
+        if let Some(prev_e) = capture {
+            // what was on screen: mix(previous start, previous true field, previous e)
+            let fp = &self.field_pipes[variant];
+            let fields = Bind { buf: &self.fields_buf, offset: 0, size: self.stride as u64 * 4 };
+            self.dispatch_field(enc, &mut passes, &fp.capture, Bind::whole(&self.work[self.last_cur]), Bind::whole(&self.tween_prev), Bind::whole(&self.tween_prev), fields, PassParams { f0: prev_e, ..Default::default() }, false);
+        }
         let out = self.encode(enc, input, &plan, variant, n_measures, &mut passes);
+        self.encode_tween(enc);
+        self.last_e = e;
+        self.last_field = if plan.field_active { Some((input.grid, variant)) } else { None };
+        self.canvas_fresh = false;
         self.pass_params = passes;
         self.last_cur = out.cur;
         if out.adapt_stepped {
@@ -1170,10 +1325,34 @@ impl Renderer {
         out
     }
 
+    fn encode_tween(&self, enc: &mut wgpu::CommandEncoder) {
+        let c = &self.canvas;
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("tween"),
+            layout: &self.bgl_tween,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&c.frame_load) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&c.snap_load) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&c.display_storage) },
+                wgpu::BindGroupEntry { binding: 3, resource: self.tween_buf.as_entire_binding() },
+            ],
+        });
+        let (gx, gy) = Self::groups(c.frame.width(), c.frame.height());
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("tween"), timestamp_writes: None });
+        pass.set_pipeline(&self.pipe_tween);
+        pass.set_bind_group(0, &bg, &[]);
+        pass.dispatch_workgroups(gx, gy, 1);
+    }
+
     fn resolve(&self, enc: &mut wgpu::CommandEncoder, passes: &mut Vec<PassParams>, variant: usize, cur: Bind<'_>) {
         let resolve = &self.field_pipes[variant].resolve;
         let fields = Bind { buf: &self.fields_buf, offset: 0, size: self.stride as u64 * 4 };
-        self.dispatch_field(enc, passes, resolve, cur, cur, cur, fields, PassParams::default(), true);
+        // morph: the resolve pass paints mix(start field, true field, e); the start field is in tween_prev
+        let (prev, pp) = match self.frame_morph {
+            Some(e) => (Bind::whole(&self.tween_prev), PassParams { flag: 1, f0: e, ..Default::default() }),
+            None => (cur, PassParams::default()),
+        };
+        self.dispatch_field(enc, passes, resolve, cur, cur, prev, fields, pp, true);
         if let Some(t) = self.timing.as_ref().filter(|t| t.pending.is_none()) {
             // Close the timing span with an empty pass, then resolve the two stamps.
             {
@@ -1267,14 +1446,24 @@ impl Renderer {
         bytemuck::cast_slice::<u8, f32>(&bytes).to_vec()
     }
 
-    /// The canvas as tightly packed RGBA8.
+    /// The last rendered frame as tightly packed RGBA8. It is the true frame whenever
+    /// that render used `Tween::Off` (exports always do); a morph paints into it.
     pub fn read_output_rgba(&self) -> (u32, u32, Vec<u8>) {
-        let (w, h) = self.canvas_size();
+        self.read_texture_rgba(&self.canvas.frame)
+    }
+
+    /// What the window shows (the frame, or a tween into it).
+    pub fn read_display_rgba(&self) -> (u32, u32, Vec<u8>) {
+        self.read_texture_rgba(&self.canvas.display)
+    }
+
+    fn read_texture_rgba(&self, tex: &wgpu::Texture) -> (u32, u32, Vec<u8>) {
+        let (w, h) = (tex.width(), tex.height());
         let bpr = round_up(w as u64 * 4, wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as u64);
         let staging = buffer(&self.device, "staging tex", bpr * h as u64, wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST);
         let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("readback tex") });
         enc.copy_texture_to_buffer(
-            self.out_tex.as_image_copy(),
+            tex.as_image_copy(),
             wgpu::TexelCopyBufferInfo { buffer: &staging, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(bpr as u32), rows_per_image: None } },
             wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
         );

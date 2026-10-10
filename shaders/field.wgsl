@@ -24,6 +24,10 @@ struct PassParams {
   stride: u32,
 };
 
+const MAX_MEASURE_SLOTS: u32 = 8u;
+const HIST_CAP: u32 = 64u;
+const MAX_SS: u32 = 4u;
+
 {{FIELD_PRELUDE}}
 
 @group(1) @binding(0) var<storage, read_write> fa: array<FT>;      // source / current
@@ -71,10 +75,13 @@ fn blend_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let mode = P.blend_mode;
     var acc = select(0.0, 1.0, mode == 1u);
     var nl = 0.0;
-    for (var s = 0u; s < nm; s = s + 1u) {
+    for (var s = 0u; s < MAX_MEASURE_SLOTS; s = s + 1u) {
+      if (s >= nm) { break; }
       let mx = bitcast<f32>(atomicLoad(&maxbuf[s]));
       let inv = select(1.0 / mx, 1.0, mx == 0.0);
-      let v = fields[s * P.field_stride + idx] * inv;
+      let raw = fields[s * P.field_stride + idx] * inv;
+      // signed measures are centered on 0.5, as in the reference's buildCombinedField
+      let v = select(raw, 0.5 + 0.5 * clamp(raw, -1.0, 1.0), ((P.signed_mask >> s) & 1u) == 1u);
       acc = fold(acc, v, mode);
       nl = nl + 1.0;
     }
@@ -120,7 +127,8 @@ fn temporal_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (gid.x >= P.grid_w || gid.y >= P.grid_h) { return; }
   let idx = gid.y * P.grid_w + gid.x;
   var s = fa[idx];
-  for (var t = 0u; t < PP.hist_len; t = t + 1u) {
+  for (var t = 0u; t < HIST_CAP; t = t + 1u) {
+    if (t >= PP.hist_len) { break; }
     let f = (PP.hist_start + t) % PP.hist_cap;
     s = s + fc[f * PP.stride + idx];
   }
@@ -194,16 +202,30 @@ fn afterimage_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 // ---------------------------------------------------------------------------
+// tween_capture: at the start of a morph, fb = what was on screen
+//   mix(fb (start of the previous morph), fa (previous true field), PP.f0)
+// PP.f0 = 1 when no morph was running, which copies the previous true field.
+// ---------------------------------------------------------------------------
+@compute @workgroup_size(16, 16)
+fn tween_capture(@builtin(global_invocation_id) gid: vec3<u32>) {
+  if (gid.x >= P.grid_w || gid.y >= P.grid_h) { return; }
+  let idx = gid.y * P.grid_w + gid.x;
+  fb[idx] = select(mix(fb[idx], fa[idx], PP.f0), fa[idx], PP.f0 >= 1.0);
+}
+
+// ---------------------------------------------------------------------------
 // resolve: canvas pixels → colors. ss × ss sub-samples per pixel, each mapped to
 // its grid texel; the same shader serves the live view and the export.
 // ---------------------------------------------------------------------------
 @compute @workgroup_size(16, 16)
 fn resolve_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (gid.x >= P.canvas_w || gid.y >= P.canvas_h) { return; }
-  let ss = max(P.ss, 1u);
+  let ss = clamp(P.ss, 1u, MAX_SS);
   var sum = vec3<f32>(0.0);
-  for (var a = 0u; a < ss; a = a + 1u) {
-    for (var b = 0u; b < ss; b = b + 1u) {
+  for (var a = 0u; a < MAX_SS; a = a + 1u) {
+    if (a >= ss) { break; }
+    for (var b = 0u; b < MAX_SS; b = b + 1u) {
+      if (b >= ss) { break; }
       let px = f32(gid.x) + (f32(a) + 0.5) / f32(ss);
       let py = f32(gid.y) + (f32(b) + 0.5) / f32(ss);
       sum = sum + sample_color(px, py);
@@ -218,7 +240,12 @@ fn sample_color(px: f32, py: f32) -> vec3<f32> {
   let idx = u32(t.y) * P.grid_w + u32(t.x);
   let c = cells[idx];
   if (!cell_valid(c)) { return BG_COLOR; }
-  if (P.field_active == 1u) { return ft_resolve_color(fa[idx]); }
+  if (P.field_active == 1u) {
+    // display-only morph (PP.flag bit 0): fc holds the field shown when it began
+    var f = fa[idx];
+    if ((PP.flag & 1u) != 0u) { f = mix(fc[idx], fa[idx], PP.f0); }
+    return ft_resolve_color(f);
+  }
   if (P.value_style == 1u) { return select(BG_COLOR, LIGHT_COLOR, c.x != 0u); }
   return unpack_rgb(palette[level_of(c.x)]);
 }

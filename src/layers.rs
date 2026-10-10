@@ -425,7 +425,7 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), dslots.len(), "derived slots are unique");
-        assert!(dslots.iter().all(|&d| d < 4));
+        assert!(dslots.iter().all(|&d| d < 8));
     }
 
     #[test]

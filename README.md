@@ -85,8 +85,9 @@ driver works: `sudo apt install mesa-vulkan-drivers` (lavapipe) and run
 | drag | pan |
 | wheel / pinch | zoom, centered on the cursor |
 | double-click, **F** | fit the chosen number of rows |
-| **← / →** | modulus −1 / +1 |
-| **PgDn / PgUp** | modulus −10 / +10 |
+| **space** | play / pause the sweep |
+| **← / →** | one step back / forward through the sweep's selection mode |
+| **PgDn / PgUp** | ten steps back / forward |
 | **↑ / ↓** | rows to fit +1 / −1, then fit |
 | **Shift** | ×10 for any of the above |
 | hover | inspector: *n*, *k*, `C(n,k)`, `C mod m`, ν_p for each prime factor, the Lucas digit product |
@@ -95,6 +96,26 @@ The panel on the left has the modulus (text, ◀ ▶, log slider), the rows to f
 supersampling, the palette, the three color presets (residue → palette,
 zero/nonzero mask, p-adic valuation heatmap), the layer stack and PNG export.
 When cells are at least 18 px wide their residue is printed inside them.
+
+## Sweep
+
+The SWEEP section plays the modulus through a range, ported from the reference's
+MODULUS SWEEP group (`playBounds`, `nextModInDir`, `buildSeqMods`):
+
+* **Transport:** jump to the range start, play reverse, play / pause, play forward,
+  step back and forward one frame. Steps and typed or slider values always snap to
+  the active selection mode.
+* **Selection modes:** all, primes (in order, grouped by p mod 4, or only one class),
+  composites, even, odd, and interval sequences starting at the range start: fixed
+  step, π digits, Fibonacci, primes, squares, powers of 2, 2×Pn, 3×Pn, primes + 2×Pn,
+  semiprimes, primes + semiprimes, sphenic numbers.
+* **Range, frame speed (ms) and loop:** looping wraps at the range ends; with loop
+  off, playback stops on the last frame.
+* **Tween (ms):** a display-only transition. When consecutive frames run the same
+  field pipeline on the same view, the field morphs (smoothstep lerp, as in the
+  reference); otherwise the picture cross-dissolves. The resolve pass still writes
+  the true frame, layer history (temporal AVERAGE, AFTERIMAGE) only sees true
+  frames, and PNG export re-renders the true frame first.
 
 ## The math
 

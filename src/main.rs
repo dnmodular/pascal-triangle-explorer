@@ -8,10 +8,11 @@ use std::time::Instant;
 
 use egui::{Align2, Color32, FontId, Pos2, Rect, Sense, Vec2};
 use pascal::export;
-use pascal::gpu::{FrameInput, Gpu, Renderer};
+use pascal::gpu::{FrameInput, Gpu, Renderer, Tween};
 use pascal::layers::{AvgMode, BlendMode, FieldColorMode, Kind, LayerId, LayerState, Preset, REGISTRY};
 use pascal::math::{self, Modulus, MOD_CAP};
 use pascal::palette::{Palette, Scheme};
+use pascal::sweep::{ModMode, PrimeOrder, Seq, Sweep};
 use pascal::view::{GridSpec, View, ROW_H, STATUS_H};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
@@ -41,6 +42,9 @@ struct Model {
     export_note: String,
     pending_export: bool,
     hover: Option<(u32, u32)>,
+    sweep: Sweep,
+    /// When the play timer last advanced the modulus.
+    last_step: Option<Instant>,
 }
 
 impl Model {
@@ -62,6 +66,8 @@ impl Model {
             export_note: String::new(),
             pending_export: false,
             hover: None,
+            sweep: Sweep::default(),
+            last_step: None,
         }
     }
 
@@ -72,6 +78,36 @@ impl Model {
             self.modulus = Modulus::new(m);
         }
         self.m_text = m.to_string();
+    }
+
+    /// Go to `m` snapped to the active selection mode (typed value, slider).
+    fn goto(&mut self, m: i64) {
+        let v = self.sweep.snap(m);
+        self.set_m(v);
+    }
+
+    /// `n` steps through the active selection mode (sign = direction); stops playback.
+    fn step(&mut self, n: i32) {
+        self.sweep.playing = false;
+        let v = self.sweep.step_by(self.m, n);
+        self.set_m(v);
+    }
+
+    /// Advance the play timer; true when the modulus moved.
+    fn play_tick(&mut self, now: Instant) -> bool {
+        if !self.sweep.playing {
+            self.last_step = None;
+            return false;
+        }
+        let due = self.last_step.map(|t| now.duration_since(t).as_millis() as u32 >= self.sweep.speed_ms).unwrap_or(true);
+        if !due {
+            return false;
+        }
+        self.last_step = Some(now);
+        let v = self.sweep.tick(self.m);
+        let moved = v != self.m;
+        self.set_m(v);
+        moved
     }
 
     fn set_scheme(&mut self, s: Scheme) {
@@ -147,6 +183,9 @@ struct App {
     frame_nr: u64,
     surface_errors: u32,
     fatal: bool,
+    /// Modulus of the last rendered frame, and when the running tween began.
+    last_m: u32,
+    tween_t0: Option<Instant>,
 }
 
 const USAGE: &str = "pascal-triangle-explorer [options]
@@ -226,7 +265,7 @@ fn main() {
     }
     let event_loop = EventLoop::new().expect("event loop");
     event_loop.set_control_flow(ControlFlow::Wait);
-    let mut app = App { gfx: None, model, last_inputs: None, frame_ms: 0.0, frame_nr: 0, surface_errors: 0, fatal: false };
+    let mut app = App { gfx: None, model, last_inputs: None, frame_ms: 0.0, frame_nr: 0, surface_errors: 0, fatal: false, last_m: 0, tween_t0: None };
     event_loop.run_app(&mut app).expect("run");
 }
 
@@ -293,7 +332,7 @@ fn headless_export(mut model: Model, size: (u32, u32), path: &std::path::Path) {
     let mut renderer = Renderer::new(gpu.device.clone(), gpu.queue.clone());
     model.fit(size.0 as f64, size.1 as f64);
     let grid = GridSpec::new(&model.view, size.0, size.1, model.ss, renderer.max_texels());
-    renderer.render_blocking(&FrameInput { grid, modulus: &model.modulus, palette: &model.palette, layers: &model.layers, advance: true });
+    renderer.render_blocking(&FrameInput { grid, modulus: &model.modulus, palette: &model.palette, layers: &model.layers, advance: true, tween: Tween::Off });
     let (w, h, rgba) = renderer.read_output_rgba();
     match export::write_png(path, w, h, &rgba) {
         Ok(()) => eprintln!("wrote {}×{} px to {}", w, h, path.display()),
@@ -396,6 +435,7 @@ impl App {
         let ppp = egui_winit::pixels_per_point(&gfx.egui_ctx, &gfx.window);
         let raw_input = gfx.egui_state.take_egui_input(&gfx.window);
         let gpu_ms = gfx.renderer.gpu_ms();
+        self.model.play_tick(Instant::now());
         let mut canvas_px = (gfx.config.width.saturating_sub((PANEL_W * ppp) as u32).max(1), gfx.config.height.max(1));
         let model = &mut self.model;
         let frame_ms = self.frame_ms;
@@ -432,11 +472,11 @@ impl App {
                 let id = match *canvas_tex {
                     Some(id) if !needs_tex_update => id,
                     Some(id) => {
-                        egui_renderer.update_egui_texture_from_wgpu_texture(&gpu.device, &renderer.out_view_sampled, wgpu::FilterMode::Nearest, id);
+                        egui_renderer.update_egui_texture_from_wgpu_texture(&gpu.device, renderer.display_view(), wgpu::FilterMode::Nearest, id);
                         id
                     }
                     None => {
-                        let id = egui_renderer.register_native_texture(&gpu.device, &renderer.out_view_sampled, wgpu::FilterMode::Nearest);
+                        let id = egui_renderer.register_native_texture(&gpu.device, renderer.display_view(), wgpu::FilterMode::Nearest);
                         *canvas_tex = Some(id);
                         id
                     }
@@ -457,8 +497,26 @@ impl App {
         let inputs = (model.m, model.scheme, model.layers.clone(), model.view, model.ss, canvas_px);
         let advance = self.last_inputs.as_ref() != Some(&inputs);
         self.last_inputs = Some(inputs);
+        // Display-only tween between moduli (smoothstep over tween_ms, as in the reference).
+        let now = Instant::now();
+        let tween = if model.sweep.tween_ms == 0 {
+            self.tween_t0 = None;
+            Tween::Off
+        } else if model.m != self.last_m && self.last_m != 0 {
+            self.tween_t0 = Some(now);
+            Tween::Start(0.0)
+        } else if let Some(t0) = self.tween_t0 {
+            let t = (now.duration_since(t0).as_secs_f32() * 1000.0 / model.sweep.tween_ms as f32).min(1.0);
+            if t >= 1.0 {
+                self.tween_t0 = None;
+            }
+            Tween::Continue(t * t * (3.0 - 2.0 * t))
+        } else {
+            Tween::Off
+        };
+        self.last_m = model.m;
         let mut encoder = gfx.gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
-        gfx.renderer.render(&mut encoder, &FrameInput { grid, modulus: &model.modulus, palette: &model.palette, layers: &model.layers, advance });
+        gfx.renderer.render(&mut encoder, &FrameInput { grid, modulus: &model.modulus, palette: &model.palette, layers: &model.layers, advance, tween });
         gfx.renderer.flush_pass_params();
 
         // ---- egui paint ----
@@ -500,6 +558,9 @@ impl App {
 
         if model.pending_export {
             model.pending_export = false;
+            // Render the true frame (no tween) with the same pipeline, then read it back.
+            gfx.renderer.render_blocking(&FrameInput { grid, modulus: &model.modulus, palette: &model.palette, layers: &model.layers, advance: false, tween: Tween::Off });
+            self.tween_t0 = None;
             let (w, h, rgba) = gfx.renderer.read_output_rgba();
             let rows = model.view.visible_rows(h as f64).unwrap_or((0, 0));
             let dir = PathBuf::from(model.export_dir.trim());
@@ -513,7 +574,7 @@ impl App {
 
         self.frame_ms = t0.elapsed().as_secs_f32() * 1000.0;
         let repaint = viewport_output.get(&egui::ViewportId::ROOT).map(|v| v.repaint_delay.is_zero()).unwrap_or(false);
-        if repaint {
+        if repaint || model.sweep.playing || self.tween_t0.is_some() {
             gfx.window.request_redraw();
         }
     }
@@ -571,22 +632,26 @@ fn panel_ui(ui: &mut egui::Ui, model: &mut Model, canvas_px: (u32, u32), _frame_
             ui.label(egui::RichText::new("m").color(ui.visuals().weak_text_color()));
             let resp = ui.add(egui::TextEdit::singleline(&mut model.m_text).font(FontId::monospace(12.0)).desired_width(90.0));
             if resp.lost_focus() || (resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
-                match model.m_text.trim().parse::<u32>() {
-                    Ok(v) => model.set_m(v),
+                match model.m_text.trim().parse::<i64>() {
+                    Ok(v) => model.goto(v),
                     Err(_) => model.m_text = model.m.to_string(),
                 }
             }
-            if ui.add(egui::Button::new("◀").small()).on_hover_text("One step down (←)").clicked() {
-                model.set_m(model.m.saturating_sub(1));
+            if ui.add(egui::Button::new("◀").small()).on_hover_text("One step back in the selection mode (←)").clicked() {
+                model.step(-1);
             }
-            if ui.add(egui::Button::new("▶").small()).on_hover_text("One step up (→)").clicked() {
-                model.set_m(model.m + 1);
+            if ui.add(egui::Button::new("▶").small()).on_hover_text("One step forward in the selection mode (→)").clicked() {
+                model.step(1);
             }
         });
         let mut m = model.m;
         ui.spacing_mut().slider_width = ui.available_width() - 8.0;
-        if ui.add(egui::Slider::new(&mut m, 2..=MOD_CAP).logarithmic(true).show_value(false)).changed() {
-            model.set_m(m);
+        let slider = ui.add(egui::Slider::new(&mut m, 2..=MOD_CAP).logarithmic(true).show_value(false));
+        if slider.drag_started() {
+            model.sweep.playing = false;
+        }
+        if slider.changed() {
+            model.goto(m as i64);
         }
         let fs = &model.modulus.factors.iter().map(|t| t.f).collect::<Vec<_>>();
         let info = if model.modulus.is_prime() { format!("{} is prime", model.m) } else { format!("{} = {}", model.m, math::factor_string(fs)) };
@@ -595,6 +660,8 @@ fn panel_ui(ui: &mut egui::Ui, model: &mut Model, canvas_px: (u32, u32), _frame_
             note(ui, "Zeros are where every prime-power factor divides C(n,k); the CRT layer shows which ones do.");
         }
     });
+
+    section(ui, "Sweep", |ui| sweep_ui(ui, model));
 
     section(ui, "View", |ui| {
         ui.horizontal(|ui| {
@@ -733,13 +800,143 @@ fn panel_ui(ui: &mut egui::Ui, model: &mut Model, canvas_px: (u32, u32), _frame_
     });
 
     ui.separator();
-    note(ui, "Keys: ←/→ step m · PgUp/PgDn ±10 · ↑/↓ rows · shift = ×10 · F fit. Drag to pan, wheel to zoom, double-click to fit. Hover a cell to inspect it.");
+    note(ui, "Keys: space play/pause · ←/→ step · PgUp/PgDn ±10 steps · ↑/↓ rows · shift = ×10 · F fit. Drag to pan, wheel to zoom, double-click to fit. Hover a cell to inspect it.");
 }
 
 /// Subscript digits: 7 → ₇.
 fn sub(n: u32) -> String {
     const SUB: [char; 10] = ['₀', '₁', '₂', '₃', '₄', '₅', '₆', '₇', '₈', '₉'];
     n.to_string().chars().map(|c| SUB[c as usize - '0' as usize]).collect()
+}
+
+fn small_button(ui: &mut egui::Ui, label: &str, selected: bool, tip: &str) -> bool {
+    ui.add(egui::Button::new(egui::RichText::new(label).font(FontId::monospace(12.0))).selected(selected).min_size(Vec2::new(30.0, 0.0))).on_hover_text(tip).clicked()
+}
+
+fn sweep_ui(ui: &mut egui::Ui, model: &mut Model) {
+    let weak = ui.visuals().weak_text_color();
+    let sw = &mut model.sweep;
+    // transport
+    let mut action: Option<i32> = None; // Some(n) = step n frames
+    ui.horizontal(|ui| {
+        if small_button(ui, "⇤", false, "Jump to the range start") {
+            sw.playing = false;
+            action = Some(0);
+        }
+        if small_button(ui, "◀◀", sw.playing && sw.dir < 0, "Play in reverse") {
+            sw.dir = -1;
+            sw.playing = true;
+        }
+        let label = if sw.playing { "❚❚" } else { "▶" };
+        if small_button(ui, label, false, "Play / pause (space)") {
+            sw.playing = !sw.playing;
+        }
+        if small_button(ui, "▶▶", sw.playing && sw.dir > 0, "Play forward") {
+            sw.dir = 1;
+            sw.playing = true;
+        }
+        if small_button(ui, "◀|", false, "Step back one frame (←)") {
+            action = Some(-1);
+        }
+        if small_button(ui, "|▶", false, "Step forward one frame (→)") {
+            action = Some(1);
+        }
+    });
+    // selection mode
+    let before = (sw.mode, sw.prime_order, sw.seq, sw.step, sw.start);
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("visit").color(weak));
+        egui::ComboBox::from_id_salt("modmode").selected_text(sw.mode.label()).show_ui(ui, |ui| {
+            for m in ModMode::ALL {
+                ui.selectable_value(&mut sw.mode, m, m.label());
+            }
+        });
+    });
+    note(ui, sw.mode.note());
+    if sw.mode == ModMode::Prime {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("order").color(weak));
+            egui::ComboBox::from_id_salt("primeorder").width(150.0).selected_text(sw.prime_order.label()).show_ui(ui, |ui| {
+                for o in PrimeOrder::ALL {
+                    ui.selectable_value(&mut sw.prime_order, o, o.label());
+                }
+            });
+        });
+    }
+    if sw.mode == ModMode::Interval {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("sequence").color(weak));
+            let prev = sw.seq;
+            egui::ComboBox::from_id_salt("seq").width(150.0).selected_text(sw.seq.label()).show_ui(ui, |ui| {
+                for q in Seq::ALL {
+                    ui.selectable_value(&mut sw.seq, q, q.label());
+                }
+            });
+            // as in the reference, the 2×Pn and 3×Pn walks start on their first term
+            if sw.seq != prev {
+                match sw.seq {
+                    Seq::Semi2p => sw.start = 4,
+                    Seq::Semi3p => sw.start = 6,
+                    _ => {}
+                }
+            }
+        });
+        if sw.seq == Seq::Fixed {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("step").color(weak));
+                mono_drag(ui, &mut sw.step, 1..=10000u32, 0.2);
+            });
+        }
+        note(ui, if sw.seq == Seq::Fixed {
+            "Constant step from the range start."
+        } else if sw.seq.absolute() {
+            "Lands directly on the sequence's values at or above the range start."
+        } else {
+            "Increments follow the sequence from the range start; zero increments are skipped."
+        });
+    }
+    // range
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("range").color(weak));
+        mono_drag(ui, &mut sw.start, 2..=MOD_CAP, 1.0);
+        ui.label(egui::RichText::new("to").color(weak));
+        mono_drag(ui, &mut sw.end, 2..=MOD_CAP, 1.0);
+    });
+    let preview = sw.preview(8);
+    let frames = sw.frames_in_range(100_000);
+    let mut pv: Vec<String> = preview.iter().map(|v| v.to_string()).collect();
+    if preview.len() >= 8 {
+        pv.push("…".into());
+    }
+    mono_note(ui, &format!("{} · {} frame{} in range", pv.join(", "), group(frames as u64), if frames == 1 { "" } else { "s" }));
+    // speed, loop, tween
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("frame").color(weak));
+        ui.spacing_mut().slider_width = 130.0;
+        ui.add(egui::Slider::new(&mut sw.speed_ms, 16..=1000).show_value(false));
+        ui.label(egui::RichText::new(format!("{} ms", sw.speed_ms)).font(FontId::monospace(12.0)));
+    });
+    ui.checkbox(&mut sw.looping, "loop at range ends");
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("tween").color(weak));
+        mono_drag(ui, &mut sw.tween_ms, 0..=3000u32, 5.0);
+        ui.label(egui::RichText::new("ms").color(weak));
+    });
+    note(ui, "Smooths transitions between moduli: fields morph, plain residue coloring cross-dissolves. Display only; exports, layer history and the inspector use the true frames. 0 = hard cuts.");
+    // re-snap when the mode or its parameters changed, as the reference does
+    let changed = before != (sw.mode, sw.prime_order, sw.seq, sw.step, sw.start);
+    match action {
+        Some(0) => {
+            let (lo, hi) = model.sweep.bounds();
+            let v = if model.sweep.dir > 0 { lo } else { hi };
+            model.set_m(v);
+        }
+        Some(n) => model.step(n),
+        None => {}
+    }
+    if changed {
+        model.goto(model.m as i64);
+    }
 }
 
 fn first_sentence(s: &str) -> &str {
@@ -806,8 +1003,9 @@ fn canvas_interaction(ui: &mut egui::Ui, model: &mut Model, response: &egui::Res
 
     // Keyboard, when no text field has focus.
     if handle && !ui.ctx().egui_wants_keyboard_input() {
-        let (shift, right, left, pgup, pgdn, up, down, fit) = ui.input(|i| {
+        let (space, shift, right, left, pgup, pgdn, up, down, fit) = ui.input(|i| {
             (
+                i.key_pressed(egui::Key::Space),
                 i.modifiers.shift,
                 i.num_presses(egui::Key::ArrowRight),
                 i.num_presses(egui::Key::ArrowLeft),
@@ -819,9 +1017,13 @@ fn canvas_interaction(ui: &mut egui::Ui, model: &mut Model, response: &egui::Res
             )
         });
         let big: i64 = if shift { 10 } else { 1 };
+        if space {
+            model.sweep.playing = !model.sweep.playing;
+        }
+        // ←/→ one step through the selection mode, PgUp/PgDn ten; shift ×10
         let dm = (right as i64 - left as i64) * big + (pgup as i64 - pgdn as i64) * 10 * big;
         if dm != 0 {
-            model.set_m((model.m as i64 + dm).clamp(2, MOD_CAP as i64) as u32);
+            model.step(dm.clamp(-100_000, 100_000) as i32);
         }
         let dr = (up as i64 - down as i64) * big;
         if dr != 0 {

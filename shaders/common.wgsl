@@ -24,7 +24,7 @@ struct Factor {
   minus_one: u32,  // 1 when (p^e !)_p ≡ -1 (every case except p = 2, e ≥ 3)
   garner_q: u32,   // product of the previous factors' q (1 for the first factor)
   garner_inv: u32, // garner_q^{-1} mod q, Montgomery form (plain when p = 2)
-  pad0: u32,
+  ppow_off: u32,   // tables[ppow_off + t] = p^t mod q for t < e (Montgomery form; plain when p = 2)
   pad1: u32,
 };
 
@@ -46,8 +46,8 @@ struct Params {
 
   cells_per_px: f32,
   rows_per_px: f32,
-  pad_a: f32,
-  pad_b: f32,
+  lnf_off: u32,     // tables[lnf_off + i] = ln(i!) as f32 bits, i < LNF_TABLE
+  prank_off: u32,   // tables[prank_off + v] = 1-based prime index of v (0 = not prime), v < m
 
   m: u32,           // the modulus
   p: u32,           // its smallest prime factor
@@ -61,11 +61,10 @@ struct Params {
 
   field_active: u32, // the field pipeline ran: resolve reads the working field
   field_stride: u32, // elements per field slot
-  pad_c: u32,
+  signed_mask: u32,  // bit s set when measure slot s is signed (normalized around 0.5)
   pad_d: u32,
 
-  iparams: array<vec4<i32>, 4>, // layer parameters by slot (see layers.rs)
-  dparams: array<vec4<u32>, 4>, // per-layer values derived on the CPU (LayerDef::derive / dslot)
+  dparams: array<vec4<u32>, 8>, // per-layer values derived on the CPU (LayerDef::derive / dslot)
   factors: array<Factor, 9>,
 };
 
@@ -77,12 +76,9 @@ struct Params {
 @group(0) @binding(5) var<storage, read_write> maxbuf: array<atomic<u32>>; // per-slot field maxima as f32 bits
 
 const CELL_VALID: u32 = 0x80000000u;
-
-fn iparam(slot: u32) -> i32 {
-  let v = P.iparams[slot >> 2u];
-  let c = slot & 3u;
-  return select(select(v.x, v.y, c == 1u), select(v.z, v.w, c == 3u), c >= 2u);
-}
+const MAX_FACTORS: u32 = 9u;     // distinct primes of a u32 modulus
+const MAX_DIGITS: u32 = 32u;     // base-p digits of a u32 (p ≥ 2)
+const LNF_TABLE: u32 = 4096u;    // ln(i!) is tabulated below this
 
 fn cell_valid(c: vec2<u32>) -> bool { return (c.y & CELL_VALID) != 0u; }
 fn cell_nu(c: vec2<u32>) -> u32 { return c.y & 0xffu; }
@@ -175,7 +171,8 @@ fn binom_mod_prime_power(n: u32, k: u32, F: Factor, full_nu: bool) -> BinomRes {
   var zero = false;
   var done = false;
   var j = 0u;
-  while (nn != 0u && !done) {
+  for (var it = 0u; it < MAX_DIGITS; it = it + 1u) {
+    if (nn == 0u || done) { break; }
     // One division per number per digit; the digit is the remainder. For p = 2
     // everything is shifts and masks. The e-digit windows N_j, K_j are the digits
     // themselves when e = 1 (Lucas), otherwise one more remainder each.
@@ -213,12 +210,56 @@ fn binom_mod_prime_power(n: u32, k: u32, F: Factor, full_nu: bool) -> BinomRes {
   }
   var r = 0u;
   if (!zero) {
-    r = acc;
-    for (var t = 0u; t < nu; t = t + 1u) { r = mm(r, F.p_mont, F); }
+    // ν < e here, and p^ν mod q comes from a CPU-built table: no power loop.
+    r = mm(acc, tables[F.ppow_off + nu], F);
     r = from_mont(r, F);
     if (F.minus_one == 1u && (sc & 1u) == 1u) { r = select(q - r, 0u, r == 0u); }
   }
   return BinomRes(r, nu);
+}
+
+// ---------------------------------------------------------------------------
+// C(n,k) mod m for the whole modulus: one residue per prime-power factor,
+// recombined by Garner's form of the Chinese remainder theorem
+//   x_1 = r_1,   x_f = x_{f−1} + Q_{f−1}·((r_f − x_{f−1})·Q_{f−1}^{−1} mod q_f)
+// so every intermediate stays below m. Also returns ν_p for the smallest prime
+// (full count only when want_nu) and the per-factor divisibility mask.
+// ---------------------------------------------------------------------------
+struct ResidueInfo { x: u32, nu0: u32, mask: u32 };
+
+fn residue_info(n: u32, k: u32, want_nu: bool) -> ResidueInfo {
+  var x = 0u;
+  var nu0 = 0u;
+  var mask = 0u;
+  for (var f = 0u; f < MAX_FACTORS; f = f + 1u) {
+    if (f >= P.nfactors) { break; }
+    let F = P.factors[f];
+    let res = binom_mod_prime_power(n, k, F, want_nu && f == 0u);
+    if (f == 0u) {
+      nu0 = res.nu;
+      x = res.r;
+    } else {
+      let xq = x % F.q;
+      let t = res.r + F.q - xq;               // in (0, 2q)
+      let diff = select(t, t - F.q, t >= F.q);
+      let cc = mm(diff, F.garner_inv, F);     // plain (r_f − x)·Q^{−1} mod q_f
+      x = x + F.garner_q * cc;
+    }
+    if (res.nu >= F.e) { mask = mask | (1u << f); }
+  }
+  return ResidueInfo(x, nu0, mask);
+}
+
+// C(n,k) mod m (0 outside the triangle).
+fn residue_at(n: u32, k: u32) -> u32 {
+  if (k > n) { return 0u; }
+  return residue_info(n, k, false).x;
+}
+
+// Wrap-around distance between two residues mod m.
+fn wrap_dist(a: u32, b: u32) -> u32 {
+  let d = select(b - a, a - b, a >= b);
+  return min(d, P.m - d);
 }
 
 // ---------------------------------------------------------------------------

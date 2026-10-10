@@ -29,7 +29,7 @@ fn cell_grid(rows: u32) -> (View, GridSpec) {
 }
 
 fn frame<'a>(grid: GridSpec, md: &'a Modulus, pal: &'a Palette, layers: &'a LayerState) -> FrameInput<'a> {
-    FrameInput { grid, modulus: md, palette: pal, layers, advance: true }
+    FrameInput { grid, modulus: md, palette: pal, layers, advance: true, tween: pascal::gpu::Tween::Off }
 }
 
 const MODULI: &[u32] = &[
@@ -492,4 +492,72 @@ fn resolve_colors_match_palette_tables() {
     r.render_blocking(&frame(grid, &md, &pal, &layers));
     let (_, _, rgba2) = r.read_output_rgba();
     assert!(rgba2.chunks(4).any(|c| c[..3] != pascal::palette::BG), "palette blend paints something");
+}
+
+fn tween_frame<'a>(grid: GridSpec, md: &'a Modulus, pal: &'a Palette, layers: &'a LayerState, tween: pascal::gpu::Tween) -> FrameInput<'a> {
+    FrameInput { grid, modulus: md, palette: pal, layers, advance: false, tween }
+}
+
+fn assert_rgba_close(a: &[u8], b: &[u8], tol: u8, what: &str) {
+    assert_eq!(a.len(), b.len(), "{what}: size");
+    let worst = a.iter().zip(b).map(|(x, y)| x.abs_diff(*y)).max().unwrap_or(0);
+    assert!(worst <= tol, "{what}: worst channel difference {worst} > {tol}");
+}
+
+#[test]
+fn tween_is_display_only_and_lands_on_the_true_frame() {
+    use pascal::gpu::Tween;
+    let (_gpu, mut r) = device();
+    let pal = Palette::new(Scheme::Spectral);
+    let (_, grid) = cell_grid(90);
+    let (m7, m11) = (Modulus::new(7), Modulus::new(11));
+    for (what, field) in [("dissolve (VALUE)", false), ("morph (KUMMER)", true)] {
+        let mut layers = LayerState::default();
+        if field {
+            layers.set_active(LayerId::Value, false);
+            layers.set_active(LayerId::Kummer, true);
+        }
+        // the true frames
+        r.render_blocking(&tween_frame(grid, &m11, &pal, &layers, Tween::Off));
+        let (_, _, true11) = r.read_output_rgba();
+        r.render_blocking(&tween_frame(grid, &m7, &pal, &layers, Tween::Off));
+        let (_, _, shown7) = r.read_display_rgba();
+        // start a transition 7 -> 11: e = 0 still shows 7
+        r.render_blocking(&tween_frame(grid, &m11, &pal, &layers, Tween::Start(0.0)));
+        let (_, _, d0) = r.read_display_rgba();
+        assert_rgba_close(&d0, &shown7, 0, &format!("{what}: e = 0 shows the previous frame"));
+        // halfway is between the two
+        r.render_blocking(&tween_frame(grid, &m11, &pal, &layers, Tween::Continue(0.5)));
+        let (_, _, dh) = r.read_display_rgba();
+        assert!(dh != shown7 && dh != true11, "{what}: e = 0.5 is a blend");
+        // e = 1 is exactly the true frame
+        r.render_blocking(&tween_frame(grid, &m11, &pal, &layers, Tween::Continue(1.0)));
+        let (_, _, d1) = r.read_display_rgba();
+        assert_rgba_close(&d1, &true11, 0, &format!("{what}: e = 1 is the true frame"));
+        // an Off render is always the true frame, in both textures
+        r.render_blocking(&tween_frame(grid, &m11, &pal, &layers, Tween::Off));
+        let (_, _, f) = r.read_output_rgba();
+        assert_rgba_close(&f, &true11, 0, &format!("{what}: Off output"));
+    }
+    // a retarget mid-transition starts from what is on screen
+    let layers = LayerState::default();
+    let m13 = Modulus::new(13);
+    r.render_blocking(&tween_frame(grid, &m7, &pal, &layers, Tween::Off));
+    r.render_blocking(&tween_frame(grid, &m11, &pal, &layers, Tween::Start(0.0)));
+    r.render_blocking(&tween_frame(grid, &m11, &pal, &layers, Tween::Continue(0.5)));
+    let (_, _, mid) = r.read_display_rgba();
+    r.render_blocking(&tween_frame(grid, &m13, &pal, &layers, Tween::Start(0.0)));
+    let (_, _, d0) = r.read_display_rgba();
+    assert_rgba_close(&d0, &mid, 0, "retarget starts from the blended picture");
+    // the same for a morph
+    let mut layers = LayerState::default();
+    layers.set_active(LayerId::Value, false);
+    layers.set_active(LayerId::Kummer, true);
+    r.render_blocking(&tween_frame(grid, &m7, &pal, &layers, Tween::Off));
+    r.render_blocking(&tween_frame(grid, &m11, &pal, &layers, Tween::Start(0.0)));
+    r.render_blocking(&tween_frame(grid, &m11, &pal, &layers, Tween::Continue(0.5)));
+    let (_, _, mid) = r.read_display_rgba();
+    r.render_blocking(&tween_frame(grid, &m13, &pal, &layers, Tween::Start(0.0)));
+    let (_, _, d0) = r.read_display_rgba();
+    assert_rgba_close(&d0, &mid, 0, "morph retarget starts from the blended field");
 }
