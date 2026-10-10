@@ -203,9 +203,13 @@ pub struct WaveOverlay {
     /// Eased visibility, 0..1.
     fade: f32,
     source: Option<Source>,
-    /// `target` is stale: rebuilt on the next visible `update`.
+    /// `target` (and the texts) are stale: rebuilt on the next visible `update`.
     dirty: bool,
+    /// Only the texts are stale (the pin changed; the coefficients did not).
+    texts_dirty: bool,
     pinned: bool,
+    /// The last rebuild reached the row (false: modulus too large for a long row).
+    in_range: bool,
     pascal: PascalRow,
     /// Closed form for long rows: the app's (see `share_closed_form`) or our own.
     closed: Option<Arc<Modulus>>,
@@ -260,7 +264,9 @@ impl WaveOverlay {
             fade: 0.0,
             source: None,
             dirty: false,
+            texts_dirty: false,
             pinned: false,
+            in_range: true,
             pascal: PascalRow::default(),
             closed: None,
             target: HashMap::new(),
@@ -308,7 +314,7 @@ impl WaveOverlay {
             return false; // nothing to show (no viewport, or one too small for the box)
         }
         if self.visible {
-            self.fade < 1.0 || self.dirty || !self.settled || self.config.drift != 0.0
+            self.fade < 1.0 || self.dirty || self.texts_dirty || !self.settled || self.config.drift != 0.0
         } else {
             self.fade > 0.0
         }
@@ -362,11 +368,11 @@ impl WaveOverlay {
         }
     }
 
-    /// Mark the row as pinned by the user (shown in the label).
+    /// Mark the row as pinned by the user (shown in the label; the coefficients stay).
     pub fn set_pinned(&mut self, pinned: bool) {
         if pinned != self.pinned {
             self.pinned = pinned;
-            self.dirty = true;
+            self.texts_dirty = true;
         }
     }
 
@@ -378,11 +384,9 @@ impl WaveOverlay {
         self.pixels_per_point = if pixels_per_point.is_finite() { pixels_per_point.max(0.1) } else { 1.0 };
     }
 
-    /// Rebuild `target` and the texts for the current source.
-    fn rebuild(&mut self) {
-        let Some(src) = self.source else { return };
-        let in_range = self.rebuild_target(src);
-        let Source { row: n, modulus: m, k_lo, k_hi } = src;
+    /// Rebuild the label and note for the current source and target.
+    fn rebuild_texts(&mut self) {
+        let Some(Source { row: n, modulus: m, k_lo, k_hi }) = self.source else { return };
         use std::fmt::Write;
         self.label.clear();
         let _ = write!(self.label, "row {} · mod {}", group(n), group(m));
@@ -391,7 +395,7 @@ impl WaveOverlay {
         }
         // the verdict goes first, so a narrow box elides the k range rather than it
         self.note.clear();
-        if !in_range {
+        if !self.in_range {
             self.note.push_str("beyond the overlay's range");
         } else if self.target.is_empty() {
             self.note.push_str("every r_k is 0");
@@ -498,8 +502,15 @@ impl WaveOverlay {
         }
         if self.dirty {
             self.dirty = false;
-            self.rebuild();
+            if let Some(src) = self.source {
+                self.in_range = self.rebuild_target(src);
+            }
+            self.texts_dirty = true;
             self.settled = false;
+        }
+        if self.texts_dirty {
+            self.texts_dirty = false;
+            self.rebuild_texts();
         }
 
         // ease every displayed coefficient toward its target (0 when absent)
@@ -836,6 +847,7 @@ mod tests {
         assert_eq!(w.label(), "row 4 · mod 7");
         assert_eq!(w.note(), "");
         w.set_pinned(true);
+        assert!(!w.dirty, "pinning only relabels; the coefficients are not recomputed");
         w.update(0.0);
         assert_eq!(w.label(), "row 4 · mod 7 · pinned");
         // a long row, through the closed form: C(2050, k) mod 7 at f = 2050 − 2k
