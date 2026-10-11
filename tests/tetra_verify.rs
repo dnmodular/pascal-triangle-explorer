@@ -118,6 +118,28 @@ fn the_face_and_the_diamond_match_too() {
 }
 
 #[test]
+fn peeling_leaves_out_the_ones_edges_only() {
+    let (_gpu, mut r) = device();
+    let mods: Vec<u32> = (2..=60).collect();
+    for (view, budget) in [(View::Stack, u32::MAX), (View::Stack, 4_000), (View::Diamond, u32::MAX)] {
+        let mut layout = Layout::build(view, &mods, Spacing::True, Shape::Regular, budget);
+        layout.peel = true;
+        let mds: Vec<Modulus> = layout.slices.iter().map(|s| Modulus::new(s.m)).collect();
+        r.set_scene(&layout, &mds, &Palette::new(Scheme::Spectral), 0.0);
+        let (nz, z) = r.read_cubes();
+        let all: Vec<(usize, u32, u32)> = (0..layout.total).map(|g| layout.cell(g).unwrap()).collect();
+        let inner: Vec<_> = all.iter().filter(|&&(_, n, k)| k != 0 && k != n).collect();
+        assert!(inner.len() < all.len());
+        assert_eq!(nz.len() + z.len(), inner.len(), "{view:?}: every inner cell, no edge cell");
+        for w in nz.iter().chain(&z) {
+            let c = CubeId::unpack(*w);
+            assert!(c.k != 0 && c.k != c.n, "{view:?}: edge cell {c:?} drawn");
+            assert_eq!(c.residue, mds[c.slice as usize].binom(c.n, c.k));
+        }
+    }
+}
+
+#[test]
 fn strided_and_deep_slices_match_too() {
     let (_gpu, mut r) = device();
     // a wide range under a small budget: a stride on slices, rows and cells

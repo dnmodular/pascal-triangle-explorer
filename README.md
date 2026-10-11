@@ -305,6 +305,9 @@ voids run through the solid as tunnels.
   hovered slice) light up, with white edges. The zero / nonzero mask lens colors the
   cubes white; other layer setups fall back to residue coloring, and the HUD says
   so. The HUD shows the shape, m and its factorization, n, k and the residue.
+* **Peel the 1s edges** (**P**): leaves out every triangle's outer cells, k = 0 and
+  k = n, which are all 1 (white in spectral). The skin comes off the stack (and off the
+  face and the diamond), and the layer under it shows: its edge rows are n mod m.
 * **Selection.** A start / end range (2–4096) and the sweep's selection modes: all,
   primes (with their orderings), composites, even, odd, and the interval sequences.
 * **Spacing.** *True* (default): slice height follows m. Skipped moduli leave gaps,
@@ -314,8 +317,11 @@ voids run through the solid as tunnels.
   now curve, because slice size no longer tracks height.
 * **Level of detail, as cubes.** The stack has about M³/6 cells. A cube budget
   (250K–8M, default 1M) picks the smallest stride s that fits: every s-th row and
-  cell of a slice, and, walking up from the base (always drawn), only the slices at
-  least one cube (s cells) above the last one kept. Every cube is a cube, s cells on a
+  cell of a slice, and, walking down from the apex, only the slices at least one cube
+  (s cells) below the last one kept; the base is always drawn too (it takes the last
+  kept slice's place when they would touch). Anchored at the apex, the top of the stack
+  stays the same when the range's end moves (2–487 and 2–488 used to draw different
+  slices all the way up). Every cube is a cube, s cells on a
   side, in all three directions, so a wide range no longer turns into stacked slabs,
   and a sparse selection whose slices are already far apart (every 100th modulus,
   say) keeps all of them. The face and the diamond use the same rule on their rows;

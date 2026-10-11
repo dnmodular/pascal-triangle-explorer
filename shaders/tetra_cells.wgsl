@@ -18,6 +18,10 @@ struct CellParams {
   stride: u32,
   total: u32,
   row_threads: u32,   // threads per row of the 2D dispatch (x groups × 64)
+  flags: u32,         // bit 0: leave out the edge cells k = 0 and k = n (the 1s)
+  pad0: u32,
+  pad1: u32,
+  pad2: u32,
 };
 
 struct Slice {
@@ -103,6 +107,8 @@ fn tetra_cells(@builtin(global_invocation_id) gid: vec3<u32>) {
   n = s.row_n + i * C.stride;
   k = j * C.stride;
   }
+  // peeled: the triangle's 1s edges are not drawn at all
+  if ((C.flags & 1u) != 0u && (k == 0u || k == n)) { return; }
   let r = slice_residue(n, k, s);
   let w = vec2<u32>(n | (k << 16u), lo | (r << 16u));
   if (r != 0u) {

@@ -210,6 +210,7 @@ pub fn render(model: &mut Model, cache: &mut TetraCache, r: &mut TetraRenderer, 
     if (cache.scene != Some(key) && !dragging) || t.layout.is_none() {
         let mods = selected_moduli(&t.config.sweep);
         let mut layout = Layout::build(view, &mods, t.config.spacing, t.config.shape, t.config.budget);
+        layout.peel = t.config.peel;
         if view == View::Diamond {
             layout.set_fold(t.fold_angle());
         }
@@ -391,6 +392,7 @@ fn options(ui: &mut egui::Ui, t: &mut TetraView) {
         ui.add_enabled_ui(!c.color_slice, |ui| mono_drag(ui, &mut c.brush, 0.0..=64.0, 0.05).on_hover_text("Cubes within this many cells of the hovered cube light up"));
         ui.checkbox(&mut c.color_slice, "whole slice").on_hover_text("Light up the whole hovered slice (or face row) instead");
     });
+    ui.checkbox(&mut c.peel, "peel the 1s edges").on_hover_text("Leave out every triangle's outer cells, k = 0 and k = n, which are all 1: the white skin comes off and the residues inside show (P)");
     ui.horizontal(|ui| {
         ui.checkbox(&mut c.ghosts, "ghost zeros").on_hover_text("Zero cells as faint ghost cubes: the tunnels glow through the solid");
         ui.label(egui::RichText::new("cubes ≤").color(ui.visuals().weak_text_color()));
@@ -411,7 +413,7 @@ fn options(ui: &mut egui::Ui, t: &mut TetraView) {
     };
     mono_line(ui, &text);
     ui.separator();
-    note(ui, "Keys: V next view · U unfold again · G spacing · O options · Esc back. Stack: drag orbit, right / shift-drag pan, wheel zoom. Face and diamond: drag pan, wheel zoom. Double-click reframes.");
+    note(ui, "Keys: V next view · U unfold again · G spacing · P peel · O options · Esc back. Stack: drag orbit, right / shift-drag pan, wheel zoom. Face and diamond: drag pan, wheel zoom. Double-click reframes.");
 }
 
 fn short(n: u32) -> String {
@@ -563,7 +565,10 @@ pub fn space(ui: &mut egui::Ui, model: &mut Model, ppp: f32, tex: Option<egui::T
                 t.camera = None;
             }
             if !ui.ctx().egui_wants_keyboard_input() {
-                let (esc, g, v, u, o) = ui.input(|i| (i.key_pressed(egui::Key::Escape), i.key_pressed(egui::Key::G), i.key_pressed(egui::Key::V), i.key_pressed(egui::Key::U), i.key_pressed(egui::Key::O)));
+                let (esc, g, v, u, o, pk) = ui.input(|i| (i.key_pressed(egui::Key::Escape), i.key_pressed(egui::Key::G), i.key_pressed(egui::Key::V), i.key_pressed(egui::Key::U), i.key_pressed(egui::Key::O), i.key_pressed(egui::Key::P)));
+                if pk {
+                    t.config.peel = !t.config.peel;
+                }
                 if esc && !t.focus_last_frame {
                     t.open = false;
                 }
@@ -681,6 +686,9 @@ pub fn space(ui: &mut egui::Ui, model: &mut Model, ppp: f32, tex: Option<egui::T
                         Spacing::Packed => "packed: one row per modulus of the selection, no gaps (G)".into(),
                     });
                 }
+            }
+            if l.peel {
+                lines.push("peeled: the 1s edges (k = 0, k = n) are left out (P)".into());
             }
             let lens = match model.layers.preset() {
                 Some(Preset::Mask) => "mask",

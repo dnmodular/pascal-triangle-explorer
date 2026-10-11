@@ -130,6 +130,8 @@ pub struct TetraConfig {
     pub shape: Shape,
     /// What the 3D space shows: the stack, its front face, or the diamond.
     pub view: View,
+    /// Leave out the triangles' 1s edges (k = 0, k = n).
+    pub peel: bool,
     /// The options panel is open in the 3D space.
     pub options: bool,
     /// Zero cells as faint ghost cubes.
@@ -150,7 +152,7 @@ impl Default for TetraConfig {
     fn default() -> Self {
         let mut sweep = Sweep::default();
         sweep.end = 48;
-        TetraConfig { sweep, spacing: Spacing::True, shape: Shape::Regular, view: View::Stack, options: true, ghosts: false, brush: 2.0, color_slice: false, budget: 1_000_000, spin: true, tile: true }
+        TetraConfig { sweep, spacing: Spacing::True, shape: Shape::Regular, view: View::Stack, peel: false, options: true, ghosts: false, brush: 2.0, color_slice: false, budget: 1_000_000, spin: true, tile: true }
     }
 }
 
@@ -158,11 +160,11 @@ impl TetraConfig {
     /// What the geometry of `view` depends on (the scene is rebuilt when it changes).
     pub fn scene_key(&self, view: View) -> SceneKey {
         let s = &self.sweep;
-        (s.mode, s.prime_order, s.seq, s.step, s.start, s.end, self.spacing, self.budget, self.shape, view)
+        (s.mode, s.prime_order, s.seq, s.step, s.start, s.end, self.spacing, self.budget, self.shape, view, self.peel)
     }
 }
 
-pub type SceneKey = (crate::sweep::ModMode, crate::sweep::PrimeOrder, crate::sweep::Seq, u32, u32, u32, Spacing, u32, Shape, View);
+pub type SceneKey = (crate::sweep::ModMode, crate::sweep::PrimeOrder, crate::sweep::Seq, u32, u32, u32, Spacing, u32, Shape, View, bool);
 
 /// The moduli in `start..=end` (clamped to 2..=TETRA_MAX_M) that the selection mode
 /// visits, ascending.
@@ -210,10 +212,12 @@ pub fn level_depth(view: View, spacing: Spacing, i: usize, m: u32) -> f32 {
     }
 }
 
-/// The selection indices drawn at stride s. Walking up from the base (always drawn: the
-/// stack's base slice, the diamond's base), a slice or face row is kept when it sits at
-/// least one cube (s cells) above the last one kept, so cubes never overlap, and a
-/// sparse selection whose slices are far apart keeps all of them.
+/// The selection indices drawn at stride s. Walking down from the apex (always drawn, so
+/// the top of the stack does not change when the range's end does), a slice or face row
+/// is kept when it sits at least one cube (s cells) below the last one kept, so cubes
+/// never overlap and a sparse selection whose slices are far apart keeps all of them.
+/// The base (the stack's base slice, the diamond's base) is always drawn too: when it is
+/// less than a cube below the last one kept, it takes that one's place.
 pub fn drawn(view: View, mods: &[u32], spacing: Spacing, stride: u32) -> Vec<usize> {
     let len = mods.len();
     if len == 0 {
@@ -224,16 +228,20 @@ pub fn drawn(view: View, mods: &[u32], spacing: Spacing, stride: u32) -> Vec<usi
         return (0..len).collect();
     }
     let need = 2.0 * CUBE_HALF * stride as f32 - 1e-4;
-    let mut out = vec![len - 1];
-    let mut last = level_depth(view, spacing, len - 1, mods[len - 1]);
-    for i in (0..len - 1).rev() {
-        let d = level_depth(view, spacing, i, mods[i]);
-        if last - d >= need {
+    let depth = |i: usize| level_depth(view, spacing, i, mods[i]);
+    let mut out = vec![0];
+    let mut last = depth(0);
+    for i in 1..len {
+        if depth(i) - last >= need {
             out.push(i);
-            last = d;
+            last = depth(i);
         }
     }
-    out.reverse();
+    // the base was not kept, so it is less than a cube below the last kept one, which
+    // is a cube below the one before it: the base can take its place
+    if *out.last().unwrap() != len - 1 {
+        *out.last_mut().unwrap() = len - 1;
+    }
     out
 }
 
@@ -395,6 +403,9 @@ pub struct Layout {
     pub full_total: u64,
     /// The diamond's hinge: the base slice's angle out of the face's plane (0 = flat).
     pub fold: f32,
+    /// Leave out every triangle's edge cells (k = 0 and k = n, all 1s): the white skin
+    /// comes off and the residues inside show.
+    pub peel: bool,
 }
 
 /// The stack's row direction: rows run back along z, half a cell left per row.
@@ -413,7 +424,7 @@ impl Layout {
     pub fn build(view: View, mods: &[u32], spacing: Spacing, shape: Shape, budget: u32) -> Layout {
         let stride = view_stride(view, mods, spacing, budget);
         let len = mods.len();
-        let mut l = Layout { view, mods: mods.to_vec(), slices: Vec::new(), spacing, shape, stride, total: 0, full_total: view_cells(view, mods, spacing, 1), fold: 0.0 };
+        let mut l = Layout { view, mods: mods.to_vec(), slices: Vec::new(), spacing, shape, stride, total: 0, full_total: view_cells(view, mods, spacing, 1), fold: 0.0, peel: false };
         let mut base = 0u32;
         for i in drawn(view, mods, spacing, stride) {
             let m = mods[i];
@@ -1135,6 +1146,24 @@ mod tests {
             let (l0, r0) = (d.center(last, n, 0), d.center(last, n, n));
             assert!((l0[0] + r0[0]).abs() < 1e-3 && (r0[0] - l0[0] - n as f32).abs() < 1e-3);
             assert!((l0[1] - (hinge[1] - (29 - n) as f32 * SQRT3_2)).abs() < 1e-3);
+        }
+    }
+
+    #[test]
+    fn the_apex_does_not_move_when_the_range_end_does() {
+        // the reported trouble: 2–487 and 2–488 drew different slices all the way up
+        for spacing in [Spacing::True, Spacing::Packed] {
+            for (a, b) in [((2..=487).collect::<Vec<u32>>(), (2..=488).collect::<Vec<u32>>()), (crate::sweep::prime_tables().primes.iter().copied().filter(|&p| p <= 486).collect(), crate::sweep::prime_tables().primes.iter().copied().filter(|&p| p <= 487).collect())] {
+                let (la, lb) = (Layout::build(View::Stack, &a, spacing, Shape::Regular, 1_000_000), Layout::build(View::Stack, &b, spacing, Shape::Regular, 1_000_000));
+                assert_eq!(la.stride, lb.stride);
+                let (ma, mb): (Vec<u32>, Vec<u32>) = (la.slices.iter().map(|s| s.m).collect(), lb.slices.iter().map(|s| s.m).collect());
+                // the same slices from the apex down to the last couple, which make room
+                // for each range's own base
+                let common = ma.len().min(mb.len()) - 2;
+                assert_eq!(ma[..common], mb[..common], "{spacing:?}");
+                assert_eq!(ma[0], a[0]);
+                assert_eq!((*ma.last().unwrap(), *mb.last().unwrap()), (*a.last().unwrap(), *b.last().unwrap()));
+            }
         }
     }
 

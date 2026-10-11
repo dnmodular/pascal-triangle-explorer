@@ -45,6 +45,9 @@ struct CellParams {
     stride: u32,
     total: u32,
     row_threads: u32,
+    /// Bit 0: leave out the edge cells k = 0 and k = n.
+    flags: u32,
+    pad: [u32; 3],
 }
 
 #[repr(C)]
@@ -444,7 +447,7 @@ impl TetraRenderer {
         let groups = layout.total.div_ceil(WG);
         let gx = groups.clamp(1, MAX_GROUPS_X);
         let gy = groups.div_ceil(gx).max(1);
-        let params = CellParams { n_slices: layout.slices.len() as u32, stride: layout.stride, total: layout.total, row_threads: gx * WG };
+        let params = CellParams { n_slices: layout.slices.len() as u32, stride: layout.stride, total: layout.total, row_threads: gx * WG, flags: layout.peel as u32, pad: [0; 3] };
         let pbuf = init(d, "tetra cell params", bytemuck::bytes_of(&params), wgpu::BufferUsages::UNIFORM);
         let cells_bg = d.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("tetra cells"),
