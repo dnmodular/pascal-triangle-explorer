@@ -97,6 +97,9 @@ pub fn selected_moduli(sweep: &Sweep) -> Vec<u32> {
     if lo > hi {
         std::mem::swap(&mut lo, &mut hi);
     }
+    // the interval walks are anchored at the start: the lower bound
+    sw.start = lo;
+    sw.end = hi;
     (lo..=hi).filter(|&m| sw.snap(m as i64) == m).collect()
 }
 
@@ -536,6 +539,12 @@ mod tests {
         assert_eq!(selected_moduli(&c.sweep), vec![4, 6, 8, 9, 10, 12, 14, 15, 16, 18, 20]);
         c.sweep.end = 99_999;
         assert_eq!(*selected_moduli(&c.sweep).last().unwrap(), TETRA_MAX_M);
+        // a reversed range is the same range, and interval walks start at its low end
+        c.sweep.mode = ModMode::Interval;
+        c.sweep.step = 5;
+        c.sweep.start = 40;
+        c.sweep.end = 10;
+        assert_eq!(selected_moduli(&c.sweep), vec![10, 15, 20, 25, 30, 35, 40]);
     }
 
     #[test]

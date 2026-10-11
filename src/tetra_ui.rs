@@ -6,11 +6,11 @@ use pascal::layers::Preset;
 use pascal::math::Modulus;
 use pascal::palette::Scheme;
 use pascal::sweep::{ModMode, PrimeOrder, Seq};
-use pascal::tetra::{describe, selected_moduli, Camera, CubeId, Layout, SceneKey, Spacing, TetraConfig, BUDGETS, TETRA_MAX_M};
+use pascal::tetra::{describe, selected_moduli, stride_for, Camera, CubeId, Layout, SceneKey, Spacing, TetraConfig, BUDGETS, TETRA_MAX_M};
 use pascal::tetra_gpu::{outline_vertices, DrawOptions, TetraRenderer, BACKGROUND};
 use pascal::wave_overlay::Corner;
 
-use super::{group, mono_drag, mono_line, note, Model};
+use super::{group, mono_drag, mono_drag_with, mono_line, note, Model};
 
 /// Preview spin, rad/s.
 const SPIN: f32 = 0.35;
@@ -44,6 +44,8 @@ pub struct TetraView {
 pub struct TetraCache {
     scene: Option<SceneKey>,
     colors: Option<(Scheme, u32)>,
+    /// What the target last showed.
+    drawn: Option<(DrawOptions, (u32, u32))>,
 }
 
 impl TetraView {
@@ -68,6 +70,14 @@ impl TetraView {
         }
     }
 
+    /// A pick landed: keep it only if the pick it answers is still current (the pointer
+    /// left, or the scene was rebuilt, while it was in flight).
+    pub fn land_pick(&mut self, hit: Option<CubeId>) {
+        if self.open && self.pointer.is_some() && self.last_pick.is_some() {
+            self.hover = hit;
+        }
+    }
+
     pub fn advance(&mut self, dt: f32) {
         if !self.open && self.config.spin && self.visible() {
             self.spin = (self.spin + dt * SPIN) % std::f32::consts::TAU;
@@ -83,13 +93,16 @@ impl TetraView {
 /// Rebuild the stack when its selection changed, recolor it when the palette or offset
 /// did, then draw it into the target (and pick under the pointer in the 3D space).
 /// Returns true when the target was recreated (re-register it with egui).
-pub fn render(model: &mut Model, cache: &mut TetraCache, r: &mut TetraRenderer, enc: &mut wgpu::CommandEncoder) -> bool {
+/// `dragging`: a widget is being dragged (a range field, say): the stack is rebuilt
+/// when it lets go, not on every step.
+pub fn render(model: &mut Model, cache: &mut TetraCache, r: &mut TetraRenderer, enc: &mut wgpu::CommandEncoder, dragging: bool) -> bool {
     if !model.tetra.visible() {
         return false;
     }
     let t = &mut model.tetra;
     let key = t.config.scene_key();
-    if cache.scene != Some(key) {
+    // (no layout: the model was reset to a config the cache still holds)
+    if (cache.scene != Some(key) && !dragging) || t.layout.is_none() {
         let mods = selected_moduli(&t.config.sweep);
         let layout = Layout::new(&mods, t.config.spacing, t.config.budget);
         let mds: Vec<Modulus> = mods.iter().map(|&m| Modulus::new(m)).collect();
@@ -100,34 +113,48 @@ pub fn render(model: &mut Model, cache: &mut TetraCache, r: &mut TetraRenderer, 
         let reframe = cache.scene.is_none_or(|k| (k.0, k.1, k.2, k.3, k.4, k.5) != (key.0, key.1, key.2, key.3, key.4, key.5));
         if reframe {
             t.camera = None;
+        } else if let (Some(cam), Some(old)) = (t.camera.as_mut(), t.layout.as_ref()) {
+            // same angle and relative zoom, around the new shape (packed is far shorter)
+            let (was, now) = (Camera::framing(old.bounds()), Camera::framing(layout.bounds()));
+            let pan = [cam.target[0] - was.target[0], cam.target[1] - was.target[1], cam.target[2] - was.target[2]];
+            let scale = now.radius / was.radius;
+            cam.target = [now.target[0] + pan[0] * scale, now.target[1] + pan[1] * scale, now.target[2] + pan[2] * scale];
+            cam.dist *= now.dist / was.dist;
+            cam.radius = now.radius;
         }
         t.layout = Some(layout);
         t.hover = None;
         t.last_pick = None;
         cache.scene = Some(key);
         cache.colors = Some((model.scheme, model.style.offset.to_bits()));
+        cache.drawn = None;
     }
     let colors = (model.scheme, model.style.offset.to_bits());
     if cache.colors != Some(colors) {
         r.set_colors(&model.palette, model.style.offset);
         cache.colors = Some(colors);
+        cache.drawn = None;
     }
     let recreated = r.ensure_target(t.target_px.0, t.target_px.1);
     let Some(camera) = t.draw_camera() else { return recreated };
+    if t.open && t.pointer.is_none() {
+        // off the stack: no hover, and a pick still in flight is dropped when it lands
+        t.hover = None;
+        t.last_pick = None;
+    }
     let mask = model.layers.preset() == Some(Preset::Mask);
     let hover = if t.open { t.hover } else { None };
-    r.draw(enc, &DrawOptions { camera, hover, brush: t.config.brush, color_slice: t.config.color_slice, ghosts: t.config.ghosts, mask });
+    let opts = DrawOptions { camera, hover, brush: t.config.brush, color_slice: t.config.color_slice, ghosts: t.config.ghosts, mask };
+    // an unchanged picture is not drawn again (hover, egui repaints)
+    let drawn = (opts, t.target_px);
+    if recreated || cache.drawn != Some(drawn) {
+        r.draw(enc, &opts);
+        cache.drawn = Some(drawn);
+    }
     if t.open {
-        match t.pointer {
-            Some(p) if t.last_pick != Some((p, camera)) => {
-                if r.encode_pick(enc, &camera, p.0, p.1) {
-                    t.last_pick = Some((p, camera));
-                }
-            }
-            Some(_) => {}
-            None => {
-                t.hover = None;
-                t.last_pick = None;
+        if let Some(p) = t.pointer {
+            if t.last_pick != Some((p, camera)) && r.encode_pick(enc, &camera, p.0, p.1) {
+                t.last_pick = Some((p, camera));
             }
         }
     }
@@ -150,9 +177,9 @@ pub fn panel(ui: &mut egui::Ui, model: &mut Model) {
     });
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("moduli").color(ui.visuals().weak_text_color()));
-        mono_drag(ui, &mut c.sweep.start, 2..=TETRA_MAX_M, 1.0).on_hover_text("First modulus (the apex slice)");
+        mono_drag_with(ui, &mut c.sweep.start, 2..=TETRA_MAX_M, 1.0, false).on_hover_text("First modulus (the apex slice)");
         ui.label(egui::RichText::new("to").color(ui.visuals().weak_text_color()));
-        mono_drag(ui, &mut c.sweep.end, 2..=TETRA_MAX_M, 1.0).on_hover_text(format!("Last modulus (the base slice), at most {TETRA_MAX_M}"));
+        mono_drag_with(ui, &mut c.sweep.end, 2..=TETRA_MAX_M, 1.0, false).on_hover_text(format!("Last modulus (the base slice), at most {TETRA_MAX_M}"));
     });
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("visit").color(ui.visuals().weak_text_color()));
@@ -176,7 +203,7 @@ pub fn panel(ui: &mut egui::Ui, model: &mut Model) {
                     }
                 });
                 if c.sweep.seq == Seq::Fixed {
-                    mono_drag(ui, &mut c.sweep.step, 1..=TETRA_MAX_M, 0.2).on_hover_text("Step from the first modulus");
+                    mono_drag_with(ui, &mut c.sweep.step, 1..=TETRA_MAX_M, 0.2, false).on_hover_text("Step from the first modulus");
                 }
             }
             _ => {}
@@ -204,8 +231,8 @@ pub fn panel(ui: &mut egui::Ui, model: &mut Model) {
     let mods = selected_moduli(&c.sweep);
     let text = match (mods.first(), mods.last()) {
         (Some(a), Some(b)) => {
-            let l = t.layout.as_ref().filter(|l| l.slices.len() == mods.len());
-            let lod = l.map_or(String::new(), |l| if l.stride > 1 { format!(" · stride {}", l.stride) } else { String::new() });
+            let s = stride_for(&mods, c.budget);
+            let lod = if s > 1 { format!(" · stride {s}") } else { String::new() };
             format!("{} slices, m {a}–{b}{lod}", mods.len())
         }
         _ => "no moduli in the range".into(),
@@ -285,8 +312,9 @@ pub fn space(ui: &mut egui::Ui, model: &mut Model, ppp: f32, tex: Option<egui::T
 
         // the way back: a thumbnail of the 2D view
         let aspect = canvas_px.0.max(1) as f32 / canvas_px.1.max(1) as f32;
-        let tw = (rect.width() * 0.18).clamp(120.0, 240.0);
-        let th = (tw / aspect).clamp(60.0, 200.0);
+        // the canvas's aspect, at most 240 wide and 200 tall
+        let tw = (rect.width() * 0.18).clamp(120.0, 240.0).min(200.0 * aspect);
+        let th = tw / aspect;
         let thumb = Rect::from_min_size(Pos2::new(rect.max.x - 16.0 - tw, rect.max.y - 16.0 - th), Vec2::new(tw, th));
         let tresp = ui.interact(thumb, ui.id().with("tetra back"), Sense::click()).on_hover_text("Back to the 2D view (Esc)");
         painter.rect_filled(thumb.expand(4.0), CornerRadius::same(8), Color32::from_rgba_unmultiplied(0, 0, 0, 158));
@@ -299,6 +327,9 @@ pub fn space(ui: &mut egui::Ui, model: &mut Model, ppp: f32, tex: Option<egui::T
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         }
 
+        if handle && ui.input(|i| i.key_pressed(egui::Key::F11)) {
+            model.fullscreen = !model.fullscreen;
+        }
         let t = &mut model.tetra;
         if handle {
             if tresp.clicked() {

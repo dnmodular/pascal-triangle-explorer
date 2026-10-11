@@ -738,16 +738,15 @@ impl App {
         self.model.play_tick(Instant::now());
         // real frame time for the overlay's easing (one nominal frame after an idle gap)
         let now = Instant::now();
-        let dt = match self.last_frame {
-            Some(t) if self.continuous => now.duration_since(t).as_secs_f32().min(0.25),
-            _ => 1.0 / 60.0,
-        };
+        let real_dt = self.last_frame.map_or(1.0 / 60.0, |t| now.duration_since(t).as_secs_f32().min(0.25));
+        let dt = if self.continuous { real_dt } else { 1.0 / 60.0 };
         self.last_frame = Some(now);
         self.model.advance_offset(dt);
-        self.model.tetra.advance(dt);
+        // the tile spins on its own ~30 fps timer, not continuous frames: real time
+        self.model.tetra.advance(if self.model.tetra.spinning() { real_dt.min(0.1) } else { dt });
         // the tetra stack's pick from an earlier frame
         if let Some(hit) = gfx.tetra.poll_pick() {
-            self.model.tetra.hover = hit;
+            self.model.tetra.land_pick(hit);
         }
         self.fps_frames += 1;
         let fps_t0 = *self.fps_t0.get_or_insert(now);
@@ -883,7 +882,7 @@ impl App {
         let tween_off = matches!(tween, Tween::Off);
         let render_canvas = changed || !tween_off || !self.canvas_current;
         // the tetra stack, into its own target (before egui samples it)
-        if tetra_ui::render(model, &mut gfx.tetra_cache, &mut gfx.tetra, &mut encoder) || (gfx.tetra_tex.is_none() && gfx.tetra.target_view().is_some()) {
+        if tetra_ui::render(model, &mut gfx.tetra_cache, &mut gfx.tetra, &mut encoder, ctx.dragged_id().is_some()) || (gfx.tetra_tex.is_none() && gfx.tetra.target_view().is_some()) {
             let view = gfx.tetra.target_view().expect("target");
             match gfx.tetra_tex {
                 Some(id) => gfx.egui_renderer.update_egui_texture_from_wgpu_texture(&gfx.gpu.device, view, wgpu::FilterMode::Linear, id),
@@ -967,7 +966,7 @@ impl App {
 
         self.frame_ms = t0.elapsed().as_secs_f32() * 1000.0;
         let delay = viewport_output.get(&egui::ViewportId::ROOT).map(|v| v.repaint_delay).unwrap_or(std::time::Duration::MAX);
-        self.continuous = delay.is_zero() || model.sweep.playing || self.tween_t0.is_some() || !self.canvas_current || model.offset_playing || model.wave.is_animating() || gfx.tetra.pick_in_flight();
+        self.continuous = delay.is_zero() || model.sweep.playing || self.tween_t0.is_some() || !self.canvas_current || model.offset_playing || (!model.tetra.open && model.wave.is_animating()) || gfx.tetra.pick_in_flight();
         if self.continuous {
             gfx.window.request_redraw();
             self.repaint_at = None;

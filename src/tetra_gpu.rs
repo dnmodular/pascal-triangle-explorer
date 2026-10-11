@@ -181,7 +181,7 @@ pub fn color_words(layout: &Layout, palette: &Palette, offset: f32) -> Vec<u32> 
 }
 
 /// What one draw shows besides the cubes.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DrawOptions {
     pub camera: Camera,
     /// The hovered cube, colored with its brush (or its slice).
@@ -210,6 +210,8 @@ struct PickTarget {
 
 struct Scene {
     layout: Layout,
+    /// The residue levels were built for spectral.
+    spectral: bool,
     levels: wgpu::Buffer,
     colors: wgpu::Buffer,
     nonzero: wgpu::Buffer,
@@ -455,7 +457,7 @@ impl TetraRenderer {
         let draw_nz = draw_bg(&self.draw_ubuf, &nonzero);
         let draw_z = draw_bg(&self.ghost_ubuf, &zeros);
         let pick_nz = draw_bg(&self.pick_ubuf, &nonzero);
-        self.scene = Some(Scene { layout: layout.clone(), levels, colors, nonzero, zeros, counters, draw_nz, draw_z, pick_nz });
+        self.scene = Some(Scene { layout: layout.clone(), spectral: palette.scheme == Scheme::Spectral, levels, colors, nonzero, zeros, counters, draw_nz, draw_z, pick_nz });
     }
 
     /// New palette or color offset for the same selection.
@@ -463,8 +465,12 @@ impl TetraRenderer {
         let Some(s) = &mut self.scene else { return };
         let words = color_words(&s.layout, palette, offset);
         self.queue.write_buffer(&s.colors, 0, bytemuck::cast_slice(&words));
-        let lv = level_words(&s.layout, palette.scheme == Scheme::Spectral);
-        self.queue.write_buffer(&s.levels, 0, bytemuck::cast_slice(&lv));
+        // the levels depend on the scheme only through spectral's white 1
+        let spectral = palette.scheme == Scheme::Spectral;
+        if spectral != s.spectral {
+            self.queue.write_buffer(&s.levels, 0, bytemuck::cast_slice(&level_words(&s.layout, spectral)));
+            s.spectral = spectral;
+        }
     }
 
     pub fn has_scene(&self) -> bool {

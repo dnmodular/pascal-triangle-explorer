@@ -95,8 +95,17 @@ fn strided_and_deep_slices_match_too() {
 #[test]
 fn the_pick_buffer_names_the_cube_the_ray_hits() {
     let (_gpu, mut r) = device();
-    let mods: Vec<u32> = (2..=26).collect();
-    let (layout, mds) = scene(&mut r, &mods, Spacing::True, u32::MAX);
+    let small: Vec<u32> = (2..=26).collect();
+    pick_agrees(&mut r, &small, Spacing::True, u32::MAX, 400, 100);
+    pick_agrees(&mut r, &small, Spacing::Packed, u32::MAX, 300, 100);
+    // cubes s cells wide
+    let l = pick_agrees(&mut r, &(2..=120).collect::<Vec<_>>(), Spacing::True, 20_000, 300, 100);
+    assert!(l.stride > 1, "stride {}", l.stride);
+}
+
+/// GPU picks against the CPU ray cast over a grid of pixels from four camera views.
+fn pick_agrees(r: &mut TetraRenderer, mods: &[u32], spacing: Spacing, budget: u32, min_hits: usize, min_misses: usize) -> Layout {
+    let (layout, mds) = scene(r, mods, spacing, budget);
     let (w, h) = (320u32, 240u32);
     r.ensure_target(w, h);
     let he = layout.half_extents();
@@ -146,9 +155,10 @@ fn the_pick_buffer_names_the_cube_the_ray_hits() {
             }
         }
     }
-    eprintln!("{tested} hits and {misses} misses agreed");
-    assert!(tested > 400, "only {tested} decisive hits");
-    assert!(misses > 100, "only {misses} misses");
+    eprintln!("{spacing:?}, stride {}: {tested} hits and {misses} misses agreed", layout.stride);
+    assert!(tested > min_hits, "only {tested} decisive hits");
+    assert!(misses > min_misses, "only {misses} misses");
+    layout
 }
 
 #[test]
