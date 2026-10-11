@@ -14,10 +14,14 @@ pub const ROW_H: f64 = 0.866_025_403_784_438_6;
 /// Deepest row the view can reach (a billion rows; the shader keeps `x0 + n/2` inside i32).
 pub const MAX_ROW: f64 = 1_000_000_000.0;
 pub const MIN_PPC: f64 = 1e-7;
-pub const MAX_PPC: f64 = 400.0;
-/// Padding `fit` leaves around the triangle, and the height of the status strip.
+/// Largest zoom: enough for a 2-row fit to fill an 8K-tall canvas.
+pub const MAX_PPC: f64 = 4096.0;
+/// Padding `fit` leaves at the canvas's sides, and the height of the status bar (its
+/// own strip under the canvas, so the canvas is exactly the visible view).
 pub const FIT_PAD: f64 = 12.0;
 pub const STATUS_H: f64 = 18.0;
+/// Slack for row edges that fall on a canvas edge up to float rounding.
+const EDGE_EPS: f64 = 1e-6;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct View {
@@ -30,13 +34,17 @@ pub struct View {
 }
 
 impl View {
-    /// Fit rows `0..rows` into a `w × h` canvas: apex at the top, centered horizontally.
+    /// Fit rows `0..rows` into a `w × h` canvas: the apex on the top edge, centered
+    /// horizontally. When height decides the scale (any canvas wider than the triangle's
+    /// 2 : √3), row `rows − 1` ends exactly on the bottom edge, so the view shows those
+    /// rows and nothing more; a narrower canvas shows the triangle's full width and
+    /// further rows below it.
     pub fn fit(w: f64, h: f64, rows: f64) -> View {
         let rows = rows.max(2.0);
         let aw = (w - 2.0 * FIT_PAD).max(1.0);
-        let ah = (h - 2.0 * FIT_PAD - STATUS_H).max(1.0);
+        let ah = h.max(1.0);
         let ppc = (aw / rows).min(ah / (rows * ROW_H)).clamp(MIN_PPC, MAX_PPC);
-        View { x0: -w / (2.0 * ppc), y0: -FIT_PAD / (ppc * ROW_H), ppc }
+        View { x0: -w / (2.0 * ppc), y0: 0.0, ppc }
     }
 
     pub fn cells_per_px(&self) -> f64 {
@@ -115,7 +123,17 @@ impl View {
         if hi <= 0.0 || lo >= hi {
             return None;
         }
-        Some((lo.floor() as u32, (hi.ceil() - 1.0).max(lo.floor()) as u32))
+        // a row edge on the canvas edge (up to rounding) does not make the next row visible
+        let first = (lo + EDGE_EPS).floor().min(hi);
+        Some((first as u32, ((hi - EDGE_EPS).ceil() - 1.0).max(first) as u32))
+    }
+
+    /// Inclusive range of rows wholly inside a canvas of height `h` (None when no row
+    /// fits completely, e.g. zoomed in past a single row).
+    pub fn full_rows(&self, h: f64) -> Option<(u32, u32)> {
+        let lo = (self.y0 - EDGE_EPS).ceil().max(0.0);
+        let hi = ((self.y0 + h * self.rows_per_px() + EDGE_EPS).floor() - 1.0).min(MAX_ROW);
+        (hi >= lo).then_some((lo as u32, hi as u32))
     }
 
     /// Number of cells inside the triangle that intersect the `w × h` canvas (exact for
@@ -244,7 +262,21 @@ mod tests {
                 assert_eq!(v.cell_at(x + w / 2.0, y + h / 2.0), Some((n, k)));
             }
         }
-        assert_eq!(v.cell_at(400.0, 2.0), None); // above the apex
+        assert_eq!(v.cell_at(400.0, 2.0), Some((0, 0)), "the apex touches the top edge");
+        // fitting R rows shows exactly rows 0..R−1, whole (no part of row R)
+        for (w, h, rows) in [(800.0, 600.0, 64.0), (980.0, 736.0, 2.0), (980.0, 736.0, 128.0), (1280.0, 700.0, 7.0)] {
+            let v = View::fit(w, h, rows);
+            let last = rows as u32 - 1;
+            assert_eq!(v.visible_rows(h), Some((0, last)), "{w}x{h} {rows} rows");
+            assert_eq!(v.full_rows(h), Some((0, last)), "{w}x{h} {rows} rows");
+        }
+        // a canvas narrower than the triangle shows its full width and more rows below
+        let v = View::fit(300.0, 900.0, 64.0);
+        assert!(v.visible_rows(900.0).unwrap().1 > 63);
+        // zoomed into the middle of one row: visible, but not whole
+        let v = View { x0: 0.0, y0: 10.3, ppc: 1000.0 };
+        assert_eq!(v.visible_rows(500.0), Some((10, 10)));
+        assert_eq!(v.full_rows(500.0), None);
     }
 
     #[test]

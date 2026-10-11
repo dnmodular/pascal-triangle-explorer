@@ -94,6 +94,14 @@ driver works: `sudo apt install mesa-vulkan-drivers` (lavapipe) and run
 | hover | inspector: *n*, *k*, `C(n,k)`, `C mod m`, ν_p for each prime factor, the Lucas digit product |
 | click a cell | pin its row for the wave overlay (click the row again, or **Esc**, to release) |
 | **W** | show / hide the wave overlay (it fades) |
+| **F11** | fullscreen: the canvas alone, panel, bars and buttons hidden; **Esc** returns |
+
+Fitting R rows shows exactly rows 0..R−1: the apex on the top edge and row R−1
+ending on the bottom edge (on any canvas wider than the triangle's 2 : √3; a narrower
+one shows its full width and more rows below). The status line is a bar of its own
+under the canvas, so the canvas is exactly what is in view, and the readouts, the
+in-cell numbers and the wave's last-visible-row fallback (the last whole row, never
+past R−1 while fitted) agree with it.
 
 The panel on the left has the modulus (text, ◀ ▶, log slider), the rows to fit and
 the rows-follow-m link, supersampling, the palette, the three color presets

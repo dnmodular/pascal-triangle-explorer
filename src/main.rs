@@ -66,6 +66,8 @@ struct Model {
     link_hold_sweep: bool,
     /// The canvas size (px) of the last frame, for fits made outside the canvas UI.
     canvas: (f64, f64),
+    /// The canvas alone, borderless over the whole screen (F11; Esc returns).
+    fullscreen: bool,
     ss: u32,
     show_numbers: bool,
     export_dir: String,
@@ -116,6 +118,7 @@ impl Model {
             link_factor: 1.0,
             link_hold_sweep: false,
             canvas: (0.0, 0.0),
+            fullscreen: false,
             ss: 2,
             show_numbers: true,
             export_dir: std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_else(|_| ".".into()),
@@ -364,6 +367,8 @@ struct App {
     fps_t0: Option<Instant>,
     /// A delayed repaint egui asked for.
     repaint_at: Option<Instant>,
+    /// Whether the window is in (borderless) fullscreen, to follow `Model::fullscreen`.
+    fullscreen_applied: bool,
 }
 
 const USAGE: &str = "pascal-triangle-explorer [options]
@@ -494,7 +499,7 @@ fn main() {
     }
     let event_loop = EventLoop::new().expect("event loop");
     event_loop.set_control_flow(ControlFlow::Wait);
-    let mut app = App { gfx: None, model, last_inputs: None, frame_ms: 0.0, frame_nr: 0, surface_errors: 0, fatal: false, last_m: 0, tween_t0: None, canvas_current: false, last_frame: None, continuous: false, fps_frames: 0, fps_t0: None, repaint_at: None };
+    let mut app = App { gfx: None, model, last_inputs: None, frame_ms: 0.0, frame_nr: 0, surface_errors: 0, fatal: false, last_m: 0, tween_t0: None, canvas_current: false, last_frame: None, continuous: false, fps_frames: 0, fps_t0: None, repaint_at: None, fullscreen_applied: false };
     event_loop.run_app(&mut app).expect("run");
 }
 
@@ -714,7 +719,13 @@ impl App {
         }
         // The panel runs before the canvas is laid out: give it last frame's canvas size
         // (the first frame estimates it), so its Fit and Reset fit the real canvas.
-        let mut canvas_px = if gfx.canvas_size.0 > 0 { gfx.canvas_size } else { (gfx.config.width.saturating_sub((PANEL_W * ppp) as u32).max(1), gfx.config.height.saturating_sub((SWEEP_BAR_H * ppp) as u32).max(1)) };
+        let mut canvas_px = if gfx.canvas_size.0 > 0 {
+            gfx.canvas_size
+        } else if self.model.fullscreen {
+            (gfx.config.width.max(1), gfx.config.height.max(1))
+        } else {
+            (gfx.config.width.saturating_sub((PANEL_W * ppp) as u32).max(1), gfx.config.height.saturating_sub(((SWEEP_BAR_H + STATUS_H as f32) * ppp) as u32).max(1))
+        };
         let model = &mut self.model;
         let frame_ms = self.frame_ms;
         self.frame_nr += 1;
@@ -724,21 +735,31 @@ impl App {
         let Gfx { renderer, egui_renderer, gpu, canvas_tex, canvas_size, .. } = gfx;
 
         let full_output = ctx.run_ui(raw_input, |ui| {
-            // ---- left panel ----
-            egui::Panel::left("panel").exact_size(PANEL_W).resizable(false).show(ui, |ui| {
-                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                    ui.set_max_width(PANEL_W - 24.0);
-                    panel_ui(ui, model, canvas_px, frame_ms);
+            // fullscreen: the canvas alone (F11 / Esc)
+            if !model.fullscreen {
+                // ---- left panel ----
+                egui::Panel::left("panel").exact_size(PANEL_W).resizable(false).show(ui, |ui| {
+                    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                        ui.set_max_width(PANEL_W - 24.0);
+                        panel_ui(ui, model, canvas_px, frame_ms);
+                    });
                 });
-            });
 
-            // ---- sweep bar under the canvas: fixed height, fixed slots ----
-            let bar_fill = ui.visuals().panel_fill;
-            egui::Panel::bottom("sweep")
-                .exact_size(SWEEP_BAR_H)
-                .resizable(false)
-                .frame(egui::Frame::NONE.fill(bar_fill).inner_margin(egui::Margin::symmetric(10, 6)))
-                .show(ui, |ui| sweep_bar(ui, model));
+                // ---- sweep bar under the canvas: fixed height, fixed slots ----
+                let bar_fill = ui.visuals().panel_fill;
+                egui::Panel::bottom("sweep")
+                    .exact_size(SWEEP_BAR_H)
+                    .resizable(false)
+                    .frame(egui::Frame::NONE.fill(bar_fill).inner_margin(egui::Margin::symmetric(10, 6)))
+                    .show(ui, |ui| sweep_bar(ui, model));
+
+                // ---- status bar between them: its own strip, so the canvas is exactly the view ----
+                egui::Panel::bottom("status")
+                    .exact_size(STATUS_H as f32)
+                    .resizable(false)
+                    .frame(egui::Frame::NONE.fill(Color32::from_gray(14)).inner_margin(egui::Margin::symmetric(8, 0)))
+                    .show(ui, |ui| status_bar(ui, model, gpu_ms, frame_ms));
+            }
 
             // ---- canvas ----
             egui::CentralPanel::default().frame(egui::Frame::NONE.fill(CANVAS_BG)).show(ui, |ui| {
@@ -773,7 +794,7 @@ impl App {
                 let handle = handled_frame != frame_nr;
                 handled_frame = frame_nr;
                 canvas_interaction(ui, model, &response, rect, ppp, handle);
-                canvas_overlays(ui, model, rect, ppp, gpu_ms, frame_ms, handle);
+                canvas_overlays(ui, model, rect, ppp, handle);
                 wave_overlay(ui, model, rect, ppp, dt, handle);
             });
         });
@@ -869,6 +890,11 @@ impl App {
             gfx.window.request_redraw();
         }
 
+        if model.fullscreen != self.fullscreen_applied {
+            gfx.window.set_fullscreen(model.fullscreen.then_some(winit::window::Fullscreen::Borderless(None)));
+            self.fullscreen_applied = model.fullscreen;
+            gfx.window.request_redraw();
+        }
         if let Some(rows) = model.pending_svg.take() {
             let vmax = (model.layers.preset() == Some(Preset::Valuation)).then(|| gfx.renderer.read_max()[0]);
             model.export_note = save_svg(model, rows, vmax);
@@ -1035,6 +1061,9 @@ fn panel_ui(ui: &mut egui::Ui, model: &mut Model, canvas_px: (u32, u32), _frame_
             });
         });
         note(ui, "When cells are smaller than a pixel, each pixel averages this many samples. Zoomed in, cells stay crisp.");
+        if ui.button("Fullscreen").on_hover_text("The canvas alone, over the whole screen: panel, sweep bar, status and buttons hidden (F11; Esc returns)").clicked() {
+            model.fullscreen = true;
+        }
         ui.checkbox(&mut model.show_numbers, "numbers when zoomed in");
         ui.add_space(4.0);
         ui.horizontal(|ui| {
@@ -1231,7 +1260,7 @@ fn panel_ui(ui: &mut egui::Ui, model: &mut Model, canvas_px: (u32, u32), _frame_
     });
 
     ui.separator();
-    note(ui, "Keys: space play/pause · ←/→ step · PgUp/PgDn ±10 steps · ↑/↓ rows · shift = ×10 · F fit. Drag to pan, wheel to zoom, double-click to fit. Hover a cell to inspect it; click it to pin its row for the wave (Esc releases) · W wave on/off.");
+    note(ui, "Keys: space play/pause · ←/→ step · PgUp/PgDn ±10 steps · ↑/↓ rows · shift = ×10 · F fit. Drag to pan, wheel to zoom, double-click to fit. Hover a cell to inspect it; click it to pin its row for the wave (Esc releases) · W wave on/off · F11 fullscreen (Esc returns).");
 }
 
 /// Subscript digits: 7 → ₇.
@@ -1500,7 +1529,7 @@ fn canvas_interaction(ui: &mut egui::Ui, model: &mut Model, response: &egui::Res
 
     // Keyboard, when no text field has focus.
     if handle && !ui.ctx().egui_wants_keyboard_input() {
-        let (space, shift, right, left, pgup, pgdn, up, down, fit, wave, esc) = ui.input(|i| {
+        let (space, shift, right, left, pgup, pgdn, up, down, fit, wave, esc, f11) = ui.input(|i| {
             (
                 i.key_pressed(egui::Key::Space),
                 i.modifiers.shift,
@@ -1513,15 +1542,21 @@ fn canvas_interaction(ui: &mut egui::Ui, model: &mut Model, response: &egui::Res
                 i.key_pressed(egui::Key::F),
                 i.key_pressed(egui::Key::W),
                 i.key_pressed(egui::Key::Escape),
+                i.key_pressed(egui::Key::F11),
             )
         });
+        if f11 {
+            model.fullscreen = !model.fullscreen;
+        }
         if wave {
             model.wave.toggle();
         }
         // Esc that left a text field or closed a popup is not an unpin
         if esc && !model.focus_last_frame {
-            // a selection (or picking one) goes first, then the pin
-            if model.wave_select != WaveSelect::Off {
+            // fullscreen goes first, then a selection (or picking one), then the pin
+            if model.fullscreen {
+                model.fullscreen = false;
+            } else if model.wave_select != WaveSelect::Off {
                 model.wave_select = WaveSelect::Off;
             } else {
                 model.pinned_row = None;
@@ -1555,7 +1590,7 @@ fn canvas_interaction(ui: &mut egui::Ui, model: &mut Model, response: &egui::Res
     }
 }
 
-fn canvas_overlays(ui: &mut egui::Ui, model: &mut Model, rect: Rect, ppp: f32, gpu_ms: Option<f32>, frame_ms: f32, handle: bool) {
+fn canvas_overlays(ui: &mut egui::Ui, model: &mut Model, rect: Rect, ppp: f32, handle: bool) {
     let painter = ui.painter_at(rect);
     let cw = (rect.width() * ppp) as f64;
     let ch = (rect.height() * ppp) as f64;
@@ -1608,7 +1643,7 @@ fn canvas_overlays(ui: &mut egui::Ui, model: &mut Model, rect: Rect, ppp: f32, g
         let mut pos = rect.min + Vec2::new(8.0, 8.0);
         // keep clear of the wave overlay: below it, else just above the status strip
         if let Some(b) = model.wave.box_rect() {
-            let floor = rect.max.y - STATUS_H as f32;
+            let floor = rect.max.y;
             let clear = |p: Pos2| {
                 let r = Rect::from_min_size(p, size);
                 !r.intersects(b.expand(4.0)) && r.max.y <= floor
@@ -1624,10 +1659,11 @@ fn canvas_overlays(ui: &mut egui::Ui, model: &mut Model, rect: Rect, ppp: f32, g
         painter.galley(pos + Vec2::new(9.0, 6.0), galley, Color32::from_rgb(221, 221, 221));
     }
 
-    // −/+/Fit at the top right.
+    // −/+/Fit at the top right (not in fullscreen).
     let btn_h = 22.0;
     let mut x = rect.max.x - 8.0;
-    for (label, action) in [("Fit", 2u8), ("+", 1), ("−", 0)] {
+    let buttons: &[(&str, u8)] = if model.fullscreen { &[] } else { &[("Fit", 2u8), ("+", 1), ("−", 0)] };
+    for &(label, action) in buttons {
         let w = if action == 2 { 34.0 } else { 24.0 };
         x -= w;
         let r = Rect::from_min_size(Pos2::new(x, rect.min.y + 8.0), Vec2::new(w, btn_h));
@@ -1643,22 +1679,23 @@ fn canvas_overlays(ui: &mut egui::Ui, model: &mut Model, rect: Rect, ppp: f32, g
         }
         x -= 4.0;
     }
+}
 
-    // Status strip.
-    let rows = model.view.visible_rows(ch);
-    let cells = model.view.visible_cells(cw, ch);
+/// The status bar under the canvas: modulus, the rows and cells in view, timings.
+fn status_bar(ui: &mut egui::Ui, model: &Model, gpu_ms: Option<f32>, frame_ms: f32) {
+    let (cw, ch) = model.canvas;
     let mut parts = vec![format!("m = {}", model.m)];
-    if let Some((a, b)) = rows {
+    if let Some((a, b)) = model.view.visible_rows(ch) {
         parts.push(format!("rows {}–{}", group(a as u64), group(b as u64)));
     }
-    parts.push(format!("{} cells", group(cells)));
+    parts.push(format!("{} cells", group(model.view.visible_cells(cw, ch))));
     if let Some(g) = gpu_ms {
         parts.push(format!("gpu {g:.1} ms"));
     }
     parts.push(format!("frame {frame_ms:.1} ms"));
-    let strip = Rect::from_min_max(Pos2::new(rect.min.x, rect.max.y - STATUS_H as f32), rect.max);
-    painter.rect_filled(strip, 0.0, Color32::from_black_alpha(150));
-    painter.text(Pos2::new(strip.min.x + 8.0, strip.center().y), Align2::LEFT_CENTER, parts.join("  ·  "), FontId::monospace(11.0), Color32::from_rgb(187, 187, 187));
+    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+        ui.add(egui::Label::new(egui::RichText::new(parts.join("  ·  ")).font(FontId::monospace(11.0)).color(Color32::from_rgb(187, 187, 187))).truncate());
+    });
 }
 
 /// The "modular wave" overlay, drawn last so it sits on top of the canvas. The state is
@@ -1674,7 +1711,10 @@ fn wave_overlay(ui: &mut egui::Ui, model: &mut Model, rect: Rect, ppp: f32, dt: 
         } else if model.over_wave || model.dragging {
             model.wave_row // on the overlay, or panning: keep playing the same row
         } else {
-            model.view.visible_rows(ch).map(|r| r.1).unwrap_or(model.wave_row)
+            // the last row wholly in view (a sliver of the next one does not count), and
+            // while fitted never past the rows asked for
+            let last = model.view.full_rows(ch).or(model.view.visible_rows(ch)).map_or(model.wave_row, |r| r.1);
+            if model.auto_fit { last.min((model.fit_rows.round() as u32).saturating_sub(1)) } else { last }
         };
         model.wave_row = row;
         model.wave.share_closed_form(&model.modulus);
@@ -1720,7 +1760,7 @@ fn wave_overlay(ui: &mut egui::Ui, model: &mut Model, rect: Rect, ppp: f32, dt: 
     if fade > 0.0 && !matches!(model.wave_select, WaveSelect::Active(..)) {
         let (_, y, _, h) = model.view.cell_rect(model.wave_row, 0);
         let yc = rect.min.y + ((y + h / 2.0) / ppp as f64) as f32;
-        if (rect.min.y..=rect.max.y - STATUS_H as f32).contains(&yc) {
+        if (rect.min.y..=rect.max.y).contains(&yc) {
             let a = if model.pinned_row.is_some() { 0.95 } else { 0.55 };
             let stroke = egui::Stroke::new(2.0, Color32::from_rgba_unmultiplied(0x4f, 0xc3, 0xf7, (a * fade * 255.0) as u8));
             painter.line_segment([Pos2::new(rect.min.x, yc), Pos2::new(rect.min.x + 10.0, yc)], stroke);

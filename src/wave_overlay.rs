@@ -104,7 +104,7 @@ pub struct OverlayConfig {
     pub margin: f32,
     /// Extra gap at the top edge (keeps the canvas zoom buttons clear).
     pub top_clearance: f32,
-    /// Extra gap at the bottom edge (the status strip).
+    /// Extra gap at the bottom edge.
     pub bottom_clearance: f32,
     /// Side as a fraction of min(window width, height), clamped to [min_side, max_side]
     /// and then to the canvas.
@@ -121,7 +121,7 @@ pub struct OverlayConfig {
 
 impl Default for OverlayConfig {
     fn default() -> Self {
-        OverlayConfig { corner: Corner::TopRight, margin: 16.0, top_clearance: 26.0, bottom_clearance: 18.0, size_frac: 0.28, min_side: 160.0, max_side: 420.0, drift: PHASE_DRIFT, fill: true, smooth: true }
+        OverlayConfig { corner: Corner::TopRight, margin: 16.0, top_clearance: 26.0, bottom_clearance: 0.0, size_frac: 0.28, min_side: 160.0, max_side: 420.0, drift: PHASE_DRIFT, fill: true, smooth: true }
     }
 }
 
