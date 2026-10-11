@@ -94,8 +94,9 @@ impl TetraView {
 
     /// The tile's color is running down or back up.
     pub fn filling(&self) -> bool {
-        let want = if self.tile_hot && !self.open { 1.0 } else { 0.0 };
-        self.visible() && self.fill != want
+        // (the space draws everything filled: nothing to animate there)
+        let want = if self.tile_hot { 1.0 } else { 0.0 };
+        !self.open && self.visible() && self.fill != want
     }
 
     /// The fill height of the next draw: everything in the 3D space; in the tile, from
@@ -277,7 +278,7 @@ pub fn panel(ui: &mut egui::Ui, model: &mut Model) {
         _ => "no moduli in the range".into(),
     };
     mono_line(ui, &text);
-    note(ui, "One slice per modulus m: rows 0..m−1 of the triangle mod m, stacked downward, so the solid is a tetrahedron. Zero cells are left out, and their voids run through it as tunnels. Hover a cube to color the cells around it.");
+    note(ui, "One slice per modulus m: rows 0..m−1 of the triangle mod m, stacked downward, so the solid is a tetrahedron. Zero cells are left out, and their voids run through it as tunnels. Hover a cube to highlight the cells around it.");
 }
 
 fn short(n: u32) -> String {
@@ -329,6 +330,9 @@ pub fn tile(ui: &mut egui::Ui, model: &mut Model, rect: Rect, ppp: f32, tex: Opt
     painter.text(Pos2::new(img.min.x + 4.0, img.max.y - 3.0), Align2::LEFT_BOTTOM, sub, FontId::monospace(9.0), Color32::from_rgba_unmultiplied(187, 187, 187, 190));
     if resp.clicked() {
         model.tetra.open = true;
+        // the space shows everything colored; the tile comes back as wire
+        model.tetra.tile_hot = false;
+        model.tetra.fill = 0.0;
     }
     if hot {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);

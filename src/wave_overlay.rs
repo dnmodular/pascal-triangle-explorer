@@ -872,7 +872,18 @@ impl WaveOverlay {
         let p64 = period as i64;
         self.buckets.clear();
         self.buckets.resize(period, (0.0, 0.0));
-        let shift = self.shift;
+        // Frequencies past the sampling limit (|f| > P/2, deep rows) alias: a fractional
+        // shift would turn each by its true f·s, not as the folded picture moves, and the
+        // plot would churn every frame. Snapped to whole samples, e^{−ifs} =
+        // e^{−2πi (f mod P) j₀/P} and the plot is an exact cyclic rotation: it slides one
+        // sample at a time and keeps its shape (and its envelope).
+        let half = (period / 2) as u64;
+        let shift = if self.active.iter().any(|&(f, _)| f.unsigned_abs() > half) {
+            let step = std::f64::consts::TAU / period as f64;
+            (self.shift / step).floor() * step
+        } else {
+            self.shift
+        };
         for &(f, c) in &self.active {
             let c = if f.rem_euclid(2) == 1 { -c } else { c };
             let b = &mut self.buckets[f.rem_euclid(p64) as usize];
@@ -1385,6 +1396,23 @@ mod tests {
             hi = hi.max(peak);
         }
         assert!(hi > 0.99 && lo > 0.97, "the peak moved between {lo} and {hi}");
+    }
+
+    #[test]
+    fn deep_rows_scroll_without_churning() {
+        // past the sampling limit the plot must slide as a whole: every frame's samples
+        // are a cyclic rotation of the previous ones (same values, shifted)
+        let mut w = overlay();
+        w.config.smooth = false;
+        w.set_source(1999, 7, (0, 1999));
+        run(&mut w, 1.0, 1.0 / 60.0);
+        let period = w.samples().len() - 1;
+        assert!(1999 > period / 2, "the row is past the sampling limit ({period} samples)");
+        let a: Vec<f32> = w.samples()[..period].to_vec();
+        run(&mut w, 0.5, 1.0 / 60.0);
+        let b: Vec<f32> = w.samples()[..period].to_vec();
+        let rotated = (0..period).any(|d| (0..period).all(|j| (a[j] - b[(j + d) % period]).abs() <= 1e-3 * (1.0 + a[j].abs())));
+        assert!(rotated, "the deep row changed shape while scrolling");
     }
 
     #[test]

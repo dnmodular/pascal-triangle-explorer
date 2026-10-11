@@ -759,7 +759,7 @@ pub fn outline_vertices(layout: &Layout) -> Vec<LineVertex> {
         tri(layout.outline(s.m, s.height), [0.32, 0.95, 0.48, 0.16], false);
     }
     for m in layout.missing() {
-        tri(layout.outline(m, m as f32), [0.45, 0.8, 0.55, 0.22], true);
+        tri(layout.outline(m, layout.height_of(m)), [0.45, 0.8, 0.55, 0.22], true);
     }
     v
 }

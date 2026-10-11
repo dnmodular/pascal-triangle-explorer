@@ -75,10 +75,12 @@ impl Shape {
         }
     }
 
-    /// The (x, z) shift of a slice of side s = m − 1 (in the 2D layout its apex is at
-    /// the origin and its last row at z = s·√3/2): the anchored point moves to the axis.
-    pub fn offset(self, m: u32) -> (f32, f32) {
-        let s = m.saturating_sub(1) as f32;
+    /// The (x, z) shift of a slice whose drawn last row is row `side` (in the 2D layout
+    /// its apex is at the origin and that row at z = side·√3/2): the anchored point moves
+    /// to the axis. `side` is m − 1, or the last strided row under a cell stride, so the
+    /// drawn corner cubes are the ones on the axis.
+    pub fn offset(self, side: u32) -> (f32, f32) {
+        let s = side as f32;
         let back = s * SQRT3_2;
         match self {
             Shape::Regular => (0.0, -back * 2.0 / 3.0),
@@ -176,6 +178,11 @@ pub fn strided_rows(m: u32, stride: u32) -> u32 {
     (m - 1) / stride + 1
 }
 
+/// The last drawn row of slice m at stride s (m − 1 at stride 1).
+pub fn strided_side(m: u32, stride: u32) -> u32 {
+    (strided_rows(m, stride) - 1) * stride
+}
+
 /// Cells of a slice at stride s: row i·s holds cells 0, s, …, i·s.
 pub fn strided_cells(m: u32, stride: u32) -> u64 {
     let r = strided_rows(m, stride) as u64;
@@ -245,7 +252,7 @@ impl Layout {
                 Spacing::True => true_height(m),
                 Spacing::Packed => i as f32 * LEVEL,
             };
-            let (ox, oz) = shape.offset(m);
+            let (ox, oz) = shape.offset(strided_side(m, stride));
             slices.push(Slice { m, height, ox, oz, rows: strided_rows(m, stride), cells, cell_base: base });
             base += cells;
         }
@@ -319,8 +326,8 @@ impl Layout {
     /// The centres of the corner cubes of a slice of modulus m at height h: the apex,
     /// the left and the right end of its last (strided) row.
     pub fn corners(&self, m: u32, h: f32) -> [[f32; 3]; 3] {
-        let n_last = (strided_rows(m, self.stride) - 1) * self.stride;
-        let (ox, oz) = self.shape.offset(m);
+        let n_last = strided_side(m, self.stride);
+        let (ox, oz) = self.shape.offset(n_last);
         [cell_center(h, ox, oz, 0, 0), cell_center(h, ox, oz, n_last, 0), cell_center(h, ox, oz, n_last, n_last)]
     }
 
@@ -659,6 +666,14 @@ mod tests {
     #[test]
     fn the_equilateral_stack_is_a_regular_tetrahedron() {
         let mods: Vec<u32> = (2..=60).collect();
+        // with a cell stride the drawn slices are what stays centred
+        let strided = Layout::with_shape(&mods, Spacing::True, Shape::Regular, 4000);
+        assert!(strided.stride > 1);
+        for sl in &strided.slices {
+            let c = strided.corners(sl.m, sl.height);
+            let (cx, cz) = ((c[0][0] + c[1][0] + c[2][0]) / 3.0, (c[0][2] + c[1][2] + c[2][2]) / 3.0);
+            assert!(cx.abs() < 1e-3 && cz.abs() < 1e-3, "strided m {}: centroid ({cx}, {cz})", sl.m);
+        }
         let l = Layout::with_shape(&mods, Spacing::True, Shape::Regular, u32::MAX);
         // the apex (side 0, m = 1) is the origin; the base is the last slice's corners
         let base = l.corners(60, l.slices.last().unwrap().height);
@@ -681,11 +696,18 @@ mod tests {
     fn flush_shapes_stand_their_faces_vertical() {
         let mods: Vec<u32> = (2..=40).collect();
         // which corners stay on the vertical axis through the stack
+        // at stride 1 and under a cell stride (whose drawn corners are what lines up)
         let on_axis = |shape: Shape, pick: &dyn Fn([[f32; 3]; 3]) -> [f32; 3]| {
-            let l = Layout::with_shape(&mods, Spacing::True, shape, u32::MAX);
-            l.slices.iter().all(|s| {
-                let p = pick(l.corners(s.m, s.height));
-                p[0].abs() < 1e-3 && p[2].abs() < 1e-3
+            [u32::MAX, 3000].iter().all(|&budget| {
+                let l = Layout::with_shape(&mods, Spacing::True, shape, budget);
+                assert_eq!(l.stride > 1, budget == 3000);
+                l.slices.iter().all(|s| {
+                    let p = pick(l.corners(s.m, s.height));
+                    let c = l.center(l.slice_of(s.m).unwrap(), 0, 0);
+                    // the corners are the drawn cubes' centres
+                    assert!(sub(c, l.corners(s.m, s.height)[0]).iter().all(|v| v.abs() < 1e-4));
+                    p[0].abs() < 1e-3 && p[2].abs() < 1e-3
+                })
             })
         };
         let mid = |a: [f32; 3], b: [f32; 3]| scale(add(a, b), 0.5);
