@@ -52,6 +52,14 @@ pub struct TetraView {
     /// Pointer and camera of the last pick, so an unchanged view is not picked again.
     last_pick: Option<((f32, f32), Camera)>,
     focus_last_frame: bool,
+    /// The space laid itself out this frame (its target size is real, not the tile's).
+    sized: bool,
+    /// Pixels the flat views leave free above (the HUD) and below (the 2D thumbnail).
+    flat_insets: (f32, f32),
+    /// The scene the space last showed and its bounds: its camera survives a visit to
+    /// the 2D view (whose tile shows the stack), and carries over a new spacing.
+    space_key: Option<SceneKey>,
+    space_bounds: Option<([f32; 3], [f32; 3])>,
 }
 
 /// GPU-side caches of the app.
@@ -100,12 +108,22 @@ impl TetraView {
         self.unfold = 0.0;
     }
 
+    /// Enter the 3D space (the diamond's hinge swings open again), whichever way in.
+    pub fn enter(&mut self) {
+        self.open = true;
+        self.sized = false;
+        if self.config.view == View::Diamond {
+            self.unfold = 0.0;
+        }
+    }
+
     /// The camera the next draw uses: the space's, or the slowly turning preview.
     fn draw_camera(&mut self) -> Option<Camera> {
         let layout = self.layout.as_ref()?;
         if self.open {
-            let aspect = self.target_px.0.max(1) as f32 / self.target_px.1.max(1) as f32;
-            Some(*self.camera.get_or_insert_with(|| if layout.view.flat() { Camera::flat(layout.at_rest().bounds(), aspect) } else { Camera::framing(layout.bounds()) }))
+            let (w, h) = (self.target_px.0 as f32, self.target_px.1 as f32);
+            let (top, bottom) = self.flat_insets;
+            Some(*self.camera.get_or_insert_with(|| if layout.view.flat() { Camera::flat(layout.at_rest().bounds(), w, h, top, bottom) } else { Camera::framing(layout.bounds()) }))
         } else {
             let mut c = Camera::framing(layout.bounds());
             c.yaw += self.spin;
@@ -180,6 +198,11 @@ pub fn render(model: &mut Model, cache: &mut TetraCache, r: &mut TetraRenderer, 
     if !model.tetra.visible() {
         return false;
     }
+    // the frame the space opens on still has the tile's size: build and frame it once
+    // the space has laid itself out
+    if model.tetra.open && !model.tetra.sized {
+        return false;
+    }
     let t = &mut model.tetra;
     let view = t.view();
     let key = t.config.scene_key(view);
@@ -194,19 +217,27 @@ pub fn render(model: &mut Model, cache: &mut TetraCache, r: &mut TetraRenderer, 
         r.set_scene(&layout, &mds, &model.palette, model.style.offset);
         r.set_lines(&outline_vertices(&layout));
         t.counts = r.read_counts();
-        let same_view = t.layout.as_ref().is_some_and(|l| l.view == view);
-        // a new range or view is framed anew; in the stack a new spacing, shape or level
-        // of detail keeps the angle and the relative zoom
-        let reframe = !same_view || view.flat() || cache.scene.is_none_or(|k| (k.0, k.1, k.2, k.3, k.4, k.5) != (key.0, key.1, key.2, key.3, key.4, key.5));
-        if reframe {
-            t.camera = None;
-        } else if let (Some(cam), Some(old)) = (t.camera.as_mut(), t.layout.as_ref()) {
-            let (was, now) = (Camera::framing(old.bounds()), Camera::framing(layout.bounds()));
-            let pan = [cam.target[0] - was.target[0], cam.target[1] - was.target[1], cam.target[2] - was.target[2]];
-            let scale = now.radius / was.radius;
-            cam.target = [now.target[0] + pan[0] * scale, now.target[1] + pan[1] * scale, now.target[2] + pan[2] * scale];
-            cam.dist *= now.dist / was.dist;
-            cam.radius = now.radius;
+        // The space's camera: the tile's rebuilds leave it alone, and coming back to the
+        // scene the space last showed keeps it. A new range or view is framed anew; in
+        // the stack a new spacing, shape or level of detail keeps the angle and the
+        // relative zoom.
+        if t.open && t.space_key != Some(key) {
+            let same_sel = t.space_key.is_some_and(|k| (k.0, k.1, k.2, k.3, k.4, k.5, k.9) == (key.0, key.1, key.2, key.3, key.4, key.5, key.9));
+            match (view, same_sel, t.camera.as_mut(), t.space_bounds) {
+                (View::Stack, true, Some(cam), Some(old)) => {
+                    let (was, now) = (Camera::framing(old), Camera::framing(layout.bounds()));
+                    let pan = [cam.target[0] - was.target[0], cam.target[1] - was.target[1], cam.target[2] - was.target[2]];
+                    let scale = now.radius / was.radius;
+                    cam.target = [now.target[0] + pan[0] * scale, now.target[1] + pan[1] * scale, now.target[2] + pan[2] * scale];
+                    cam.dist *= now.dist / was.dist;
+                    cam.radius = now.radius;
+                }
+                _ => t.camera = None,
+            }
+        }
+        if t.open {
+            t.space_key = Some(key);
+            t.space_bounds = Some(layout.at_rest().bounds());
         }
         t.layout = Some(layout);
         t.hover = None;
@@ -265,7 +296,7 @@ pub fn panel(ui: &mut egui::Ui, model: &mut Model) {
     let t = &mut model.tetra;
     ui.horizontal(|ui| {
         if ui.button("Open 3D view").on_hover_text("The tetra stack in its own space (or click the preview tile); Esc or the 2D thumbnail returns").clicked() {
-            t.open = true;
+            t.enter();
         }
         ui.checkbox(&mut t.config.tile, "preview tile");
         ui.checkbox(&mut t.config.spin, "spin");
@@ -316,7 +347,10 @@ fn options(ui: &mut egui::Ui, t: &mut TetraView) {
                 ui.selectable_value(&mut c.sweep.mode, m, m.label()).on_hover_text(m.note());
             }
         });
-        match c.sweep.mode {
+    });
+    // the mode's own options on a line of their own (they would overflow the panel)
+    if matches!(c.sweep.mode, ModMode::Prime | ModMode::Interval) {
+        ui.horizontal(|ui| match c.sweep.mode {
             ModMode::Prime => {
                 egui::ComboBox::from_id_salt("tetra prime order").width(110.0).selected_text(c.sweep.prime_order.label()).show_ui(ui, |ui| {
                     for o in PrimeOrder::ALL {
@@ -335,8 +369,8 @@ fn options(ui: &mut egui::Ui, t: &mut TetraView) {
                 }
             }
             _ => {}
-        }
-    });
+        });
+    }
     ui.add_enabled_ui(c.view == View::Stack, |ui| {
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("shape").color(ui.visuals().weak_text_color()));
@@ -369,7 +403,7 @@ fn options(ui: &mut egui::Ui, t: &mut TetraView) {
     let mods = selected_moduli(&c.sweep);
     let text = match (mods.first(), mods.last()) {
         (Some(a), Some(b)) => {
-            let s = view_stride(c.view, &mods, c.budget);
+            let s = view_stride(c.view, &mods, c.spacing, c.budget);
             let lod = if s > 1 { format!(" · stride {s}") } else { String::new() };
             format!("{} moduli, {a}–{b}{lod}", mods.len())
         }
@@ -403,6 +437,7 @@ fn tile_rect(model: &Model, rect: Rect) -> Rect {
 
 /// The live preview tile, styled like the wave overlay's box. Click to open the space.
 pub fn tile(ui: &mut egui::Ui, model: &mut Model, rect: Rect, ppp: f32, tex: Option<egui::TextureId>) {
+    model.tetra.sized = false;
     if !model.tetra.config.tile || rect.width() < 300.0 || rect.height() < 240.0 {
         model.tetra.tile_rect = None;
         model.tetra.tile_hot = false;
@@ -428,13 +463,10 @@ pub fn tile(ui: &mut egui::Ui, model: &mut Model, rect: Rect, ppp: f32, tex: Opt
     };
     painter.text(Pos2::new(img.min.x + 4.0, img.max.y - 3.0), Align2::LEFT_BOTTOM, sub, FontId::monospace(9.0), Color32::from_rgba_unmultiplied(187, 187, 187, 190));
     if resp.clicked() {
-        model.tetra.open = true;
+        model.tetra.enter();
         // the space shows everything colored; the tile comes back as wire
         model.tetra.tile_hot = false;
         model.tetra.fill = 0.0;
-        if model.tetra.config.view == View::Diamond {
-            model.tetra.unfold = 0.0;
-        }
     }
     if hot {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -459,6 +491,7 @@ pub fn space(ui: &mut egui::Ui, model: &mut Model, ppp: f32, tex: Option<egui::T
         let rect = ui.available_rect_before_wrap();
         let (w, h) = (((rect.width() * ppp).round() as u32).max(1), ((rect.height() * ppp).round() as u32).max(1));
         model.tetra.target_px = (w, h);
+        model.tetra.sized = true;
         let resp = ui.allocate_rect(rect, Sense::click_and_drag());
         let painter = ui.painter_at(rect);
         if let Some(id) = tex {
@@ -470,6 +503,8 @@ pub fn space(ui: &mut egui::Ui, model: &mut Model, ppp: f32, tex: Option<egui::T
         // the canvas's aspect, at most 240 wide and 200 tall
         let tw = (rect.width() * 0.18).clamp(120.0, 240.0).min(200.0 * aspect);
         let th = tw / aspect;
+        // the flat views keep clear of the HUD (up to its eleven lines) and the thumbnail
+        model.tetra.flat_insets = ((12.0 + 12.0 + 11.0 * 15.0) * ppp, (th + 16.0 + 8.0) * ppp);
         let thumb = Rect::from_min_size(Pos2::new(rect.max.x - 16.0 - tw, rect.max.y - 16.0 - th), Vec2::new(tw, th));
         let tresp = ui.interact(thumb, ui.id().with("tetra back"), Sense::click()).on_hover_text("Back to the 2D view (Esc)");
         painter.rect_filled(thumb.expand(4.0), CornerRadius::same(8), Color32::from_rgba_unmultiplied(0, 0, 0, 158));
@@ -586,12 +621,12 @@ pub fn space(ui: &mut egui::Ui, model: &mut Model, ppp: f32, tex: Option<egui::T
                 if l.view == View::Diamond {
                     if let Some(bi) = l.slices.len().checked_sub(1) {
                         let b = &l.slices[bi];
-                        let n_last = (b.rows - 1) * l.stride;
-                        let tip = l.center(bi, 0, 0);
+                        let (n_last, k_last) = (b.last_row(l.stride), b.last_k(l.stride));
+                        let tip = l.center(bi, b.n0, 0);
                         if let Some(p) = to_pt([tip[0], tip[1] - gap, tip[2]]) {
-                            painter.text(p, Align2::CENTER_TOP, format!("mod {} · rows 0–{}", b.m, n_last), FontId::monospace(10.0), label_col);
+                            painter.text(p, Align2::CENTER_TOP, format!("mod {} · rows {}–{}", b.m, b.n0, n_last), FontId::monospace(10.0), label_col);
                         }
-                        let e = l.center(bi, n_last, n_last);
+                        let e = l.center(bi, n_last, k_last);
                         if let Some(p) = to_pt([e[0] + gap, e[1], e[2]]) {
                             painter.text(p, Align2::LEFT_CENTER, format!("◀ hinge: row {n_last} mod {}", b.m), FontId::monospace(10.0), label_col);
                         }
@@ -618,7 +653,8 @@ pub fn space(ui: &mut egui::Ui, model: &mut Model, ppp: f32, tex: Option<egui::T
                     lines.push(format!("TETRA STACK · {} · m {a}–{z} · {} moduli · {}", l.view.label(), l.mods.len(), t.config.sweep.mode.label()));
                     lines.push(format!("{} cubes, {} zeros{}", group(t.counts.0 as u64), group(t.counts.1 as u64), if t.config.ghosts { " (ghosts)" } else { " (hidden)" }));
                     if l.stride > 1 {
-                        lines.push(format!("LOD: stride {} — 1 in {} slices, rows and cells, as cubes {} cells wide: {} of {} cells", l.stride, l.stride, l.stride, group(l.total as u64), group(l.full_total)));
+                        let what = if l.view == View::Stack { "slices" } else { "face rows" };
+                        lines.push(format!("LOD: stride {} — {} of {} {what} (at least a cube apart), 1 in {} rows and cells, cubes {} cells wide: {} of {} cells", l.stride, l.slices.len(), l.mods.len(), l.stride, l.stride, group(l.total as u64), group(l.full_total)));
                     }
                 }
                 _ => lines.push("TETRA STACK · no moduli in the range".into()),
@@ -635,9 +671,10 @@ pub fn space(ui: &mut egui::Ui, model: &mut Model, ppp: f32, tex: Option<egui::T
                     lines.push("front face: row m − 1 of the triangle mod m for each m, so row r = C(r, k) mod (r + 1)".into());
                     lines.push("a row alternates 1, m−1, 1, … exactly when m is prime; zeros need 3+ distinct prime factors (first at 30)".into());
                     if l.view == View::Diamond {
-                        let deg = l.fold.to_degrees();
-                        let hinge = if deg > 0.05 { format!(" · hinge {deg:.0}° open of {:.0}°", FOLD.to_degrees()) } else { String::new() };
-                        lines.push(format!("below the hinge: the base slice mod {}, every row, unfolded{hinge}", l.mods.last().copied().unwrap_or(0)));
+                        // l.fold is what is still folded: 0 lies flat
+                        let (open, swinging) = ((FOLD - l.fold).to_degrees(), l.fold.to_degrees() > 0.05);
+                        let hinge = if swinging { format!(", unfolding: hinge {open:.0}° open of {:.0}°", FOLD.to_degrees()) } else { ", unfolded flat".into() };
+                        lines.push(format!("below the hinge: the base slice mod {}, every row{hinge}", l.mods.last().copied().unwrap_or(0)));
                     }
                     lines.push(match l.spacing {
                         Spacing::True => "true spacing: rows sit at m − 1, skipped moduli leave blank rows (G)".into(),
@@ -663,7 +700,11 @@ pub fn space(ui: &mut egui::Ui, model: &mut Model, ppp: f32, tex: Option<egui::T
                 }
             }
         }
-        lines.push(if flat { "drag pan · wheel zoom · double-click reframe · V view · U unfold · O options · Esc back" } else { "drag orbit · right / shift-drag pan · wheel zoom · double-click reset · V view · O options · Esc back" }.into());
+        lines.push(match t.config.view {
+            View::Stack => "drag orbit · right / shift-drag pan · wheel zoom · double-click reset · V view · O options · Esc back",
+            View::Face => "drag pan · wheel zoom · double-click reframe · V view · O options · Esc back",
+            View::Diamond => "drag pan · wheel zoom · double-click reframe · V view · U unfold · O options · Esc back",
+        }.into());
         let galleys: Vec<_> = lines.iter().enumerate().map(|(i, s)| {
             let col = if i == 0 { Color32::from_rgb(160, 240, 180) } else { Color32::from_rgb(187, 200, 190) };
             painter.layout_no_wrap(s.clone(), FontId::monospace(11.0), col)

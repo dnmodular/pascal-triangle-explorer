@@ -35,7 +35,8 @@ pub const BUDGETS: [u32; 6] = [250_000, 500_000, 1_000_000, 2_000_000, 4_000_000
 /// How the slices line up: their centroids (a regular tetrahedron), one corner (two
 /// faces vertical, meeting in a vertical edge) or the middle of one edge (one face
 /// vertical). The corners and edges are those of the 2D triangle: the apex (row 0), the
-/// left and right ends of the last row; the back edge is the last row.
+/// left and right ends of the last row; the front edge is the last row (the face the
+/// default camera looks at, which the front-face view lays flat).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Hash)]
 pub enum Shape {
     #[default]
@@ -43,13 +44,13 @@ pub enum Shape {
     CornerApex,
     CornerLeft,
     CornerRight,
-    FaceBack,
+    FaceFront,
     FaceLeft,
     FaceRight,
 }
 
 impl Shape {
-    pub const ALL: [Shape; 7] = [Shape::Regular, Shape::CornerApex, Shape::CornerLeft, Shape::CornerRight, Shape::FaceBack, Shape::FaceLeft, Shape::FaceRight];
+    pub const ALL: [Shape; 7] = [Shape::Regular, Shape::CornerApex, Shape::CornerLeft, Shape::CornerRight, Shape::FaceFront, Shape::FaceLeft, Shape::FaceRight];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -57,7 +58,7 @@ impl Shape {
             Shape::CornerApex => "flush corner: apex",
             Shape::CornerLeft => "flush corner: left",
             Shape::CornerRight => "flush corner: right",
-            Shape::FaceBack => "flush face: back",
+            Shape::FaceFront => "flush face: front",
             Shape::FaceLeft => "flush face: left",
             Shape::FaceRight => "flush face: right",
         }
@@ -67,9 +68,9 @@ impl Shape {
         match self {
             Shape::Regular => "A regular tetrahedron: every slice centred on one vertical axis, all four faces equilateral and equally tilted.",
             Shape::CornerApex => "The row-0 corners of all slices on one vertical line: the left and right faces stand vertical and meet in a vertical edge.",
-            Shape::CornerLeft => "The left ends of the last rows on one vertical line: the left and back faces stand vertical.",
-            Shape::CornerRight => "The right ends of the last rows on one vertical line: the right and back faces stand vertical.",
-            Shape::FaceBack => "The middles of the last rows on one vertical line: the back face (the last rows) stands vertical.",
+            Shape::CornerLeft => "The left ends of the last rows on one vertical line: the left and front faces stand vertical.",
+            Shape::CornerRight => "The right ends of the last rows on one vertical line: the right and front faces stand vertical.",
+            Shape::FaceFront => "The middles of the last rows on one vertical line: the front face (the last rows) stands vertical.",
             Shape::FaceLeft => "The middles of the left edges (k = 0) on one vertical line: the left face stands vertical.",
             Shape::FaceRight => "The middles of the right edges (k = n) on one vertical line: the right face stands vertical.",
         }
@@ -87,7 +88,7 @@ impl Shape {
             Shape::CornerApex => (0.0, 0.0),
             Shape::CornerLeft => (s / 2.0, -back),
             Shape::CornerRight => (-s / 2.0, -back),
-            Shape::FaceBack => (0.0, -back),
+            Shape::FaceFront => (0.0, -back),
             Shape::FaceLeft => (s / 4.0, -back / 2.0),
             Shape::FaceRight => (-s / 4.0, -back / 2.0),
         }
@@ -198,28 +199,61 @@ pub fn strided_row_cells(m: u32, stride: u32) -> u64 {
     ((m - 1) / stride + 1) as u64
 }
 
-/// The selection indices drawn at stride s: every s-th, counted from the last, so the
-/// base slice (and the diamond's base) is always there.
-pub fn drawn(len: usize, stride: u32) -> impl Iterator<Item = usize> {
-    let s = stride.max(1) as usize;
-    (0..len).filter(move |i| (len - 1 - i).is_multiple_of(s))
-}
-
-/// Cells a view draws at stride s.
-pub fn view_cells(view: View, mods: &[u32], stride: u32) -> u64 {
-    let len = mods.len();
-    match view {
-        View::Stack => drawn(len, stride).map(|i| strided_cells(mods[i], stride)).sum(),
-        View::Face => drawn(len, stride).map(|i| strided_row_cells(mods[i], stride)).sum(),
-        View::Diamond => drawn(len, stride).map(|i| if i + 1 == len { strided_cells(mods[i], stride) } else { strided_row_cells(mods[i], stride) }).sum(),
+/// How far below the top selection index i (modulus m) sits: a stack slice's height,
+/// or a face row's depth (the face is equilateral, so its rows are √3/2 apart).
+pub fn level_depth(view: View, spacing: Spacing, i: usize, m: u32) -> f32 {
+    match (view, spacing) {
+        (View::Stack, Spacing::True) => true_height(m),
+        (View::Stack, Spacing::Packed) => i as f32 * LEVEL,
+        (_, Spacing::True) => (m - 1) as f32 * SQRT3_2,
+        (_, Spacing::Packed) => i as f32 * SQRT3_2,
     }
 }
 
-/// The smallest stride that keeps a view within `budget` cubes. A stride s draws every
-/// s-th slice (or face row) and every s-th row and cell in it, so the cubes stay cubes,
-/// s cells wide.
-pub fn view_stride(view: View, mods: &[u32], budget: u32) -> u32 {
+/// The selection indices drawn at stride s. Walking up from the base (always drawn: the
+/// stack's base slice, the diamond's base), a slice or face row is kept when it sits at
+/// least one cube (s cells) above the last one kept, so cubes never overlap, and a
+/// sparse selection whose slices are far apart keeps all of them.
+pub fn drawn(view: View, mods: &[u32], spacing: Spacing, stride: u32) -> Vec<usize> {
+    let len = mods.len();
+    if len == 0 {
+        return Vec::new();
+    }
+    if stride <= 1 {
+        // neighbouring moduli are at least √(2/3) apart, more than a cube (0.78)
+        return (0..len).collect();
+    }
+    let need = 2.0 * CUBE_HALF * stride as f32 - 1e-4;
+    let mut out = vec![len - 1];
+    let mut last = level_depth(view, spacing, len - 1, mods[len - 1]);
+    for i in (0..len - 1).rev() {
+        let d = level_depth(view, spacing, i, mods[i]);
+        if last - d >= need {
+            out.push(i);
+            last = d;
+        }
+    }
+    out.reverse();
+    out
+}
+
+/// Cells a view draws at stride s.
+pub fn view_cells(view: View, mods: &[u32], spacing: Spacing, stride: u32) -> u64 {
+    let len = mods.len();
+    let rows = drawn(view, mods, spacing, stride).into_iter();
+    match view {
+        View::Stack => rows.map(|i| strided_cells(mods[i], stride)).sum(),
+        View::Face => rows.map(|i| strided_row_cells(mods[i], stride)).sum(),
+        View::Diamond => rows.map(|i| if i + 1 == len { strided_cells(mods[i], stride) } else { strided_row_cells(mods[i], stride) }).sum(),
+    }
+}
+
+/// The smallest stride that keeps a view within `budget` cubes. A stride s draws slices
+/// (or face rows) at least s cells apart and every s-th row and cell in them, so the
+/// cubes stay cubes, s cells wide.
+pub fn view_stride(view: View, mods: &[u32], spacing: Spacing, budget: u32) -> u32 {
     let budget = budget.max(1) as u64;
+    let view_cells = |view, mods, s| view_cells(view, mods, spacing, s);
     let full = view_cells(view, mods, 1);
     if full <= budget {
         return 1;
@@ -236,9 +270,9 @@ pub fn view_stride(view: View, mods: &[u32], budget: u32) -> u32 {
     s
 }
 
-/// The stack's stride (kept for callers that only know the stack).
+/// The stack's stride in true spacing (for callers that only know the stack).
 pub fn stride_for(mods: &[u32], budget: u32) -> u32 {
-    view_stride(View::Stack, mods, budget)
+    view_stride(View::Stack, mods, Spacing::True, budget)
 }
 
 /// What the 3D space shows.
@@ -312,6 +346,9 @@ pub struct Slice {
     pub cells: u32,
     /// First cell of this slice in the cell enumeration.
     pub cell_base: u32,
+    /// A triangle's first drawn row: its rows are n0, n0 + s, …, so the diamond's base
+    /// ends exactly on row m − 1, the hinge it shares with the face (0 elsewhere).
+    pub n0: u32,
     pub origin: [f32; 3],
     pub nvec: [f32; 3],
     /// Its index in the whole selection.
@@ -322,6 +359,22 @@ impl Slice {
     /// How far below the top it sits (the stack's slice height, a face row's depth).
     pub fn height(&self) -> f32 {
         -self.origin[1]
+    }
+
+    /// Its last drawn row.
+    pub fn last_row(&self, stride: u32) -> u32 {
+        match self.kind {
+            SliceKind::Triangle => self.n0 + (self.rows - 1) * stride,
+            SliceKind::Row(n) => n,
+        }
+    }
+
+    /// The last drawn cell of its last row.
+    pub fn last_k(&self, stride: u32) -> u32 {
+        match self.kind {
+            SliceKind::Triangle => (self.rows - 1) * stride,
+            SliceKind::Row(_) => (self.cells - 1) * stride,
+        }
     }
 }
 
@@ -358,12 +411,14 @@ impl Layout {
 
     /// The slices of `view`; the diamond starts folded (see [`Layout::set_fold`]).
     pub fn build(view: View, mods: &[u32], spacing: Spacing, shape: Shape, budget: u32) -> Layout {
-        let stride = view_stride(view, mods, budget);
+        let stride = view_stride(view, mods, spacing, budget);
         let len = mods.len();
-        let mut l = Layout { view, mods: mods.to_vec(), slices: Vec::new(), spacing, shape, stride, total: 0, full_total: view_cells(view, mods, 1), fold: 0.0 };
+        let mut l = Layout { view, mods: mods.to_vec(), slices: Vec::new(), spacing, shape, stride, total: 0, full_total: view_cells(view, mods, spacing, 1), fold: 0.0 };
         let mut base = 0u32;
-        for i in drawn(len, stride) {
+        for i in drawn(view, mods, spacing, stride) {
             let m = mods[i];
+            // the diamond's base keeps its last row (the hinge) under a stride
+            let n0 = if view == View::Diamond && i + 1 == len { (m - 1) % stride } else { 0 };
             let (kind, rows, cells, origin, nvec) = match view {
                 View::Stack => {
                     let h = l.stack_height(i, m);
@@ -373,7 +428,7 @@ impl Layout {
                 View::Diamond if i + 1 == len => (SliceKind::Triangle, strided_rows(m, stride), strided_cells(m, stride), [0.0; 3], [0.0; 3]),
                 View::Face | View::Diamond => (SliceKind::Row(m - 1), 1, strided_row_cells(m, stride), [0.0, -l.face_y(i, m), 0.0], [-0.5, 0.0, 0.0]),
             };
-            l.slices.push(Slice { m, kind, rows, cells: cells as u32, cell_base: base, origin, nvec, index: i });
+            l.slices.push(Slice { m, kind, rows, cells: cells as u32, cell_base: base, n0, origin, nvec, index: i });
             base += cells as u32;
         }
         l.total = base;
@@ -385,19 +440,13 @@ impl Layout {
 
     /// The stack's slice height of selection index i (modulus m).
     fn stack_height(&self, i: usize, m: u32) -> f32 {
-        match self.spacing {
-            Spacing::True => true_height(m),
-            Spacing::Packed => i as f32 * LEVEL,
-        }
+        level_depth(View::Stack, self.spacing, i, m)
     }
 
     /// How far below the face's apex row m − 1 lies: the face is an equilateral
     /// triangle, so rows are √3/2 apart.
     fn face_y(&self, i: usize, m: u32) -> f32 {
-        match self.spacing {
-            Spacing::True => (m - 1) as f32 * SQRT3_2,
-            Spacing::Packed => i as f32 * SQRT3_2,
-        }
+        level_depth(View::Face, self.spacing, i, m)
     }
 
     /// Swing the diamond's base slice about the row it shares with the face: 0 lays it
@@ -410,7 +459,8 @@ impl Layout {
         let s = self.slices[i];
         let m = s.m;
         let y_edge = -self.face_y(s.index, m);
-        let n_last = strided_side(m, self.stride) as f32;
+        // the hinge is row m − 1 itself (the base's rows end on it at any stride)
+        let n_last = s.last_row(self.stride) as f32;
         let (sn, cs) = angle.sin_cos();
         // row n is (n_last − n)·√3/2 from the hinge, along (−cos φ, −sin φ) in (y, z)
         let nvec = [-0.5, SQRT3_2 * cs, SQRT3_2 * sn];
@@ -435,12 +485,10 @@ impl Layout {
     /// The centres of a slice's corner cubes.
     pub fn slice_corners(&self, si: usize) -> Vec<[f32; 3]> {
         let s = &self.slices[si];
+        let (n_last, k_last) = (s.last_row(self.stride), s.last_k(self.stride));
         match s.kind {
-            SliceKind::Triangle => {
-                let n_last = (s.rows - 1) * self.stride;
-                vec![self.center(si, 0, 0), self.center(si, n_last, 0), self.center(si, n_last, n_last)]
-            }
-            SliceKind::Row(n) => vec![self.center(si, n, 0), self.center(si, n, (s.cells - 1) * self.stride)],
+            SliceKind::Triangle => vec![self.center(si, s.n0, 0), self.center(si, n_last, 0), self.center(si, n_last, k_last)],
+            SliceKind::Row(n) => vec![self.center(si, n, 0), self.center(si, n, k_last)],
         }
     }
 
@@ -487,7 +535,7 @@ impl Layout {
             i += 1;
         }
         let j = l - i * (i + 1) / 2;
-        Some((si, i as u32 * self.stride, j as u32 * self.stride))
+        Some((si, s.n0 + i as u32 * self.stride, j as u32 * self.stride))
     }
 
     /// Every cell of slice si, as (n, k).
@@ -495,7 +543,7 @@ impl Layout {
         let s = &self.slices[si];
         match s.kind {
             SliceKind::Row(n) => (0..s.cells).map(|j| (n, j * self.stride)).collect(),
-            SliceKind::Triangle => (0..s.rows).flat_map(|i| (0..=i).map(move |j| (i, j))).map(|(i, j)| (i * self.stride, j * self.stride)).collect(),
+            SliceKind::Triangle => (0..s.rows).flat_map(|i| (0..=i).map(move |j| (i, j))).map(|(i, j)| (s.n0 + i * self.stride, j * self.stride)).collect(),
         }
     }
 
@@ -675,22 +723,31 @@ impl Camera {
     }
 
     /// A flat view: straight at the z = 0 plane from the front (+z, x to the right),
-    /// orthographic, the bounds filling the lower part of a w : h window (the HUD sits
-    /// in the top sixth).
-    pub fn flat(bounds: ([f32; 3], [f32; 3]), aspect: f32) -> Camera {
+    /// orthographic, the bounds filling a w × h window (px) between `top` and `bottom`
+    /// px left free for the overlays (the HUD above, the 2D thumbnail below).
+    pub fn flat(bounds: ([f32; 3], [f32; 3]), w: f32, h: f32, top: f32, bottom: f32) -> Camera {
         let (lo, hi) = bounds;
+        let (w, h) = (w.max(1.0), h.max(1.0));
         let radius = (dot(sub(hi, lo), sub(hi, lo)).sqrt() * 0.5).max(1.0);
-        let fit = ((hi[1] - lo[1]) / 2.0).max((hi[0] - lo[0]) / 2.0 / aspect.max(0.1)) + 1.0;
-        // the content takes 78% of the height, shifted down by 12% of the half height
-        let half_h = fit / 0.78;
-        let target = [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0 + 0.12 * half_h, 0.0];
+        let avail = (h - top - bottom).max(h * 0.3);
+        let (content_w, content_h) = (hi[0] - lo[0] + 2.0, hi[1] - lo[1] + 2.0);
+        // world units per pixel: the content fits the free height and the width
+        let per_px = (content_h / avail).max(content_w / (w * 0.96));
+        let half_h = per_px * h / 2.0;
+        // the content's centre sits in the middle of the free band, (top − bottom)/2 px
+        // below the window's centre (insets scaled down if they had to give way)
+        let (top, bottom) = (top.max(0.0), bottom.max(0.0));
+        let give = if top + bottom > 0.0 { ((h - avail) / (top + bottom)).min(1.0) } else { 0.0 };
+        let shift = (top - bottom) * give / 2.0 * per_px;
+        let target = [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0 + shift, 0.0];
         Camera { target, yaw: std::f32::consts::PI, pitch: 0.0, dist: radius * 2.0 + 10.0, fov_y: 40f32.to_radians(), radius, ortho: half_h }
     }
 
     pub fn eye(&self) -> [f32; 3] {
         let (sy, cy) = self.yaw.sin_cos();
         let (sp, cp) = self.pitch.sin_cos();
-        // yaw 0 looks along +z from the front (−z side): the apex row faces the viewer
+        // yaw 0 looks along +z from the −z side (behind the apex rows); the default yaw
+        // looks at the last rows' side, the front face
         add(self.target, scale([sy * cp, sp, -cy * cp], self.dist))
     }
 
@@ -964,7 +1021,7 @@ mod tests {
         assert!(on_axis(Shape::CornerApex, &|c| c[0]));
         assert!(on_axis(Shape::CornerLeft, &|c| c[1]));
         assert!(on_axis(Shape::CornerRight, &|c| c[2]));
-        assert!(on_axis(Shape::FaceBack, &|c| mid(c[1], c[2])));
+        assert!(on_axis(Shape::FaceFront, &|c| mid(c[1], c[2])));
         assert!(on_axis(Shape::FaceLeft, &|c| mid(c[0], c[1])));
         assert!(on_axis(Shape::FaceRight, &|c| mid(c[0], c[2])));
         assert!(!on_axis(Shape::Regular, &|c| c[0]));
@@ -973,13 +1030,13 @@ mod tests {
     #[test]
     fn the_stride_keeps_the_budget() {
         let mods: Vec<u32> = (2..=400).collect();
-        assert!(view_cells(View::Stack, &mods, 1) > 10_000_000);
+        assert!(view_cells(View::Stack, &mods, Spacing::True, 1) > 10_000_000);
         for view in View::ALL {
             for budget in [20_000u32, 100_000, 1_000_000, 4_000_000] {
                 let l = Layout::build(view, &mods, Spacing::True, Shape::Regular, budget);
                 let s = l.stride;
                 assert!(l.total as u64 <= budget as u64, "{view:?} {budget}: {} cells", l.total);
-                assert!(s == 1 || view_cells(view, &mods, s - 1) > budget as u64, "{view:?}: stride {s} is not the smallest");
+                assert!(s == 1 || view_cells(view, &mods, Spacing::True, s - 1) > budget as u64, "{view:?}: stride {s} is not the smallest");
                 // the last modulus is always drawn: the base of the stack and the diamond
                 assert_eq!(l.slices.last().unwrap().m, 400);
             }
@@ -1018,7 +1075,7 @@ mod tests {
             for budget in [u32::MAX, 120] {
                 let l = Layout::build(view, &[2, 5, 9, 13, 30], Spacing::True, Shape::Regular, budget);
                 let stride = l.stride;
-                assert_eq!(stride > 1, budget == 120 && view == View::Stack || (budget == 120 && view_cells(view, &l.mods, 1) > 120), "{view:?} stride {stride}");
+                assert_eq!(stride > 1, budget == 120 && view_cells(view, &l.mods, Spacing::True, 1) > 120, "{view:?} stride {stride}");
                 let mut seen = std::collections::HashSet::new();
                 for g in 0..l.total {
                     let (si, n, k) = l.cell(g).unwrap();
@@ -1026,7 +1083,7 @@ mod tests {
                     assert!(n < m && k <= n && k.is_multiple_of(stride));
                     match l.slices[si].kind {
                         SliceKind::Row(r) => assert_eq!((n, r), (m - 1, m - 1)),
-                        SliceKind::Triangle => assert!(n.is_multiple_of(stride)),
+                        SliceKind::Triangle => assert!((n - l.slices[si].n0).is_multiple_of(stride)),
                     }
                     assert!(seen.insert((si, n, k)));
                 }
@@ -1058,7 +1115,7 @@ mod tests {
         assert_eq!(d.slices[last].kind, SliceKind::Triangle);
         assert_eq!(d.slices[last].m, 30);
         assert!(d.slices[..last].iter().all(|sl| sl.m < 30 && matches!(sl.kind, SliceKind::Row(_))));
-        assert_eq!(d.total as u64, view_cells(View::Diamond, &mods, 1));
+        assert_eq!(d.total as u64, view_cells(View::Diamond, &mods, Spacing::True, 1));
         // folded: the base meets the face along its last row at the tetrahedron's dihedral
         // angle arccos(1/3)
         assert!((d.fold - FOLD).abs() < 1e-6);
@@ -1078,6 +1135,47 @@ mod tests {
             let (l0, r0) = (d.center(last, n, 0), d.center(last, n, n));
             assert!((l0[0] + r0[0]).abs() < 1e-3 && (r0[0] - l0[0] - n as f32).abs() < 1e-3);
             assert!((l0[1] - (hinge[1] - (29 - n) as f32 * SQRT3_2)).abs() < 1e-3);
+        }
+    }
+
+    #[test]
+    fn a_sparse_selection_keeps_its_slices_under_a_stride() {
+        // every 100th modulus: slices far apart, so the stride thins rows and cells only
+        let mods: Vec<u32> = (0..41).map(|i| 2 + 100 * i).collect();
+        for view in View::ALL {
+            let l = Layout::build(view, &mods, Spacing::True, Shape::Regular, 1_000_000);
+            // (the flat views of 41 rows fit without a stride; the stack needs one)
+            assert_eq!(l.stride > 1, view != View::Face, "{view:?}: stride {}", l.stride);
+            assert_eq!(l.slices.len(), mods.len(), "{view:?}: stride {} dropped slices", l.stride);
+            assert!(l.total <= 1_000_000);
+        }
+        // a dense one is still thinned to keep the cubes apart
+        let dense: Vec<u32> = (2..=600).collect();
+        let l = Layout::build(View::Stack, &dense, Spacing::True, Shape::Regular, 200_000);
+        assert!(l.slices.len() < dense.len());
+    }
+
+    #[test]
+    fn the_diamonds_hinge_is_row_m_minus_1_at_any_stride() {
+        for (hi, budget) in [(1000u32, 250_000u32), (2000, 1_000_000), (997, 40_000)] {
+            let mods: Vec<u32> = (2..=hi).collect();
+            let mut d = Layout::build(View::Diamond, &mods, Spacing::True, Shape::Regular, budget);
+            assert!(d.stride > 1);
+            let bi = d.slices.len() - 1;
+            let b = d.slices[bi];
+            assert_eq!((b.m, b.last_row(d.stride)), (hi, hi - 1), "stride {}", d.stride);
+            // every cell of the base is a real cell of the triangle mod M
+            assert!(d.slice_cells(bi).iter().all(|&(n, k)| n < hi && k <= n));
+            d.set_fold(0.0);
+            // the hinge row sits where the face's row M − 1 would, and base row M − 1 − js
+            // is on the face rows' lattice: x = k − n/2
+            let hinge = d.center(bi, hi - 1, 0);
+            assert!((hinge[1] + (hi - 1) as f32 * SQRT3_2).abs() < 1e-2);
+            for (n, k) in d.slice_cells(bi).into_iter().step_by(97) {
+                let c = d.center(bi, n, k);
+                assert!((c[0] - (k as f32 - n as f32 / 2.0)).abs() < 1e-3);
+                assert!((c[1] - (hinge[1] - (hi - 1 - n) as f32 * SQRT3_2)).abs() < 1e-2);
+            }
         }
     }
 
@@ -1128,7 +1226,7 @@ mod tests {
     fn the_flat_camera_looks_straight_at_the_face() {
         let l = Layout::build(View::Diamond, &(2..=40).collect::<Vec<_>>(), Spacing::True, Shape::Regular, u32::MAX).at_rest();
         let (w, h) = (800u32, 600u32);
-        let mut cam = Camera::flat(l.bounds(), w as f32 / h as f32);
+        let mut cam = Camera::flat(l.bounds(), w as f32, h as f32, 0.0, 0.0);
         // every cube projects inside the window, x to the right and y up
         let (lo, hi) = l.bounds();
         for p in [lo, hi, [lo[0], hi[1], 0.0], [hi[0], lo[1], 0.0]] {

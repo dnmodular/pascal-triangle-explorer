@@ -313,12 +313,15 @@ voids run through the solid as tunnels.
   straight. *Packed*: slice height follows the slice index, no gaps. The HUD notes that the sides
   now curve, because slice size no longer tracks height.
 * **Level of detail, as cubes.** The stack has about M³/6 cells. A cube budget
-  (250K–8M, default 1M) picks the smallest stride s that fits: every s-th slice
-  (counted from the base, so the base slice is always there), and every s-th row and
-  cell in each. Every cube is a cube, s cells on a side, in all three directions:
-  slices, rows and cells are each at least a cube apart, so a wide range no longer
-  turns into stacked slabs. The face and the diamond use the same rule on their rows.
-  The HUD reports the stride and how many cells are shown.
+  (250K–8M, default 1M) picks the smallest stride s that fits: every s-th row and
+  cell of a slice, and, walking up from the base (always drawn), only the slices at
+  least one cube (s cells) above the last one kept. Every cube is a cube, s cells on a
+  side, in all three directions, so a wide range no longer turns into stacked slabs,
+  and a sparse selection whose slices are already far apart (every 100th modulus,
+  say) keeps all of them. The face and the diamond use the same rule on their rows;
+  the diamond's base keeps its last row, the hinge, at any stride (its rows run
+  M − 1, M − 1 − s, …). The HUD reports the stride and how many slices and cells are
+  shown.
 
 How it runs: a compute pass (`shaders/tetra_cells.wgsl`, with `shaders/binom.wgsl`
 prepended) takes one thread per cell (a slice is a triangle of rows, or a single face

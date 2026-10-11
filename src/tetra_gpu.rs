@@ -56,7 +56,8 @@ pub struct GpuSlice {
     pub nfactors: u32,
     pub factor_off: u32,
     pub level_off: u32,
-    /// 0 a triangle of rows, 1 the single row `row_n`.
+    /// 0 a triangle of rows row_n, row_n + s, … (row_n = its first row, 0 but for the
+    /// diamond's base); 1 the single row `row_n`.
     pub kind: u32,
     pub row_n: u32,
     /// Cell (n, k) sits at origin + n·nvec + (k, 0, 0).
@@ -153,7 +154,7 @@ impl SceneData {
                 });
             }
             let (kind, row_n) = match s.kind {
-                SliceKind::Triangle => (0, 0),
+                SliceKind::Triangle => (0, s.n0),
                 SliceKind::Row(n) => (1, n),
             };
             slices.push(GpuSlice { m: s.m, rows: s.rows, cell_base: s.cell_base, nfactors: md.factors.len() as u32, factor_off, level_off, kind, row_n, origin: s.origin, pad0: 0, nvec: s.nvec, pad1: 0 });

@@ -98,6 +98,12 @@ fn the_face_and_the_diamond_match_too() {
         let l = check_view(&mut r, view, &all, Spacing::Packed, 3_000);
         assert!(l.stride > 1, "{view:?} stride {}", l.stride);
         assert_eq!(l.slices.last().unwrap().m, 200);
+        // the diamond's base keeps its hinge row 199 even when 199 is off the stride
+        if view == View::Diamond {
+            let b = l.slices.last().unwrap();
+            assert_eq!(b.last_row(l.stride), 199);
+            assert!(b.n0 > 0, "199 is not a multiple of stride {}: the base starts at row {}", l.stride, b.n0);
+        }
     }
     // a prime selection: the face's rows alternate 1, p − 1 (C(p−1, k) ≡ (−1)^k)
     let primes: Vec<u32> = (2..=150).filter(|&m| pascal::math::is_prime(m)).collect();
@@ -150,7 +156,7 @@ fn the_pick_buffer_names_the_cube_the_ray_hits() {
     assert!(l.stride > 1, "stride {}", l.stride);
     // the flat views, straight on (orthographic), zoomed and panned
     let flat = |l: &Layout| -> Vec<Camera> {
-        let base = Camera::flat(l.at_rest().bounds(), 320.0 / 240.0);
+        let base = Camera::flat(l.at_rest().bounds(), 320.0, 240.0, 0.0, 0.0);
         let mut near = base;
         near.zoom(700.0);
         near.pan(30.0, -20.0, 240.0);

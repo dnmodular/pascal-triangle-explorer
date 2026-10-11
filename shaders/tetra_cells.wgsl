@@ -27,7 +27,7 @@ struct Slice {
   nfactors: u32,
   factor_off: u32,    // factors[factor_off ..] (garner constants per slice)
   level_off: u32,     // residue → palette level bytes at levels[level_off + r] (draw pass)
-  kind: u32,          // 0 rows 0, s, 2s, … (a triangle); 1 the single row row_n
+  kind: u32,          // 0 rows row_n, row_n + s, … (a triangle); 1 the single row row_n
   row_n: u32,
   ox: f32,            // cell (n, k) sits at o + n·nv + (k, 0, 0) (draw pass)
   oy: f32,
@@ -100,7 +100,7 @@ fn tetra_cells(@builtin(global_invocation_id) gid: vec3<u32>) {
     if ((i + 1u) * (i + 2u) / 2u <= l) { i = i + 1u; }
   }
   let j = l - i * (i + 1u) / 2u;
-  n = i * C.stride;
+  n = s.row_n + i * C.stride;
   k = j * C.stride;
   }
   let r = slice_residue(n, k, s);
