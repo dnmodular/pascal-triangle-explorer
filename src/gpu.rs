@@ -448,6 +448,15 @@ pub struct ShaderCheck {
 }
 
 fn try_compile(adapter: &wgpu::Adapter, m: &ModuleSource, entry: &str, kind: LayoutKind, unchecked: bool) -> Result<(), String> {
+    compile_scoped(adapter, |device| {
+        let module = create_module(device, m.label, &m.source, unchecked);
+        let layouts = Layouts::new(device);
+        let _pipe = make_pipeline(device, layouts.for_kind(kind), &module, entry);
+    })
+}
+
+/// Run `build` on a fresh device inside error scopes and report what the driver said.
+pub fn compile_scoped(adapter: &wgpu::Adapter, build: impl FnOnce(&wgpu::Device)) -> Result<(), String> {
     let (device, _queue) = pollster::block_on(Gpu::request_device(adapter))?;
     let lost = Arc::new(std::sync::Mutex::new(None::<String>));
     let lost2 = lost.clone();
@@ -456,9 +465,7 @@ fn try_compile(adapter: &wgpu::Adapter, m: &ModuleSource, entry: &str, kind: Lay
     });
     let scope_validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
     let scope_internal = device.push_error_scope(wgpu::ErrorFilter::Internal);
-    let module = create_module(&device, m.label, &m.source, unchecked);
-    let layouts = Layouts::new(&device);
-    let _pipe = make_pipeline(&device, layouts.for_kind(kind), &module, entry);
+    build(&device);
     let _ = device.poll(wgpu::PollType::wait_indefinitely());
     let internal = pollster::block_on(scope_internal.pop());
     let validation = pollster::block_on(scope_validation.pop());
@@ -485,6 +492,14 @@ pub fn check_shaders(adapter: &wgpu::Adapter) -> Vec<ShaderCheck> {
             let unchecked_result = if result.is_err() { Some(try_compile(adapter, &m, entry, *kind, true)) } else { None };
             out.push(ShaderCheck { module: m.label, entry, result, unchecked_result });
         }
+    }
+    // the tetra stack: its compute pass and its four render pipelines
+    for which in crate::tetra_gpu::PIPELINES {
+        let module = if which == "tetra_cells" { "tetra-cells" } else { "tetra-draw" };
+        let run = |unchecked| compile_scoped(adapter, |d| crate::tetra_gpu::check_pipeline(d, which, unchecked));
+        let result = run(false);
+        let unchecked_result = if result.is_err() { Some(run(true)) } else { None };
+        out.push(ShaderCheck { module, entry: which, result, unchecked_result });
     }
     out
 }
@@ -741,7 +756,10 @@ fn ft_resolve_color(v: FT) -> vec3<f32> {
 }
 "#;
 
-pub const COMMON_WGSL: &str = include_str!("../shaders/common.wgsl");
+/// The bindings and grid geometry of the 2D passes, with the binomial math appended.
+pub const COMMON_WGSL: &str = concat!(include_str!("../shaders/common.wgsl"), "\n", include_str!("../shaders/binom.wgsl"));
+/// C(n,k) mod p^e on its own (no bindings): shared by the 2D passes and the tetra stack.
+pub const BINOM_WGSL: &str = include_str!("../shaders/binom.wgsl");
 pub const VALUE_WGSL: &str = include_str!("../shaders/value.wgsl");
 pub const MEASURES_WGSL: &str = include_str!("../shaders/measures.wgsl");
 pub const FIELD_WGSL: &str = include_str!("../shaders/field.wgsl");

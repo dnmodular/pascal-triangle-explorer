@@ -8,6 +8,7 @@
 //! * [`layers`]  — the layer registry (value / measure / transform) and its plan
 //! * [`gpu`]     — the wgpu pipeline that runs the plan
 //! * [`export`]  — PNG export of the canvas texture
+//! * [`tetra`] / [`tetra_gpu`] — the tetra stack: one 3D slice per modulus
 //! * [`wave_overlay`] — the "modular wave" overlay: one row of the triangle as a wave
 pub mod export;
 pub mod gpu;
@@ -15,5 +16,7 @@ pub mod layers;
 pub mod math;
 pub mod palette;
 pub mod sweep;
+pub mod tetra;
+pub mod tetra_gpu;
 pub mod view;
 pub mod wave_overlay;

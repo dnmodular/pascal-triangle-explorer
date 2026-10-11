@@ -67,6 +67,11 @@ cargo run --release -- --help
 cargo test
 ```
 
+`tests/tetra_verify.rs` checks the tetra stack: every cube's residue against the
+additive rule (moduli 2–64, the selection modes, a strided 2–300 and slices up to
+4096), that each strided cell lands in exactly one of the two cube lists, and the
+ID-buffer pick against a CPU ray cast through the same cubes.
+
 `tests/gpu_verify.rs` renders regions of the triangle with the real pipeline,
 reads them back and compares every cell with the plain additive rule
 (`src/math.rs: triangle_dp`) for primes, prime powers, composites and the edge
@@ -95,6 +100,7 @@ driver works: `sudo apt install mesa-vulkan-drivers` (lavapipe) and run
 | click a cell | pin its row for the wave overlay (click the row again, or **Esc**, to release) |
 | **W** | show / hide the wave overlay (it fades) |
 | **F11** | fullscreen: the canvas alone, panel, bars and buttons hidden; **Esc** returns |
+| tetra tile | open the 3D tetra stack (drag orbit, right/shift-drag pan, wheel zoom, double-click reset, **G** spacing, **Esc** back) |
 
 Fitting R rows shows exactly rows 0..R−1: the apex on the top edge and row R−1
 ending on the bottom edge (a canvas narrower than the triangle's 2 : √3 shows its full
@@ -223,6 +229,59 @@ visible and the peaks never clip.
   galley cache each frame (one short string copy each), so they survive font
   atlas rebuilds.
 
+## Tetra stack
+
+A 3D view of many moduli at once. Each selected modulus m becomes one horizontal
+slice, rows 0..m−1 of the triangle mod m. Slices stack downward in order of m, so
+slice size grows with m and the solid is a tetrahedron, with mod 2 (two rows) as the
+apex. Cell (m, n, k) is a cube at x = k − n/2, z = n·√3/2 (the 2D brick layout laid
+flat) and y = −height. Zero cells get no cube, so the voids run through the solid as
+tunnels.
+
+* **Entry and exit.** A live preview tile sits in a bottom corner of the 2D canvas,
+  in the wave box's style (the corner the wave doesn't use). It turns slowly at about
+  30 frames a second. Click it, or **Open 3D view** in the panel, for the isolated
+  space: the stack, a HUD and a thumbnail of the 2D view, nothing else. Click the
+  thumbnail or press **Esc** to return with all 2D state intact. The 2D canvas keeps
+  rendering while you are away if the sweep plays, so the thumbnail stays live.
+* **Navigation.** Drag to orbit, right-, middle- or shift-drag to pan, wheel or pinch
+  to zoom, double-click to reset the camera. **G** toggles the spacing.
+* **Look.** Green wireframe on near-black. The edges are drawn in the fragment
+  shader: on a cube face the distance to the nearest edge is the middle of the three
+  face distances, measured in pixels with `fwidth`. Fragments away from the edges are
+  discarded. Faint green triangles outline every slice. *Ghost zeros* draws the zero
+  cells as faint additive cubes that glow through the wire, which shows the tunnels.
+* **Hover.** An ID pass renders the nonzero cubes into a 1 × 1 `Rg32Uint` target
+  through a projection that maps the pointer's pixel onto it. It returns the
+  frontmost cube's packed (n, k, slice, residue) words, read back asynchronously.
+  Cubes within the brush radius of that cube (or, with *whole slice*, the hovered
+  slice) are filled in their palette color, through the same residue → level table,
+  color offset and palette as the 2D view. The zero / nonzero mask lens shows them in
+  white; other layer setups fall back to residue coloring, and the HUD says so. The
+  HUD shows m and its factorization, n, k and the residue.
+* **Selection.** A start / end range (2–4096) and the sweep's selection modes: all,
+  primes (with their orderings), composites, even, odd, and the interval sequences.
+* **Spacing.** *True* (default): slice height = m. Skipped moduli leave gaps,
+  each drawn as a faint dashed outline, and the gap between two slices is labeled
+  ("+4" between 7 and 11), so prime gaps read as spacing. The tetrahedron's edges stay
+  straight. *Packed*: slice height = slice index, no gaps. The HUD notes that the sides
+  now curve, because slice size no longer tracks height.
+* **Level of detail.** The stack has about M³/6 cells. A cube budget (250K–8M,
+  default 1M) picks the smallest cell stride s that fits: every s-th row and cell
+  of every slice, cubes s cells wide. The HUD reports the stride and how many cells
+  are shown, instead of the app freezing.
+
+How it runs: a compute pass (`shaders/tetra_cells.wgsl`, with `shaders/binom.wgsl`
+prepended) takes one thread per cell. It finds its slice by a 16-step binary search
+and its row from an f32 root corrected to exact integers. It then computes C(n,k)
+mod m with that slice's own factor descriptors: Granville / Lucas per prime power,
+with tables shared between slices with the same prime power, then Garner's CRT, as
+in the 2D passes. Every loop is constant-bounded, and all powers and constants come
+from the CPU. The pass appends nonzero cells and zeros to two instance buffers, and
+the atomic counts are the instance counts of indirect draws, so cubes are drawn
+without a CPU round trip. It runs only when the selection or level of detail
+changes; colors are looked up while drawing.
+
 ## Sweep
 
 The sweep bar under the canvas plays the modulus through a range, ported from the reference's
@@ -304,8 +363,13 @@ src/layers.rs    the layer registry: kind = value | measure | transform, params,
 src/gpu.rs       wgpu pipeline: value → measures → blend → transforms → resolve
 src/export.rs    PNG writer
 src/wave_overlay.rs  the modular-wave overlay (row cache, easing, sampling, egui shapes)
-src/main.rs      winit + egui app
-shaders/common.wgsl    mulmod, binomial, grid mapping, lattice neighbours (prepended to every pass)
+src/tetra.rs     the tetra stack's selection, layout and stride, camera, CPU ray cast
+src/tetra_gpu.rs the tetra stack on the GPU: residue/compaction pass, cubes, ghosts, pick, outlines
+src/main.rs      winit + egui app (src/tetra_ui.rs: the stack's panel, tile and 3D space)
+shaders/common.wgsl    bindings, grid mapping, lattice neighbours (prepended to every 2D pass, with binom.wgsl)
+shaders/binom.wgsl     Montgomery mulmod, Granville / Lucas, Kummer: no bindings, shared with the tetra stack
+shaders/tetra_cells.wgsl  the stack's residues, one thread per (m, n, k), appended to two cube lists
+shaders/tetra_draw.wgsl   instanced cubes with fragment-shader edges, the ID pass, dashed lines
 shaders/value.wgsl     residue + carries + divisibility mask per texel
 shaders/measures.wgsl  one entry point per measure, reduce_max, hex blur
 shaders/field.wgsl     blend, blur, temporal average, band pass, afterimage, resolve (compiled for f32 and vec4 fields)
@@ -405,6 +469,14 @@ Verified (by `cargo test` on Mesa lavapipe, and by the headless export):
   equals a fresh render pixel for pixel. The on-screen canvas equals the exported
   PNG byte for byte (checked under Xvfb with AFTERIMAGE on), and Save PNG leaves
   the screen unchanged.
+* Tetra stack: every cube's residue equals the additive rule for moduli 2–64, the
+  prime / composite / Fibonacci / square selections, a strided 2–300 and the deep
+  slices 2048, 2310, 3125, 3600, 4093, 4095 and 4096; every strided cell is written
+  exactly once. The GPU pick equals the CPU ray cast on every decisive test ray
+  across four camera views (rays inside a face, clear of the next cube), and every
+  GPU hit on a CPU miss is a grazing ray. The wire, the brush and the ghosts change
+  the image as they should. Under Xvfb: the tile, opening, hover with the HUD and
+  brush, orbit, zoom, pan, **G**, a strided 2–400 stack and **Esc** back.
 
 Not verified here: behavior on a real GPU and display (only the software Vulkan
 device was available), light-theme appearance, Windows and macOS builds, and

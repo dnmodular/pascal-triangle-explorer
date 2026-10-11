@@ -20,6 +20,9 @@ use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Window, WindowId};
 
+mod tetra_ui;
+use tetra_ui::{TetraCache, TetraView};
+
 const PANEL_W: f32 = 300.0;
 /// Height of the sweep bar under the canvas (two rows of controls).
 const SWEEP_BAR_H: f32 = 64.0;
@@ -102,6 +105,8 @@ struct Model {
     dragging: bool,
     /// A widget had keyboard focus or a popup was open last frame (its Esc is not ours).
     focus_last_frame: bool,
+    /// The tetra stack: its settings, preview tile and 3D space.
+    tetra: TetraView,
 }
 
 impl Model {
@@ -145,6 +150,7 @@ impl Model {
             select_before_click: WaveSelect::Off,
             dragging: false,
             focus_last_frame: false,
+            tetra: TetraView::new(),
         }
     }
 
@@ -354,6 +360,9 @@ struct Gfx {
     egui_renderer: egui_wgpu::Renderer,
     canvas_tex: Option<egui::TextureId>,
     canvas_size: (u32, u32),
+    tetra: pascal::tetra_gpu::TetraRenderer,
+    tetra_tex: Option<egui::TextureId>,
+    tetra_cache: TetraCache,
 }
 
 /// Everything that changes what the GPU renders: modulus, palette, style, layers, camera,
@@ -642,7 +651,8 @@ impl ApplicationHandler for App {
         let egui_renderer = egui_wgpu::Renderer::new(&gpu.device, format, egui_wgpu::RendererOptions { dithering: false, ..Default::default() });
         let mut renderer = Renderer::new(gpu.device.clone(), gpu.queue.clone());
         renderer.enable_timing();
-        self.gfx = Some(Gfx { window, surface, config, gpu, renderer, egui_ctx, egui_state, egui_renderer, canvas_tex: None, canvas_size: (0, 0) });
+        let tetra = pascal::tetra_gpu::TetraRenderer::new(gpu.device.clone(), gpu.queue.clone());
+        self.gfx = Some(Gfx { window, surface, config, gpu, renderer, egui_ctx, egui_state, egui_renderer, canvas_tex: None, canvas_size: (0, 0), tetra, tetra_tex: None, tetra_cache: TetraCache::default() });
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -734,6 +744,11 @@ impl App {
         };
         self.last_frame = Some(now);
         self.model.advance_offset(dt);
+        self.model.tetra.advance(dt);
+        // the tetra stack's pick from an earlier frame
+        if let Some(hit) = gfx.tetra.poll_pick() {
+            self.model.tetra.hover = hit;
+        }
         self.fps_frames += 1;
         let fps_t0 = *self.fps_t0.get_or_insert(now);
         if now.duration_since(fps_t0).as_secs_f32() >= 1.0 {
@@ -756,9 +771,18 @@ impl App {
         let frame_nr = self.frame_nr;
         let mut handled_frame = 0u64;
         let ctx = gfx.egui_ctx.clone();
-        let Gfx { renderer, egui_renderer, gpu, canvas_tex, canvas_size, .. } = gfx;
+        let Gfx { renderer, egui_renderer, gpu, canvas_tex, canvas_size, tetra_tex, .. } = gfx;
+        let tetra_tex_id = *tetra_tex;
+        let canvas_tex_id = *canvas_tex;
 
         let full_output = ctx.run_ui(raw_input, |ui| {
+            // the tetra stack's own space: nothing else on screen
+            if model.tetra.open {
+                let handle = handled_frame != frame_nr;
+                handled_frame = frame_nr;
+                tetra_ui::space(ui, model, ppp, tetra_tex_id, canvas_tex_id, *canvas_size, handle);
+                return;
+            }
             // fullscreen: the canvas alone (F11 / Esc)
             if !model.fullscreen {
                 // ---- left panel ----
@@ -820,6 +844,7 @@ impl App {
                 canvas_interaction(ui, model, &response, rect, ppp, handle);
                 canvas_overlays(ui, model, rect, ppp, handle);
                 wave_overlay(ui, model, rect, ppp, dt, handle);
+                tetra_ui::tile(ui, model, rect, ppp, tetra_tex_id);
             });
         });
         let egui::FullOutput { platform_output, mut textures_delta, shapes, pixels_per_point, viewport_output } = full_output;
@@ -857,6 +882,14 @@ impl App {
         let mut encoder = gfx.gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
         let tween_off = matches!(tween, Tween::Off);
         let render_canvas = changed || !tween_off || !self.canvas_current;
+        // the tetra stack, into its own target (before egui samples it)
+        if tetra_ui::render(model, &mut gfx.tetra_cache, &mut gfx.tetra, &mut encoder) || (gfx.tetra_tex.is_none() && gfx.tetra.target_view().is_some()) {
+            let view = gfx.tetra.target_view().expect("target");
+            match gfx.tetra_tex {
+                Some(id) => gfx.egui_renderer.update_egui_texture_from_wgpu_texture(&gfx.gpu.device, view, wgpu::FilterMode::Linear, id),
+                None => gfx.tetra_tex = Some(gfx.egui_renderer.register_native_texture(&gfx.gpu.device, view, wgpu::FilterMode::Linear)),
+            }
+        }
         if render_canvas {
             gfx.renderer.render(&mut encoder, &FrameInput { grid, modulus: &model.modulus, palette: &model.palette, layers: &model.layers, advance, tween, style: model.style });
             gfx.renderer.flush_pass_params();
@@ -894,6 +927,7 @@ impl App {
             gfx.egui_renderer.render(&mut rpass, &paint_jobs, &screen);
         }
         gfx.gpu.queue.submit(extra.into_iter().chain(std::iter::once(encoder.finish())));
+        gfx.tetra.start_pick_map();
         if render_canvas {
             gfx.renderer.begin_timing_readback();
         }
@@ -933,11 +967,13 @@ impl App {
 
         self.frame_ms = t0.elapsed().as_secs_f32() * 1000.0;
         let delay = viewport_output.get(&egui::ViewportId::ROOT).map(|v| v.repaint_delay).unwrap_or(std::time::Duration::MAX);
-        self.continuous = delay.is_zero() || model.sweep.playing || self.tween_t0.is_some() || !self.canvas_current || model.offset_playing || model.wave.is_animating();
+        self.continuous = delay.is_zero() || model.sweep.playing || self.tween_t0.is_some() || !self.canvas_current || model.offset_playing || model.wave.is_animating() || gfx.tetra.pick_in_flight();
         if self.continuous {
             gfx.window.request_redraw();
             self.repaint_at = None;
         } else {
+            // the preview tile turns at about 30 frames a second
+            let delay = if model.tetra.spinning() { delay.min(std::time::Duration::from_millis(33)) } else { delay };
             self.repaint_at = Instant::now().checked_add(delay);
         }
     }
@@ -1148,6 +1184,8 @@ fn panel_ui(ui: &mut egui::Ui, model: &mut Model, canvas_px: (u32, u32), _frame_
         mono_line(ui, &status);
         note(ui, "Plays one row as w(θ) = Σ (C(n,k) mod m)·cos((n−2k)θ + φ): the row under the pointer, else the last visible row. Click a cell to pin its row; a selection plays the average of its cells instead.");
     });
+
+    section(ui, "Tetra stack", |ui| tetra_ui::panel(ui, model));
 
     section(ui, "Color", |ui| {
         ui.horizontal(|ui| {
@@ -1536,7 +1574,8 @@ fn canvas_interaction(ui: &mut egui::Ui, model: &mut Model, response: &egui::Res
         }
     }
     let pointer = response.hover_pos().filter(|_| response.hovered() && !response.dragged());
-    model.over_wave = pointer.is_some_and(|p| model.wave.box_rect().is_some_and(|b| b.contains(p)));
+    // over the wave box or the tetra tile: the canvas under them gets no hover
+    model.over_wave = pointer.is_some_and(|p| model.wave.box_rect().is_some_and(|b| b.contains(p)) || model.tetra.tile_rect.is_some_and(|b| b.contains(p)));
     let pointer = pointer.filter(|_| !model.over_wave).map(to_px);
     // a fitted view shows its rows only: nothing to hover below them
     let shown = |n: u32| !model.auto_fit || (n as f64) < model.fit_rows.round();
