@@ -30,6 +30,8 @@ struct DrawParams {
   line_px: f32,         // wire half width in px
   ghost_alpha: f32,
   fill: vec4<f32>,      // x: cubes whose centre is at or above this height are filled in color
+  peel_a: vec4<u32>,    // peeled away: k < x, n − k < y, last row − n < z (cells), slice < w
+  peel_b: vec4<u32>,    // x: slices from the base, y: slices in the stack; 0 = none
 };
 
 struct Slice {
@@ -74,6 +76,24 @@ fn cube_center(c: vec2<u32>, s: Slice) -> vec3<f32> {
   return vec3<f32>(s.ox + n * s.nx + k, s.oy + n * s.ny, s.oz + n * s.nz);
 }
 
+// Peeled cubes are not drawn (the stack's sides come off layer by layer). The
+// thresholds are the CPU's: layers × stride on the triangles' sides, layers of slices
+// at the top and the base.
+fn peeled(c: vec2<u32>, si: u32, s: Slice) -> bool {
+  if (s.kind != 0u) { return false; }
+  let n = c.x & 0xffffu;
+  let k = c.x >> 16u;
+  let last = s.row_n + (s.rows - 1u) * D.peel_b.z;
+  return (D.peel_a.x > 0u && k < D.peel_a.x)
+      || (D.peel_a.y > 0u && n - k < D.peel_a.y)
+      || (D.peel_a.z > 0u && last - n < D.peel_a.z)
+      || (D.peel_a.w > 0u && si < D.peel_a.w)
+      || (D.peel_b.x > 0u && D.peel_b.y - 1u - si < D.peel_b.x);
+}
+
+// Outside the clip volume: a peeled cube's triangles collapse and are clipped.
+const NOWHERE: vec4<f32> = vec4<f32>(0.0, 0.0, -2.0, 1.0);
+
 fn corner_of(vi: u32) -> vec3<f32> {
   return vec3<f32>(f32(vi & 1u), f32((vi >> 1u) & 1u), f32((vi >> 2u) & 1u));
 }
@@ -116,7 +136,7 @@ fn cube_vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> 
     }
   }
   var out: CubeOut;
-  out.pos = D.view_proj * vec4<f32>(world, 1.0);
+  out.pos = select(D.view_proj * vec4<f32>(world, 1.0), NOWHERE, peeled(c, si, s));
   out.local = corner;
   out.world = world;
   let filled = center.y >= D.fill.x || lit;
@@ -177,10 +197,11 @@ struct PickOut {
 @vertex
 fn pick_vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> PickOut {
   let c = cubes[ii];
-  let s = slices[c.y & 0xffffu];
+  let si = c.y & 0xffffu;
+  let s = slices[si];
   let world = cube_center(c, s) + (corner_of(vi) * 2.0 - 1.0) * D.half.xyz;
   var out: PickOut;
-  out.pos = D.view_proj * vec4<f32>(world, 1.0);
+  out.pos = select(D.view_proj * vec4<f32>(world, 1.0), NOWHERE, peeled(c, si, s));
   out.id = vec2<u32>(c.x, c.y | 0x80000000u);
   return out;
 }

@@ -267,7 +267,7 @@ voids run through the solid as tunnels.
   wheel or pinch to zoom. In the face and the diamond (an orthographic camera,
   straight on): drag to pan, wheel to zoom about the pointer. Double-click reframes.
   **V** cycles the views, **G** toggles the spacing, **U** swings the diamond's hinge
-  open again.
+  open again, **P** plays the peel, **1–5** snap the stack's camera.
 * **Views.**
   * *Stack*: the tetrahedron.
   * *Front face*: the face the slices' last rows make, laid flat. Slice m's last row
@@ -305,9 +305,22 @@ voids run through the solid as tunnels.
   hovered slice) light up, with white edges. The zero / nonzero mask lens colors the
   cubes white; other layer setups fall back to residue coloring, and the HUD says
   so. The HUD shows the shape, m and its factorization, n, k and the residue.
-* **Peel the 1s edges** (**P**): leaves out every triangle's outer cells, k = 0 and
-  k = n, which are all 1 (white in spectral). The skin comes off the stack (and off the
-  face and the diamond), and the layer under it shows: its edge rows are n mod m.
+* **Peel** (stack view): takes the stack apart layer by layer from its sides: left
+  (k = 0), right (k = n), front (the last rows), top (slices from the apex down) and
+  base (slices from the bottom up). The top and the base are in the same list as the
+  triangles' sides, so peeling "from the top" needs no extra option. *One side* peels
+  the chosen side; *all but one* keeps the chosen side and peels every other one
+  uniformly, the same number of layers each. A layer is a row or cell of the stride
+  on the sides and a drawn slice at the top and the base. The ▶ button (or **P**)
+  plays it, a layer every 1/speed s, starting over once nothing is left; the slider
+  sets the layers by hand. The first layer off the left and right sides is the white
+  skin of 1s, and the layer under it is n mod m. Peeling is done while drawing (the
+  vertex shader sends peeled cubes out of the clip volume, the pick pass too), so a
+  layer costs nothing to take off or put back.
+* **Snap** (stack view, keys **1–5**): the camera glides to look straight down onto the
+  apex, straight up at the base, or square onto the left, right or front face. The
+  directions are the faces' outward normals, from the stack's own corners, so they fit
+  the flush shapes too.
 * **Selection.** A start / end range (2–4096) and the sweep's selection modes: all,
   primes (with their orderings), composites, even, odd, and the interval sequences.
 * **Spacing.** *True* (default): slice height follows m. Skipped moduli leave gaps,

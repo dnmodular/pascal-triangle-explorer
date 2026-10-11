@@ -11,7 +11,7 @@ use pascal::gpu::Gpu;
 use pascal::math::{triangle_dp, Modulus};
 use pascal::palette::{Palette, Scheme};
 use pascal::sweep::{ModMode, Seq};
-use pascal::tetra::{ray_cast, selected_moduli, Camera, CubeId, Layout, Shape, Spacing, TetraConfig, View, FOLD};
+use pascal::tetra::{ray_cast, ray_cast_peeled, selected_moduli, Camera, CubeId, Layout, Peel, PeelMode, Shape, Side, Spacing, TetraConfig, View, FOLD};
 use pascal::tetra_gpu::{DrawOptions, TetraRenderer, BACKGROUND};
 
 fn device() -> (Gpu, TetraRenderer) {
@@ -118,24 +118,45 @@ fn the_face_and_the_diamond_match_too() {
 }
 
 #[test]
-fn peeling_leaves_out_the_ones_edges_only() {
+fn the_pick_sees_through_the_peel() {
     let (_gpu, mut r) = device();
-    let mods: Vec<u32> = (2..=60).collect();
-    for (view, budget) in [(View::Stack, u32::MAX), (View::Stack, 4_000), (View::Diamond, u32::MAX)] {
-        let mut layout = Layout::build(view, &mods, Spacing::True, Shape::Regular, budget);
-        layout.peel = true;
-        let mds: Vec<Modulus> = layout.slices.iter().map(|s| Modulus::new(s.m)).collect();
-        r.set_scene(&layout, &mds, &Palette::new(Scheme::Spectral), 0.0);
-        let (nz, z) = r.read_cubes();
-        let all: Vec<(usize, u32, u32)> = (0..layout.total).map(|g| layout.cell(g).unwrap()).collect();
-        let inner: Vec<_> = all.iter().filter(|&&(_, n, k)| k != 0 && k != n).collect();
-        assert!(inner.len() < all.len());
-        assert_eq!(nz.len() + z.len(), inner.len(), "{view:?}: every inner cell, no edge cell");
-        for w in nz.iter().chain(&z) {
-            let c = CubeId::unpack(*w);
-            assert!(c.k != 0 && c.k != c.n, "{view:?}: edge cell {c:?} drawn");
-            assert_eq!(c.residue, mds[c.slice as usize].binom(c.n, c.k));
+    let mods: Vec<u32> = (2..=26).collect();
+    let (layout, mds) = scene_of(&mut r, View::Stack, &mods, Spacing::True, Shape::Regular, u32::MAX);
+    let (w, h) = (320u32, 240u32);
+    r.ensure_target(w, h);
+    let he = layout.half_extents();
+    for (mode, side, layers) in [(PeelMode::One, Side::Left, 3), (PeelMode::One, Side::Front, 5), (PeelMode::One, Side::Top, 6), (PeelMode::AllBut, Side::Base, 2)] {
+        let peel = Peel { mode, side, layers, ..Peel::default() }.depths();
+        let cam = Camera::framing(layout.bounds());
+        let (mut tested, mut agreed_misses) = (0, 0);
+        for py in (3..h).step_by(11) {
+            for px in (5..w).step_by(9) {
+                let (o, d) = cam.ray(w, h, px as f32, py as f32);
+                let gpu = r.pick_blocking_peeled(&cam, px as f32, py as f32, peel);
+                if let Some(g) = gpu {
+                    assert!(!layout.peeled(g.slice as usize, g.n, g.k, peel), "{mode:?} {side:?}: picked a peeled cube {g:?}");
+                }
+                match ray_cast_peeled(&layout, &mds, o, d, peel) {
+                    Some(hit) => {
+                        let c = layout.center(hit.cube.slice as usize, hit.cube.n, hit.cube.k);
+                        let p = [o[0] + d[0] * hit.t, o[1] + d[1] * hit.t, o[2] + d[2] * hit.t];
+                        let mut m = (0..3).map(|a| he[a] - (p[a] - c[a]).abs()).collect::<Vec<_>>();
+                        m.sort_by(f32::total_cmp);
+                        if m[1] > 0.03 && hit.next_t - hit.t > 0.05 {
+                            assert_eq!(gpu, Some(hit.cube), "{mode:?} {side:?} pixel ({px},{py})");
+                            tested += 1;
+                        }
+                    }
+                    None => {
+                        if gpu.is_none() {
+                            agreed_misses += 1;
+                        }
+                    }
+                }
+            }
         }
+        eprintln!("{mode:?} {side:?} {layers}: {tested} hits, {agreed_misses} misses agreed");
+        assert!(tested > 40 && agreed_misses > 50, "too few decisive rays");
     }
 }
 
@@ -268,7 +289,7 @@ fn the_stack_draws_green_wire_and_lit_brush_cells() {
     let (w, h) = (400u32, 300u32);
     r.ensure_target(w, h);
     let cam = Camera::framing(layout.bounds());
-    let mut o = DrawOptions { camera: cam, fill: f32::INFINITY, hover: None, brush: 3.0, color_slice: false, ghosts: false, mask: false, flat: false };
+    let mut o = DrawOptions { camera: cam, fill: f32::INFINITY, hover: None, brush: 3.0, color_slice: false, ghosts: false, mask: false, flat: false, peel: [0; 5] };
     r.draw_blocking(&o);
     let (_, _, plain) = r.read_target_rgba();
     let bg = BACKGROUND.map(|c| (c * 255.0).round() as u8);

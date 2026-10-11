@@ -45,7 +45,7 @@ struct CellParams {
     stride: u32,
     total: u32,
     row_threads: u32,
-    /// Bit 0: leave out the edge cells k = 0 and k = n.
+    /// Reserved (0).
     flags: u32,
     pad: [u32; 3],
 }
@@ -89,6 +89,8 @@ struct DrawParams {
     line_px: f32,
     ghost_alpha: f32,
     fill: [f32; 4],
+    peel_a: [u32; 4],
+    peel_b: [u32; 4],
 }
 
 const FLAG_SLICE: u32 = 1;
@@ -219,6 +221,8 @@ pub struct DrawOptions {
     pub mask: bool,
     /// A flat view (the face, the diamond): faces toward the viewer in true colors.
     pub flat: bool,
+    /// Layers peeled off each [`crate::tetra::Side`] (the stack only; 0 = none).
+    pub peel: [u32; 5],
 }
 
 struct Target {
@@ -447,7 +451,7 @@ impl TetraRenderer {
         let groups = layout.total.div_ceil(WG);
         let gx = groups.clamp(1, MAX_GROUPS_X);
         let gy = groups.div_ceil(gx).max(1);
-        let params = CellParams { n_slices: layout.slices.len() as u32, stride: layout.stride, total: layout.total, row_threads: gx * WG, flags: layout.peel as u32, pad: [0; 3] };
+        let params = CellParams { n_slices: layout.slices.len() as u32, stride: layout.stride, total: layout.total, row_threads: gx * WG, flags: 0, pad: [0; 3] };
         let pbuf = init(d, "tetra cell params", bytemuck::bytes_of(&params), wgpu::BufferUsages::UNIFORM);
         let cells_bg = d.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("tetra cells"),
@@ -577,7 +581,13 @@ impl TetraRenderer {
             flags |= FLAG_FLAT;
         }
         let brush = o.brush.max(0.0) * s.layout.stride as f32;
-        DrawParams { view_proj, hover, half: [he[0], he[1], he[2], brush], wire: if ghost { [0.55, 0.75, 0.6, 1.0] } else { WIRE }, hover_slice, flags, line_px: 0.75, ghost_alpha: 0.07, fill: [o.fill.clamp(-1e30, 1e30), 0.0, 0.0, 0.0] }
+        let (st, d) = (s.layout.stride, o.peel);
+        let (peel_a, peel_b) = if s.layout.view == View::Stack {
+            ([d[0] * st, d[1] * st, d[2] * st, d[3]], [d[4], s.layout.slices.len() as u32, st, 0])
+        } else {
+            ([0; 4], [0, 0, st, 0])
+        };
+        DrawParams { view_proj, hover, half: [he[0], he[1], he[2], brush], wire: if ghost { [0.55, 0.75, 0.6, 1.0] } else { WIRE }, hover_slice, flags, line_px: 0.75, ghost_alpha: 0.07, fill: [o.fill.clamp(-1e30, 1e30), 0.0, 0.0, 0.0], peel_a, peel_b }
     }
 
     /// Draw the stack into the target: the cubes, the outlines, then the ghosts.
@@ -635,12 +645,12 @@ impl TetraRenderer {
 
     /// Encode the ID pass for pixel (px, py) of the target and copy its result out, unless
     /// a pick is still in flight. Call [`Self::start_pick_map`] after submitting.
-    pub fn encode_pick(&mut self, enc: &mut wgpu::CommandEncoder, camera: &Camera, px: f32, py: f32) -> bool {
+    pub fn encode_pick(&mut self, enc: &mut wgpu::CommandEncoder, camera: &Camera, px: f32, py: f32, peel: [u32; 5]) -> bool {
         if self.pick_pending.is_some() {
             return false;
         }
         let (Some(t), Some(s)) = (&self.target, &self.scene) else { return false };
-        let o = DrawOptions { camera: *camera, fill: f32::INFINITY, hover: None, brush: 0.0, color_slice: false, ghosts: false, mask: false, flat: false };
+        let o = DrawOptions { camera: *camera, fill: f32::INFINITY, hover: None, brush: 0.0, color_slice: false, ghosts: false, mask: false, flat: false, peel };
         let p = self.params(&o, camera.pick_view_proj(t.w, t.h, px, py), false);
         self.queue.write_buffer(&self.pick_ubuf, 0, bytemuck::bytes_of(&p));
         {
@@ -710,8 +720,13 @@ impl TetraRenderer {
 
     /// Pick synchronously (tests).
     pub fn pick_blocking(&mut self, camera: &Camera, px: f32, py: f32) -> Option<CubeId> {
+        self.pick_blocking_peeled(camera, px, py, [0; 5])
+    }
+
+    /// Pick synchronously through a peel (tests).
+    pub fn pick_blocking_peeled(&mut self, camera: &Camera, px: f32, py: f32, peel: [u32; 5]) -> Option<CubeId> {
         let mut enc = self.device.create_command_encoder(&Default::default());
-        assert!(self.encode_pick(&mut enc, camera, px, py), "no pick in flight");
+        assert!(self.encode_pick(&mut enc, camera, px, py, peel), "no pick in flight");
         self.queue.submit(Some(enc.finish()));
         self.start_pick_map();
         loop {

@@ -8,7 +8,7 @@ use pascal::layers::Preset;
 use pascal::math::Modulus;
 use pascal::palette::Scheme;
 use pascal::sweep::{ModMode, PrimeOrder, Seq};
-use pascal::tetra::{describe, face_row_alternates, face_row_zeros, selected_moduli, view_stride, Camera, CubeId, Layout, SceneKey, Shape, SliceKind, Spacing, TetraConfig, View, BUDGETS, FOLD, TETRA_MAX_M};
+use pascal::tetra::{describe, PeelMode, Side, Snap, face_row_alternates, face_row_zeros, selected_moduli, view_stride, Camera, CubeId, Layout, SceneKey, Shape, SliceKind, Spacing, TetraConfig, View, BUDGETS, FOLD, TETRA_MAX_M};
 use pascal::tetra_gpu::{outline_vertices, DrawOptions, TetraRenderer, BACKGROUND};
 use pascal::wave_overlay::Corner;
 
@@ -20,6 +20,10 @@ const SPIN: f32 = 0.35;
 const FILL_TIME: f32 = 0.35;
 /// Seconds for the diamond's hinge to swing open.
 const UNFOLD_TIME: f32 = 1.1;
+/// Seconds for a snapped camera to glide into place.
+const SNAP_TIME: f32 = 0.45;
+/// What a peel extent was counted for: the sides, and the layout (total, stride, slices).
+type PeelKey = (PeelMode, Side, u32, u32, usize);
 /// Width of the space's options panel (points).
 const OPTIONS_W: f32 = 270.0;
 
@@ -50,7 +54,13 @@ pub struct TetraView {
     /// The hovered face row's facts: (m, alternates ±1, zeros).
     row_stats: Option<(u32, bool, u32)>,
     /// Pointer and camera of the last pick, so an unchanged view is not picked again.
-    last_pick: Option<((f32, f32), Camera)>,
+    last_pick: Option<((f32, f32), Camera, [u32; 5])>,
+    /// The peel animation's clock (a layer comes off every 1/speed s), and the extent
+    /// (layers that peel everything) for the sides and the layout it was counted for.
+    peel_clock: f32,
+    peel_extent: Option<(PeelKey, u32)>,
+    /// A snapped camera gliding into place: from, to, progress 0..1.
+    snap: Option<(Camera, Camera, f32)>,
     focus_last_frame: bool,
     /// The space laid itself out this frame (its target size is real, not the tile's).
     sized: bool,
@@ -139,8 +149,77 @@ impl TetraView {
         }
     }
 
+    /// The layers that peel the whole stack away with the current sides.
+    pub fn peel_extent(&mut self) -> u32 {
+        let Some(l) = &self.layout else { return 0 };
+        let p = self.config.peel;
+        let key = (p.mode, p.side, l.total, l.stride, l.slices.len());
+        match self.peel_extent {
+            Some((k, e)) if k == key => e,
+            _ => {
+                let e = l.peel_extent(&p);
+                self.peel_extent = Some((key, e));
+                e
+            }
+        }
+    }
+
+    /// The peel the next draw uses: the space's stack only.
+    fn peel_depths(&self) -> [u32; 5] {
+        if self.open && self.config.view == View::Stack {
+            self.config.peel.depths()
+        } else {
+            [0; 5]
+        }
+    }
+
+    /// Glide the space's camera square onto a side (or straight down / up).
+    pub fn start_snap(&mut self, snap: Snap) {
+        let (Some(l), Some(from)) = (&self.layout, self.camera) else { return };
+        if l.view != View::Stack {
+            return;
+        }
+        let mut to = l.snap_camera(snap);
+        if matches!(snap, Snap::Top | Snap::Bottom) {
+            // straight down or up: keep the turn the view already has
+            to.yaw = from.yaw;
+        }
+        self.snap = Some((from, to, 0.0));
+    }
+
     pub fn advance(&mut self, dt: f32) {
         let dt = dt.max(0.0);
+        // the camera gliding to a snapped view
+        if let Some((from, to, t)) = self.snap.as_mut() {
+            *t = (*t + dt / SNAP_TIME).min(1.0);
+            let e = smoothstep(*t);
+            let (from, to, done) = (*from, *to, *t >= 1.0);
+            if let Some(cam) = self.camera.as_mut() {
+                let turn = (to.yaw - from.yaw + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI;
+                cam.yaw = from.yaw + turn * e;
+                cam.pitch = from.pitch + (to.pitch - from.pitch) * e;
+                cam.dist = from.dist + (to.dist - from.dist) * e;
+                for a in 0..3 {
+                    cam.target[a] = from.target[a] + (to.target[a] - from.target[a]) * e;
+                }
+                cam.radius = to.radius;
+            }
+            if done {
+                self.snap = None;
+            }
+        }
+        // the peel, a layer at a time while it plays, round and round
+        if self.config.peel.playing && self.open && self.config.view == View::Stack && self.config.peel.mode != PeelMode::Off {
+            let speed = self.config.peel.speed.clamp(0.1, 120.0);
+            self.peel_clock += dt * speed;
+            let steps = self.peel_clock.floor();
+            if steps >= 1.0 {
+                self.peel_clock -= steps;
+                let extent = self.peel_extent().max(1);
+                let p = &mut self.config.peel;
+                p.layers = (p.layers + steps as u32) % (extent + 1);
+            }
+        }
         if !self.open && self.config.spin && self.visible() {
             self.spin = (self.spin + dt * SPIN) % std::f32::consts::TAU;
         }
@@ -158,7 +237,8 @@ impl TetraView {
         let want = if self.tile_hot { 1.0 } else { 0.0 };
         let tile = !self.open && self.visible() && self.fill != want;
         let hinge = self.open && self.config.view == View::Diamond && self.unfold < 1.0;
-        tile || hinge
+        let peel = self.open && self.config.view == View::Stack && self.config.peel.playing && self.config.peel.mode != PeelMode::Off;
+        tile || hinge || peel || self.snap.is_some()
     }
 
     /// The hinge angle of the diamond now: folded at the start, flat at the end.
@@ -210,7 +290,6 @@ pub fn render(model: &mut Model, cache: &mut TetraCache, r: &mut TetraRenderer, 
     if (cache.scene != Some(key) && !dragging) || t.layout.is_none() {
         let mods = selected_moduli(&t.config.sweep);
         let mut layout = Layout::build(view, &mods, t.config.spacing, t.config.shape, t.config.budget);
-        layout.peel = t.config.peel;
         if view == View::Diamond {
             layout.set_fold(t.fold_angle());
         }
@@ -272,7 +351,8 @@ pub fn render(model: &mut Model, cache: &mut TetraCache, r: &mut TetraRenderer, 
     }
     let mask = model.layers.preset() == Some(Preset::Mask);
     let hover = if t.open { t.hover } else { None };
-    let opts = DrawOptions { camera, fill: t.fill_height(), hover, brush: t.config.brush, color_slice: t.config.color_slice, ghosts: t.config.ghosts, mask, flat: t.open && view.flat() };
+    let peel = t.peel_depths();
+    let opts = DrawOptions { camera, fill: t.fill_height(), hover, brush: t.config.brush, color_slice: t.config.color_slice, ghosts: t.config.ghosts, mask, flat: t.open && view.flat(), peel };
     // an unchanged picture is not drawn again (hover, egui repaints)
     let drawn = (opts, t.target_px);
     if recreated || cache.drawn != Some(drawn) {
@@ -281,8 +361,8 @@ pub fn render(model: &mut Model, cache: &mut TetraCache, r: &mut TetraRenderer, 
     }
     if t.open {
         if let Some(p) = t.pointer {
-            if t.last_pick != Some((p, camera)) && r.encode_pick(enc, &camera, p.0, p.1) {
-                t.last_pick = Some((p, camera));
+            if t.last_pick != Some((p, camera, peel)) && r.encode_pick(enc, &camera, p.0, p.1, peel) {
+                t.last_pick = Some((p, camera, peel));
             }
         }
     }
@@ -332,6 +412,25 @@ fn options(ui: &mut egui::Ui, t: &mut TetraView) {
     note(ui, t.config.view.note());
     if t.config.view == View::Diamond && ui.small_button("unfold again (U)").on_hover_text("Fold the base slice back to where it sits in the tetrahedron and swing it open").clicked() {
         t.replay_unfold();
+    }
+    if t.config.view == View::Stack {
+        ui.separator();
+        ui.horizontal_wrapped(|ui| {
+            ui.label(egui::RichText::new("snap").color(ui.visuals().weak_text_color()));
+            for (i, sn) in Snap::ALL.iter().enumerate() {
+                let tip = match sn {
+                    Snap::Top => "Straight down onto the apex",
+                    Snap::Bottom => "Straight up at the base slice",
+                    Snap::Left => "Square onto the left face (k = 0)",
+                    Snap::Right => "Square onto the right face (k = n)",
+                    Snap::Front => "Square onto the front face (the last rows)",
+                };
+                if ui.small_button(sn.label()).on_hover_text(format!("{tip} ({})", i + 1)).clicked() {
+                    t.start_snap(*sn);
+                }
+            }
+        });
+        peel_controls(ui, t);
     }
     ui.separator();
     let c = &mut t.config;
@@ -392,7 +491,6 @@ fn options(ui: &mut egui::Ui, t: &mut TetraView) {
         ui.add_enabled_ui(!c.color_slice, |ui| mono_drag(ui, &mut c.brush, 0.0..=64.0, 0.05).on_hover_text("Cubes within this many cells of the hovered cube light up"));
         ui.checkbox(&mut c.color_slice, "whole slice").on_hover_text("Light up the whole hovered slice (or face row) instead");
     });
-    ui.checkbox(&mut c.peel, "peel the 1s edges").on_hover_text("Leave out every triangle's outer cells, k = 0 and k = n, which are all 1: the white skin comes off and the residues inside show (P)");
     ui.horizontal(|ui| {
         ui.checkbox(&mut c.ghosts, "ghost zeros").on_hover_text("Zero cells as faint ghost cubes: the tunnels glow through the solid");
         ui.label(egui::RichText::new("cubes ≤").color(ui.visuals().weak_text_color()));
@@ -413,7 +511,51 @@ fn options(ui: &mut egui::Ui, t: &mut TetraView) {
     };
     mono_line(ui, &text);
     ui.separator();
-    note(ui, "Keys: V next view · U unfold again · G spacing · P peel · O options · Esc back. Stack: drag orbit, right / shift-drag pan, wheel zoom. Face and diamond: drag pan, wheel zoom. Double-click reframes.");
+    note(ui, "Keys: V next view · 1–5 snap the stack's camera · P play the peel · U unfold again · G spacing · O options · Esc back. Stack: drag orbit, right / shift-drag pan, wheel zoom. Face and diamond: drag pan, wheel zoom. Double-click reframes.");
+}
+
+/// The peel: which sides, how many layers, and the animation that takes them off one by
+/// one and starts over.
+fn peel_controls(ui: &mut egui::Ui, t: &mut TetraView) {
+    let extent = t.peel_extent();
+    let p = &mut t.config.peel;
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("peel").color(ui.visuals().weak_text_color()));
+        for m in PeelMode::ALL {
+            let tip = match m {
+                PeelMode::Off => "Nothing peeled",
+                PeelMode::One => "Peel the chosen side, one layer at a time",
+                PeelMode::AllBut => "Keep the chosen side and peel every other one uniformly",
+            };
+            ui.selectable_value(&mut p.mode, m, m.label()).on_hover_text(tip);
+        }
+    });
+    if p.mode == PeelMode::Off {
+        return;
+    }
+    ui.horizontal(|ui| {
+        let what = if p.mode == PeelMode::One { "side" } else { "keep" };
+        ui.label(egui::RichText::new(what).color(ui.visuals().weak_text_color()));
+        egui::ComboBox::from_id_salt("peel side").width(150.0).selected_text(p.side.label()).show_ui(ui, |ui| {
+            for sd in Side::ALL {
+                ui.selectable_value(&mut p.side, sd, sd.label());
+            }
+        });
+    });
+    ui.horizontal(|ui| {
+        let playing = p.playing;
+        if ui.add(egui::Button::new(if playing { "❚❚" } else { "▶" }).small().selected(playing)).on_hover_text(if playing { "Stop peeling (P)" } else { "Peel a layer at a time, and start over when nothing is left (P)" }).clicked() {
+            p.playing = !playing;
+        }
+        ui.spacing_mut().slider_width = 110.0;
+        ui.add(egui::Slider::new(&mut p.layers, 0..=extent.max(1)).show_value(false)).on_hover_text("Layers peeled");
+        mono_line(ui, &format!("{} / {}", p.layers, extent));
+    });
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("speed").color(ui.visuals().weak_text_color()));
+        mono_drag(ui, &mut p.speed, 0.1..=120.0, 0.05).on_hover_text("Layers a second while it plays");
+        ui.label(egui::RichText::new("layers / s").color(ui.visuals().weak_text_color()));
+    });
 }
 
 fn short(n: u32) -> String {
@@ -567,7 +709,19 @@ pub fn space(ui: &mut egui::Ui, model: &mut Model, ppp: f32, tex: Option<egui::T
             if !ui.ctx().egui_wants_keyboard_input() {
                 let (esc, g, v, u, o, pk) = ui.input(|i| (i.key_pressed(egui::Key::Escape), i.key_pressed(egui::Key::G), i.key_pressed(egui::Key::V), i.key_pressed(egui::Key::U), i.key_pressed(egui::Key::O), i.key_pressed(egui::Key::P)));
                 if pk {
-                    t.config.peel = !t.config.peel;
+                    let p = &mut t.config.peel;
+                    if p.mode == PeelMode::Off {
+                        p.mode = PeelMode::One;
+                    }
+                    p.playing = !p.playing;
+                }
+                if t.config.view == View::Stack {
+                    let keys = [egui::Key::Num1, egui::Key::Num2, egui::Key::Num3, egui::Key::Num4, egui::Key::Num5];
+                    for (key, sn) in keys.iter().zip(Snap::ALL) {
+                        if ui.input(|i| i.key_pressed(*key)) {
+                            t.start_snap(sn);
+                        }
+                    }
                 }
                 if esc && !t.focus_last_frame {
                     t.open = false;
@@ -687,8 +841,10 @@ pub fn space(ui: &mut egui::Ui, model: &mut Model, ppp: f32, tex: Option<egui::T
                     });
                 }
             }
-            if l.peel {
-                lines.push("peeled: the 1s edges (k = 0, k = n) are left out (P)".into());
+            let p = t.config.peel;
+            if l.view == View::Stack && p.mode != PeelMode::Off && (p.layers > 0 || p.playing) {
+                let how = if p.mode == PeelMode::One { format!("the {} side", p.side.label()) } else { format!("every side but {}", p.side.label()) };
+                lines.push(format!("peeled: {} layer{} off {how}{} (P)", p.layers, if p.layers == 1 { "" } else { "s" }, if p.playing { ", playing" } else { "" }));
             }
             let lens = match model.layers.preset() {
                 Some(Preset::Mask) => "mask",

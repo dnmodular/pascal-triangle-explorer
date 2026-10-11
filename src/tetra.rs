@@ -130,8 +130,8 @@ pub struct TetraConfig {
     pub shape: Shape,
     /// What the 3D space shows: the stack, its front face, or the diamond.
     pub view: View,
-    /// Leave out the triangles' 1s edges (k = 0, k = n).
-    pub peel: bool,
+    /// Peeling the stack's sides away, layer by layer (the stack view only).
+    pub peel: Peel,
     /// The options panel is open in the 3D space.
     pub options: bool,
     /// Zero cells as faint ghost cubes.
@@ -152,7 +152,7 @@ impl Default for TetraConfig {
     fn default() -> Self {
         let mut sweep = Sweep::default();
         sweep.end = 48;
-        TetraConfig { sweep, spacing: Spacing::True, shape: Shape::Regular, view: View::Stack, peel: false, options: true, ghosts: false, brush: 2.0, color_slice: false, budget: 1_000_000, spin: true, tile: true }
+        TetraConfig { sweep, spacing: Spacing::True, shape: Shape::Regular, view: View::Stack, peel: Peel::default(), options: true, ghosts: false, brush: 2.0, color_slice: false, budget: 1_000_000, spin: true, tile: true }
     }
 }
 
@@ -160,11 +160,11 @@ impl TetraConfig {
     /// What the geometry of `view` depends on (the scene is rebuilt when it changes).
     pub fn scene_key(&self, view: View) -> SceneKey {
         let s = &self.sweep;
-        (s.mode, s.prime_order, s.seq, s.step, s.start, s.end, self.spacing, self.budget, self.shape, view, self.peel)
+        (s.mode, s.prime_order, s.seq, s.step, s.start, s.end, self.spacing, self.budget, self.shape, view)
     }
 }
 
-pub type SceneKey = (crate::sweep::ModMode, crate::sweep::PrimeOrder, crate::sweep::Seq, u32, u32, u32, Spacing, u32, Shape, View, bool);
+pub type SceneKey = (crate::sweep::ModMode, crate::sweep::PrimeOrder, crate::sweep::Seq, u32, u32, u32, Spacing, u32, Shape, View);
 
 /// The moduli in `start..=end` (clamped to 2..=TETRA_MAX_M) that the selection mode
 /// visits, ascending.
@@ -281,6 +281,123 @@ pub fn view_stride(view: View, mods: &[u32], spacing: Spacing, budget: u32) -> u
 /// The stack's stride in true spacing (for callers that only know the stack).
 pub fn stride_for(mods: &[u32], budget: u32) -> u32 {
     view_stride(View::Stack, mods, Spacing::True, budget)
+}
+
+/// A side of the stack that peels: the three sides of every triangle (as faces of the
+/// tetrahedron) and its two ends, the apex and the base.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Hash)]
+pub enum Side {
+    /// k = 0 in every slice (all 1s).
+    #[default]
+    Left,
+    /// k = n in every slice (all 1s).
+    Right,
+    /// The last rows (the front face).
+    Front,
+    /// Slices from the apex down.
+    Top,
+    /// Slices from the base up.
+    Base,
+}
+
+impl Side {
+    pub const ALL: [Side; 5] = [Side::Left, Side::Right, Side::Front, Side::Top, Side::Base];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Side::Left => "left (k = 0)",
+            Side::Right => "right (k = n)",
+            Side::Front => "front (last rows)",
+            Side::Top => "top (from the apex)",
+            Side::Base => "base (from the bottom)",
+        }
+    }
+}
+
+/// How the sides peel.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Hash)]
+pub enum PeelMode {
+    #[default]
+    Off,
+    /// The chosen side, one layer at a time.
+    One,
+    /// Every side but the chosen one, all at once, uniformly.
+    AllBut,
+}
+
+impl PeelMode {
+    pub const ALL: [PeelMode; 3] = [PeelMode::Off, PeelMode::One, PeelMode::AllBut];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            PeelMode::Off => "off",
+            PeelMode::One => "one side",
+            PeelMode::AllBut => "all but one",
+        }
+    }
+}
+
+/// Peeling: which sides, and how many layers are off. A layer is one row or cell of the
+/// stride on the triangles' sides (k, n − k, last row − n) and one drawn slice at the top
+/// or the base, so a stride never makes a layer peel nothing.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Peel {
+    pub mode: PeelMode,
+    pub side: Side,
+    pub layers: u32,
+    /// The animation: a layer comes off every 1/speed s while playing, and when the
+    /// last cube is gone it starts again from nothing peeled.
+    pub playing: bool,
+    pub speed: f32,
+}
+
+impl Default for Peel {
+    fn default() -> Self {
+        Peel { mode: PeelMode::Off, side: Side::Left, layers: 0, playing: false, speed: 6.0 }
+    }
+}
+
+impl Peel {
+    /// Layers off each side, in `Side::ALL` order (0 = untouched).
+    pub fn depths(&self) -> [u32; 5] {
+        let mut d = [0u32; 5];
+        for (i, side) in Side::ALL.iter().enumerate() {
+            let on = match self.mode {
+                PeelMode::Off => false,
+                PeelMode::One => *side == self.side,
+                PeelMode::AllBut => *side != self.side,
+            };
+            if on {
+                d[i] = self.layers;
+            }
+        }
+        d
+    }
+}
+
+/// A snapped camera direction for the stack: straight down at the apex, straight up at
+/// the base, or square onto one of the three sides (the left, right and front faces).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Snap {
+    Top,
+    Bottom,
+    Left,
+    Right,
+    Front,
+}
+
+impl Snap {
+    pub const ALL: [Snap; 5] = [Snap::Top, Snap::Bottom, Snap::Left, Snap::Right, Snap::Front];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Snap::Top => "top",
+            Snap::Bottom => "base",
+            Snap::Left => "left",
+            Snap::Right => "right",
+            Snap::Front => "front",
+        }
+    }
 }
 
 /// What the 3D space shows.
@@ -403,9 +520,6 @@ pub struct Layout {
     pub full_total: u64,
     /// The diamond's hinge: the base slice's angle out of the face's plane (0 = flat).
     pub fold: f32,
-    /// Leave out every triangle's edge cells (k = 0 and k = n, all 1s): the white skin
-    /// comes off and the residues inside show.
-    pub peel: bool,
 }
 
 /// The stack's row direction: rows run back along z, half a cell left per row.
@@ -424,7 +538,7 @@ impl Layout {
     pub fn build(view: View, mods: &[u32], spacing: Spacing, shape: Shape, budget: u32) -> Layout {
         let stride = view_stride(view, mods, spacing, budget);
         let len = mods.len();
-        let mut l = Layout { view, mods: mods.to_vec(), slices: Vec::new(), spacing, shape, stride, total: 0, full_total: view_cells(view, mods, spacing, 1), fold: 0.0, peel: false };
+        let mut l = Layout { view, mods: mods.to_vec(), slices: Vec::new(), spacing, shape, stride, total: 0, full_total: view_cells(view, mods, spacing, 1), fold: 0.0 };
         let mut base = 0u32;
         for i in drawn(view, mods, spacing, stride) {
             let m = mods[i];
@@ -562,6 +676,82 @@ impl Layout {
     pub fn center(&self, slice: usize, n: u32, k: u32) -> [f32; 3] {
         let s = &self.slices[slice];
         add(add(s.origin, scale(s.nvec, n as f32)), [k as f32, 0.0, 0.0])
+    }
+
+    /// Whether cell (slice, n, k) is peeled away (the stack only), as the shaders decide.
+    pub fn peeled(&self, si: usize, n: u32, k: u32, depths: [u32; 5]) -> bool {
+        if self.view != View::Stack {
+            return false;
+        }
+        let s = &self.slices[si];
+        let st = self.stride;
+        let last = s.last_row(st);
+        let n_slices = self.slices.len() as u32;
+        let si = si as u32;
+        (depths[0] > 0 && k < depths[0] * st)
+            || (depths[1] > 0 && n - k < depths[1] * st)
+            || (depths[2] > 0 && last - n < depths[2] * st)
+            || (depths[3] > 0 && si < depths[3])
+            || (depths[4] > 0 && n_slices - 1 - si < depths[4])
+    }
+
+    /// The fewest layers that peel the whole stack away with `peel`'s sides.
+    pub fn peel_extent(&self, peel: &Peel) -> u32 {
+        let mut p = *peel;
+        p.layers = 1;
+        let unit = p.depths();
+        if self.view != View::Stack || unit.iter().all(|&d| d == 0) {
+            return 0;
+        }
+        let st = self.stride;
+        let n_slices = self.slices.len() as u32;
+        let mut extent = 0u32;
+        for (si, s) in self.slices.iter().enumerate() {
+            let last = s.last_row(st);
+            let si = si as u32;
+            // a cell survives L layers while every peeled side is at least L layers away
+            let slice_d = [si, n_slices - 1 - si];
+            let slice_min = (3..5).filter(|&i| unit[i] > 0).map(|i| slice_d[i - 3] + 1).min().unwrap_or(u32::MAX);
+            if slice_min <= extent {
+                continue;
+            }
+            for (n, k) in self.slice_cells(si as usize) {
+                let cell_d = [k / st, (n - k) / st, (last - n) / st];
+                let cell_min = (0..3).filter(|&i| unit[i] > 0).map(|i| cell_d[i] + 1).min().unwrap_or(u32::MAX);
+                extent = extent.max(cell_min.min(slice_min));
+            }
+        }
+        extent
+    }
+
+    /// A camera looking square onto a side of the stack (or straight down / up),
+    /// framing the whole stack, from the stack's own corners so every shape works.
+    pub fn snap_camera(&self, snap: Snap) -> Camera {
+        let mut cam = Camera::framing(self.bounds());
+        let (Some(first), Some(last)) = (self.slices.first(), self.slices.last()) else { return cam };
+        let apex = self.corners(first.m, first.height())[0];
+        let [b0, bl, br] = self.corners(last.m, last.height());
+        // outward normal of the plane through a, b, c, away from the opposite corner
+        let outward = |a: [f32; 3], b: [f32; 3], c: [f32; 3], away: [f32; 3]| {
+            let mut nrm = normalize(cross(sub(b, a), sub(c, a)));
+            if dot(nrm, sub(away, a)) > 0.0 {
+                nrm = scale(nrm, -1.0);
+            }
+            nrm
+        };
+        let dir = match snap {
+            Snap::Top => [0.0, 1.0, 0.0],
+            Snap::Bottom => [0.0, -1.0, 0.0],
+            Snap::Left => outward(apex, b0, bl, br),
+            Snap::Right => outward(apex, b0, br, bl),
+            Snap::Front => outward(apex, bl, br, b0),
+        };
+        // eye = target + dir·dist, with eye = target + (sin yaw·cos pitch, sin pitch, −cos yaw·cos pitch)
+        cam.pitch = dir[1].clamp(-1.0, 1.0).asin().clamp(-1.55, 1.55);
+        if dir[0].abs() + dir[2].abs() > 1e-4 {
+            cam.yaw = dir[0].atan2(-dir[2]);
+        }
+        cam
     }
 
     /// The stack height a modulus has (or would have, skipped) in this spacing.
@@ -908,6 +1098,11 @@ pub struct RayHit {
 /// The reference ray cast over every nonzero cube of the layout (CPU residues;
 /// `mods[i]` is slice i's modulus).
 pub fn ray_cast(layout: &Layout, mods: &[Modulus], o: [f32; 3], d: [f32; 3]) -> Option<RayHit> {
+    ray_cast_peeled(layout, mods, o, d, [0; 5])
+}
+
+/// The same through a peel: peeled cubes are not there.
+pub fn ray_cast_peeled(layout: &Layout, mods: &[Modulus], o: [f32; 3], d: [f32; 3], peel: [u32; 5]) -> Option<RayHit> {
     let he = layout.half_extents();
     let mut best: Option<RayHit> = None;
     let mut second = f32::MAX;
@@ -924,6 +1119,9 @@ pub fn ray_cast(layout: &Layout, mods: &[Modulus], o: [f32; 3], d: [f32; 3]) -> 
             continue;
         }
         for (n, k) in layout.slice_cells(si) {
+            if layout.peeled(si, n, k, peel) {
+                continue;
+            }
             let c = layout.center(si, n, k);
             let Some(t) = ray_box(o, d, sub(c, he), add(c, he)) else { continue };
             let r = md.binom(n, k);
@@ -1164,6 +1362,73 @@ mod tests {
                 assert_eq!(ma[0], a[0]);
                 assert_eq!((*ma.last().unwrap(), *mb.last().unwrap()), (*a.last().unwrap(), *b.last().unwrap()));
             }
+        }
+    }
+
+    #[test]
+    fn peels_take_whole_layers_and_the_extent_clears_the_stack() {
+        for budget in [u32::MAX, 3_000] {
+            let l = Layout::build(View::Stack, &(2..=30).collect::<Vec<_>>(), Spacing::True, Shape::Regular, budget);
+            let cells: Vec<(usize, u32, u32)> = (0..l.total).map(|g| l.cell(g).unwrap()).collect();
+            for mode in [PeelMode::One, PeelMode::AllBut] {
+                for side in Side::ALL {
+                    let mut p = Peel { mode, side, ..Peel::default() };
+                    let extent = l.peel_extent(&p);
+                    assert!(extent > 0, "{mode:?} {side:?}");
+                    let left = |layers: u32| {
+                        let q = Peel { layers, ..p };
+                        cells.iter().filter(|&&(si, n, k)| !l.peeled(si, n, k, q.depths())).count()
+                    };
+                    assert_eq!(left(0), cells.len());
+                    // each layer takes something off, until the extent takes everything
+                    let mut prev = cells.len();
+                    for layers in 1..=extent {
+                        let now = left(layers);
+                        assert!(now < prev, "{mode:?} {side:?} stride {}: layer {layers} took nothing", l.stride);
+                        prev = now;
+                    }
+                    assert_eq!(prev, 0, "{mode:?} {side:?}: {extent} layers leave cubes");
+                    // one layer of a side is exactly its outer cells
+                    if mode == PeelMode::One {
+                        p.layers = 1;
+                        let st = l.stride;
+                        for &(si, n, k) in &cells {
+                            let s = &l.slices[si];
+                            let outer = match side {
+                                Side::Left => k == 0,
+                                Side::Right => k == n,
+                                Side::Front => n == s.last_row(st),
+                                Side::Top => si == 0,
+                                Side::Base => si == l.slices.len() - 1,
+                            };
+                            assert_eq!(l.peeled(si, n, k, p.depths()), outer, "{side:?} ({si}, {n}, {k})");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn snapped_cameras_look_square_onto_the_faces() {
+        for shape in [Shape::Regular, Shape::CornerApex, Shape::FaceFront] {
+            let l = Layout::build(View::Stack, &(2..=40).collect::<Vec<_>>(), Spacing::True, shape, u32::MAX);
+            let first = l.slices[0];
+            let last = *l.slices.last().unwrap();
+            let apex = l.corners(first.m, first.height())[0];
+            let [b0, bl, br] = l.corners(last.m, last.height());
+            for (snap, face) in [(Snap::Left, [apex, b0, bl]), (Snap::Right, [apex, b0, br]), (Snap::Front, [apex, bl, br])] {
+                let cam = l.snap_camera(snap);
+                let view = normalize(sub(cam.eye(), cam.target));
+                // the view direction is perpendicular to both of the face's edges
+                for e in [sub(face[1], face[0]), sub(face[2], face[0])] {
+                    assert!(dot(view, normalize(e)).abs() < 1e-3, "{shape:?} {snap:?}: not square on");
+                }
+                // and from outside: the face's other corner is behind it
+                let other = [apex, b0, bl, br].into_iter().find(|p| !face.contains(p)).unwrap();
+                assert!(dot(view, sub(other, face[0])) < 0.0, "{shape:?} {snap:?}: looking from inside");
+            }
+            assert!(l.snap_camera(Snap::Top).pitch > 1.5 && l.snap_camera(Snap::Bottom).pitch < -1.5);
         }
     }
 
