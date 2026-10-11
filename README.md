@@ -319,8 +319,15 @@ voids run through the solid as tunnels.
   layer costs nothing to take off or put back.
 * **Snap** (stack view, keys **1–5**): the camera glides to look straight down onto the
   apex, straight up at the base, or square onto the left, right or front face. The
-  directions are the faces' outward normals, from the stack's own corners, so they fit
-  the flush shapes too.
+  directions are the outward normals of the planes from the top slice to the bottom
+  one, from the stack's own corners, so they fit the flush shapes and packed spacing
+  (whose squat prime stacks tilt the faces far more). A snap sticks: change the
+  spacing, range, visit mode or shape and the camera glides to the same face of the
+  new shape; orbiting or panning by hand lets go of it.
+* **The view stays put.** Rebuilding the stack (a new range, visit mode, spacing,
+  shape or level of detail) keeps the camera's angle and its pan and zoom relative to
+  the new size; only switching between stack, face and diamond, or a double-click,
+  frames it afresh.
 * **Selection.** A start / end range (2–4096) and the sweep's selection modes: all,
   primes (with their orderings), composites, even, odd, and the interval sequences.
 * **Spacing.** *True* (default): slice height follows m. Skipped moduli leave gaps,

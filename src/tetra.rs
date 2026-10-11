@@ -1411,8 +1411,12 @@ mod tests {
 
     #[test]
     fn snapped_cameras_look_square_onto_the_faces() {
-        for shape in [Shape::Regular, Shape::CornerApex, Shape::FaceFront] {
-            let l = Layout::build(View::Stack, &(2..=40).collect::<Vec<_>>(), Spacing::True, shape, u32::MAX);
+        // the equilateral shape, the flush ones, and packed spacing (prime selections make
+        // it squat): each snap faces the plane from the top slice to the bottom one
+        let primes: Vec<u32> = (2..=487).filter(|&m| crate::math::is_prime(m)).collect();
+        let cases = [(Shape::Regular, Spacing::True, (2..=40).collect::<Vec<u32>>()), (Shape::CornerApex, Spacing::True, (2..=40).collect()), (Shape::FaceFront, Spacing::True, (2..=40).collect()), (Shape::Regular, Spacing::Packed, primes.clone()), (Shape::FaceLeft, Spacing::Packed, primes)];
+        for (shape, spacing, mods) in cases {
+            let l = Layout::build(View::Stack, &mods, spacing, shape, 1_000_000);
             let first = l.slices[0];
             let last = *l.slices.last().unwrap();
             let apex = l.corners(first.m, first.height())[0];

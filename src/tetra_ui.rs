@@ -61,6 +61,9 @@ pub struct TetraView {
     peel_extent: Option<(PeelKey, u32)>,
     /// A snapped camera gliding into place: from, to, progress 0..1.
     snap: Option<(Camera, Camera, f32)>,
+    /// The face the camera is snapped to, until the view is turned by hand: a new shape
+    /// (packed spacing, another range) re-snaps to the same face.
+    snapped: Option<Snap>,
     focus_last_frame: bool,
     /// The space laid itself out this frame (its target size is real, not the tile's).
     sized: bool,
@@ -185,6 +188,7 @@ impl TetraView {
             to.yaw = from.yaw;
         }
         self.snap = Some((from, to, 0.0));
+        self.snapped = Some(snap);
     }
 
     pub fn advance(&mut self, dt: f32) {
@@ -301,18 +305,34 @@ pub fn render(model: &mut Model, cache: &mut TetraCache, r: &mut TetraRenderer, 
         // scene the space last showed keeps it. A new range or view is framed anew; in
         // the stack a new spacing, shape or level of detail keeps the angle and the
         // relative zoom.
+        // The space's view is kept through every rebuild of the same view (a new range,
+        // visit mode, spacing, shape or level of detail): the same angle, and the pan
+        // and zoom relative to the new size. Only a new view (stack, face, diamond) or a
+        // double-click frames it afresh.
+        let mut resnap = None;
         if t.open && t.space_key != Some(key) {
-            let same_sel = t.space_key.is_some_and(|k| (k.0, k.1, k.2, k.3, k.4, k.5, k.9) == (key.0, key.1, key.2, key.3, key.4, key.5, key.9));
-            match (view, same_sel, t.camera.as_mut(), t.space_bounds) {
-                (View::Stack, true, Some(cam), Some(old)) => {
-                    let (was, now) = (Camera::framing(old), Camera::framing(layout.bounds()));
+            let same_view = t.space_key.is_some_and(|k| k.9 == view);
+            match (same_view, t.camera.as_mut(), t.space_bounds) {
+                (true, Some(cam), Some(old)) => {
+                    let new = layout.at_rest().bounds();
+                    let (w, h) = (t.target_px.0 as f32, t.target_px.1 as f32);
+                    let (top, bottom) = t.flat_insets;
+                    let (was, now) = if view.flat() { (Camera::flat(old, w, h, top, bottom), Camera::flat(new, w, h, top, bottom)) } else { (Camera::framing(old), Camera::framing(new)) };
                     let pan = [cam.target[0] - was.target[0], cam.target[1] - was.target[1], cam.target[2] - was.target[2]];
                     let scale = now.radius / was.radius;
                     cam.target = [now.target[0] + pan[0] * scale, now.target[1] + pan[1] * scale, now.target[2] + pan[2] * scale];
                     cam.dist *= now.dist / was.dist;
+                    if view.flat() {
+                        cam.ortho *= now.ortho / was.ortho;
+                    }
                     cam.radius = now.radius;
+                    // a snapped view follows its face to the new shape
+                    resnap = t.snapped;
                 }
-                _ => t.camera = None,
+                _ => {
+                    t.camera = None;
+                    t.snapped = None;
+                }
             }
         }
         if t.open {
@@ -320,11 +340,21 @@ pub fn render(model: &mut Model, cache: &mut TetraCache, r: &mut TetraRenderer, 
             t.space_bounds = Some(layout.at_rest().bounds());
         }
         t.layout = Some(layout);
+        if let Some(sn) = resnap {
+            t.start_snap(sn);
+        }
         t.hover = None;
         t.last_pick = None;
         cache.scene = Some(key);
         cache.colors = Some((model.scheme, model.style.offset.to_bits()));
         cache.drawn = None;
+    }
+    // the space opened on the tile's scene (no rebuild): its camera belongs to it now
+    if t.open && t.space_key != Some(key) && cache.scene == Some(key) {
+        if let Some(l) = &t.layout {
+            t.space_key = Some(key);
+            t.space_bounds = Some(l.at_rest().bounds());
+        }
     }
     // the diamond's hinge: only the base slice's placement changes
     let want = t.fold_angle();
@@ -688,8 +718,12 @@ pub fn space(ui: &mut egui::Ui, model: &mut Model, ppp: f32, tex: Option<egui::T
                     let pan = flat || resp.dragged_by(egui::PointerButton::Secondary) || resp.dragged_by(egui::PointerButton::Middle) || (shift && resp.dragged_by(egui::PointerButton::Primary));
                     if pan {
                         cam.pan(d.x, d.y, rect.height());
+                        t.snapped = None;
+                        t.snap = None;
                     } else if resp.dragged_by(egui::PointerButton::Primary) {
                         cam.orbit(d.x, d.y);
+                        t.snapped = None;
+                        t.snap = None;
                     }
                 }
                 if resp.hovered() {
@@ -705,6 +739,8 @@ pub fn space(ui: &mut egui::Ui, model: &mut Model, ppp: f32, tex: Option<egui::T
             }
             if resp.double_clicked() {
                 t.camera = None;
+                t.snapped = None;
+                t.snap = None;
             }
             if !ui.ctx().egui_wants_keyboard_input() {
                 let (esc, g, v, u, o, pk) = ui.input(|i| (i.key_pressed(egui::Key::Escape), i.key_pressed(egui::Key::G), i.key_pressed(egui::Key::V), i.key_pressed(egui::Key::U), i.key_pressed(egui::Key::O), i.key_pressed(egui::Key::P)));
