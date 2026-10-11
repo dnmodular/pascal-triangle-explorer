@@ -118,7 +118,9 @@ of morphing. `--link` turns the link on from the command line.
 `reference/ChatGPT-version-pascal-square-scanner` is a small canvas page ("Pascal ·
 Square Scanner"). These of its features earned a place here:
 
-* **Color offset** (its "fractional offset", −1..1): residue colors slide along
+* **Color offset** (its "fractional offset", −1..1), with its own ▶ / ❚❚: playing,
+  it cycles round and round — one full turn per period (4 s by default), wrapping,
+  for as long as the button is on. Residue colors slide along
   the palette, cyclically, keeping their spacing — a step of 1/m moves every residue
   one slot, as the scanner's frac(r/m + offset) does, and the top residue waits one
   slot before it wraps to the bottom. Unlike the scanner, the void of 0 and
@@ -166,7 +168,14 @@ r_k = C(n, k) mod m        w(θ) = Σ_k r_k · cos((n − 2k)·θ + φ(t)),   θ
 ```
 
 The row is the pinned one if any, else the row under the pointer, else the last
-visible row; small ticks at the canvas edges mark it. Each coefficient sits at
+visible row; small ticks at the canvas edges mark it. **Select cells** (next to
+"smooth") plays a block of cells instead: click a start cell (red mark), then an end
+cell (blue mark); the overlay plays the average of every cell in the rectangle
+between them, (1/N) Σ r_{n,k} cos((n − 2k)θ + φ), binned by frequency like a row
+(rectangles of more than 65,536 cells are sampled, and the note says so). "Clear
+selection" or Esc ends it, as unpinning does for a pinned row; a selection takes
+precedence over the pin. **Smooth** off makes the wave snap from one row (or
+selection) to the next instead of easing. Each coefficient sits at
 frequency n − 2k (the terms of (2 cos θ)ⁿ, filtered through mod m), so the maps
 are keyed by frequency and rows of different lengths line up. On a change of
 row or modulus only the target coefficients are rebuilt; the displayed ones ease

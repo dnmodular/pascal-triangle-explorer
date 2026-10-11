@@ -50,6 +50,10 @@ const PASCAL_MAX_ROW: u64 = 2048;
 /// Most coefficients enumerated for one row. Rows longer than this (the app reaches
 /// rows near 10⁹) use the window of k on screen, clamped to this many entries.
 const ROW_ENUM_CAP: u64 = 16_384;
+/// Most cells a selected region averages, and most rows it walks: larger regions are
+/// sampled (every s-th row, every c-th cell of a long row), and the note says so.
+const REGION_CELL_BUDGET: u64 = 65_536;
+const REGION_ROW_BUDGET: u64 = 4_096;
 /// Sample count: ~2 per pixel of plot width (≈ 400–500 at the default size), within
 /// these bounds.
 const MIN_SAMPLES: usize = 256;
@@ -111,22 +115,57 @@ pub struct OverlayConfig {
     pub drift: f32,
     /// Subtle fill between the wave and the zero line.
     pub fill: bool,
+    /// Ease from one wave to the next (coefficients and scale); off snaps at once.
+    pub smooth: bool,
 }
 
 impl Default for OverlayConfig {
     fn default() -> Self {
-        OverlayConfig { corner: Corner::TopRight, margin: 16.0, top_clearance: 26.0, bottom_clearance: 18.0, size_frac: 0.28, min_side: 160.0, max_side: 420.0, drift: PHASE_DRIFT, fill: true }
+        OverlayConfig { corner: Corner::TopRight, margin: 16.0, top_clearance: 26.0, bottom_clearance: 18.0, size_frac: 0.28, min_side: 160.0, max_side: 420.0, drift: PHASE_DRIFT, fill: true, smooth: true }
     }
 }
 
 /// What the current `target` describes.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-struct Source {
-    row: u64,
-    modulus: u64,
-    /// The k range actually used (the whole row unless it is longer than ROW_ENUM_CAP).
-    k_lo: u64,
-    k_hi: u64,
+enum Source {
+    /// One row; k_lo..=k_hi is the whole row unless it is longer than ROW_ENUM_CAP.
+    Row { row: u64, modulus: u64, k_lo: u64, k_hi: u64 },
+    /// A block of cells: rows n_lo..=n_hi, and in each the cells whose centre lies in
+    /// x2_lo..=x2_hi, in half cells (x2 = 2k − n, so a cell's frequency n − 2k is −x2).
+    /// The rectangle between two marked cells; the wave is their cells' average.
+    Region { modulus: u64, n_lo: u64, n_hi: u64, x2_lo: i64, x2_hi: i64 },
+}
+
+impl Source {
+    /// The deepest row involved (long rows draw only their largest terms).
+    fn max_row(&self) -> u64 {
+        match *self {
+            Source::Row { row, .. } => row,
+            Source::Region { n_hi, .. } => n_hi,
+        }
+    }
+}
+
+/// How a region was sampled: cells averaged, and the row / cell strides.
+#[derive(Clone, Copy, Default, Debug)]
+struct RegionStats {
+    cells: u64,
+    row_step: u64,
+    cell_step: u64,
+}
+
+/// Cells of row `n` whose x2 = 2k − n lies in lo..=hi: (first x2, count), stepping by 2.
+fn region_row(n: u64, lo: i64, hi: i64) -> (i64, u64) {
+    let ni = n as i64;
+    let mut a = lo.max(-ni);
+    let b = hi.min(ni);
+    if (a - ni).rem_euclid(2) != 0 {
+        a += 1; // x2 has the parity of n
+    }
+    if a > b {
+        return (a, 0);
+    }
+    (a, ((b - a) / 2 + 1) as u64)
 }
 
 /// Row n of Pascal's triangle mod m, built and cached with Pascal's rule in u64.
@@ -210,6 +249,8 @@ pub struct WaveOverlay {
     pinned: bool,
     /// The last rebuild reached the row (false: modulus too large for a long row).
     in_range: bool,
+    /// How the current region (if any) was sampled.
+    region_stats: RegionStats,
     pascal: PascalRow,
     /// Closed form for long rows: the app's (see `share_closed_form`) or our own.
     closed: Option<Arc<Modulus>>,
@@ -267,6 +308,7 @@ impl WaveOverlay {
             texts_dirty: false,
             pinned: false,
             in_range: true,
+            region_stats: RegionStats::default(),
             pascal: PascalRow::default(),
             closed: None,
             target: HashMap::new(),
@@ -345,19 +387,33 @@ impl WaveOverlay {
             let lo2 = mid.saturating_sub(ROW_ENUM_CAP / 2).min(len - ROW_ENUM_CAP);
             (lo2, lo2 + ROW_ENUM_CAP - 1)
         };
-        let src = Source { row, modulus, k_lo, k_hi };
+        let src = Source::Row { row, modulus, k_lo, k_hi };
         if self.source == Some(src) {
             return;
         }
         // A new window of the same long row only changes the target when the window
         // moved a lot; keeps the morph calm while panning along a deep row.
-        if let Some(old) = self.source {
-            if old.row == row && old.modulus == modulus && len > ROW_ENUM_CAP && old.k_lo.abs_diff(k_lo) < ROW_ENUM_CAP / 8 {
+        if let Some(Source::Row { row: or, modulus: om, k_lo: ok, .. }) = self.source {
+            if or == row && om == modulus && len > ROW_ENUM_CAP && ok.abs_diff(k_lo) < ROW_ENUM_CAP / 8 {
                 return;
             }
         }
         self.source = Some(src);
         self.dirty = true;
+    }
+
+    /// Point the overlay at the block of cells between two marked cells `a` and `b`
+    /// ((n, k) each): rows between theirs, and in each the cells whose centre lies
+    /// between their centres. The wave is the average of those cells' terms,
+    /// (1/N) Σ r_{n,k} cos((n − 2k)θ + φ), binned by frequency like a row's. Cheap and
+    /// idempotent, like `set_source`.
+    pub fn set_region(&mut self, modulus: u64, a: (u64, u64), b: (u64, u64)) {
+        let x2 = |(n, k): (u64, u64)| 2 * k as i64 - n as i64;
+        let src = Source::Region { modulus, n_lo: a.0.min(b.0), n_hi: a.0.max(b.0), x2_lo: x2(a).min(x2(b)), x2_hi: x2(a).max(x2(b)) };
+        if self.source != Some(src) {
+            self.source = Some(src);
+            self.dirty = true;
+        }
     }
 
     /// Lend the overlay the app's closed form for the current modulus, so long rows do not
@@ -386,8 +442,28 @@ impl WaveOverlay {
 
     /// Rebuild the label and note for the current source and target.
     fn rebuild_texts(&mut self) {
-        let Some(Source { row: n, modulus: m, k_lo, k_hi }) = self.source else { return };
         use std::fmt::Write;
+        let Some(src) = self.source else { return };
+        if let Source::Region { modulus: m, n_lo, n_hi, .. } = src {
+            self.label.clear();
+            let rows = if n_lo == n_hi { format!("row {}", group(n_lo)) } else { format!("rows {}–{}", group(n_lo), group(n_hi)) };
+            let _ = write!(self.label, "{rows} · mod {} · selection", group(m));
+            self.note.clear();
+            let st = self.region_stats;
+            if !self.in_range {
+                self.note.push_str("beyond the overlay's range");
+            } else {
+                let _ = write!(self.note, "average of {} cell{}", group(st.cells), if st.cells == 1 { "" } else { "s" });
+                if st.row_step > 1 || st.cell_step > 1 {
+                    let _ = write!(self.note, " (sampled 1/{})", group(st.row_step * st.cell_step));
+                }
+                if self.target.is_empty() && st.cells > 0 {
+                    self.note.push_str(" · every r is 0");
+                }
+            }
+            return;
+        }
+        let Source::Row { row: n, modulus: m, k_lo, k_hi } = src else { return };
         self.label.clear();
         let _ = write!(self.label, "row {} · mod {}", group(n), group(m));
         if self.pinned {
@@ -411,7 +487,10 @@ impl WaveOverlay {
     /// Fill `target` with the nonzero r_k of `src`; false when the row is out of reach.
     fn rebuild_target(&mut self, src: Source) -> bool {
         self.target.clear();
-        let Source { row: n, modulus: m, k_lo, k_hi } = src;
+        let (n, m, k_lo, k_hi) = match src {
+            Source::Row { row, modulus, k_lo, k_hi } => (row, modulus, k_lo, k_hi),
+            Source::Region { modulus, n_lo, n_hi, x2_lo, x2_hi } => return self.rebuild_region(modulus, n_lo, n_hi, x2_lo, x2_hi),
+        };
         if m <= 1 {
             // every residue mod 1 is 0: an empty target, so the wave eases to a flat line
             return true;
@@ -444,6 +523,73 @@ impl WaveOverlay {
         }
         // every target frequency gets a displayed entry to ease from (allocates only
         // here, on a source change)
+        for &f in self.target.keys() {
+            self.displayed.entry(f).or_insert(0.0);
+        }
+        true
+    }
+
+    /// Fill `target` with the average term of a region's cells (see `Source::Region`).
+    fn rebuild_region(&mut self, m: u64, n_lo: u64, n_hi: u64, x2_lo: i64, x2_hi: i64) -> bool {
+        // sample rows, then cells within long rows, to stay within the budgets
+        let rows = n_hi - n_lo + 1;
+        let mut row_step = rows.div_ceil(REGION_ROW_BUDGET).max(1);
+        let sampled: u64 = (n_lo..=n_hi).step_by(row_step as usize).map(|n| region_row(n, x2_lo, x2_hi).1.min(ROW_ENUM_CAP)).sum();
+        if sampled > REGION_CELL_BUDGET {
+            row_step *= sampled.div_ceil(REGION_CELL_BUDGET);
+        }
+        let mut stats = RegionStats { cells: 0, row_step, cell_step: 1 };
+        let in_range = m <= 1 || n_hi <= PASCAL_MAX_ROW || (m <= MOD_CAP as u64 && n_hi <= u32::MAX as u64);
+        if !in_range {
+            log::debug!("wave overlay: region to row {n_hi} mod {m} is beyond the overlay's range");
+            self.region_stats = stats;
+            return false;
+        }
+        if m > 1 && n_hi > PASCAL_MAX_ROW {
+            let m32 = m as u32;
+            if self.closed.as_ref().map(|c| c.m) != Some(m32) {
+                self.closed = Some(Arc::new(Modulus::new(m32)));
+            }
+        }
+        let mut n = n_lo;
+        while n <= n_hi {
+            let (x0, count) = region_row(n, x2_lo, x2_hi);
+            if count > 0 {
+                let cell_step = count.div_ceil(ROW_ENUM_CAP).max(1);
+                stats.cell_step = stats.cell_step.max(cell_step);
+                let ni = n as i64;
+                let mut add = |x2: i64, r: u64| {
+                    if r != 0 {
+                        *self.target.entry(-x2).or_insert(0.0) += r as f32;
+                    }
+                };
+                if m <= 1 {
+                    // every residue is 0: the cells count, nothing adds
+                } else if n <= PASCAL_MAX_ROW {
+                    let row = self.pascal.get(n, m);
+                    for i in (0..count).step_by(cell_step as usize) {
+                        let x2 = x0 + 2 * i as i64;
+                        add(x2, row[((x2 + ni) / 2) as usize]);
+                    }
+                } else {
+                    let md = self.closed.as_ref().expect("closed form built above");
+                    for i in (0..count).step_by(cell_step as usize) {
+                        let x2 = x0 + 2 * i as i64;
+                        add(x2, md.binom(n as u32, ((x2 + ni) / 2) as u32) as u64);
+                    }
+                }
+                stats.cells += count.div_ceil(cell_step);
+            }
+            n = match n.checked_add(row_step) {
+                Some(v) => v,
+                None => break,
+            };
+        }
+        if stats.cells > 0 {
+            let inv = 1.0 / stats.cells as f32;
+            self.target.values_mut().for_each(|v| *v *= inv);
+        }
+        self.region_stats = stats;
         for &f in self.target.keys() {
             self.displayed.entry(f).or_insert(0.0);
         }
@@ -513,12 +659,14 @@ impl WaveOverlay {
             self.rebuild_texts();
         }
 
-        // ease every displayed coefficient toward its target (0 when absent)
+        // ease every displayed coefficient toward its target (0 when absent); without
+        // smoothing, snap
+        let ease = if self.config.smooth { alpha } else { 1.0 };
         let target = &self.target;
         let mut moving = false;
         for (f, v) in self.displayed.iter_mut() {
             let t = target.get(f).copied().unwrap_or(0.0);
-            *v += (t - *v) * alpha;
+            *v += (t - *v) * ease;
             if (t - *v).abs() > DROP_EPS * (1.0 + t.abs()) {
                 moving = true;
             }
@@ -588,7 +736,7 @@ impl WaveOverlay {
         if !(self.norm > 0.0 && self.norm.is_finite()) {
             self.norm = raw;
         } else {
-            self.norm += (raw - self.norm) * alpha;
+            self.norm += (raw - self.norm) * ease;
         }
         self.norm = self.norm.max(NORM_FLOOR);
         if (raw - self.norm).abs() > 1e-3 * raw {
@@ -606,7 +754,7 @@ impl WaveOverlay {
     /// choice deterministic and the ±f pairs of a symmetric row together.
     fn select_active(&mut self) {
         self.active.clear();
-        let long_row = self.source.is_some_and(|s| s.row > LARGE_ROW);
+        let long_row = self.source.is_some_and(|s| s.max_row() > LARGE_ROW);
         if !long_row || self.displayed.len() <= TOP_K {
             self.active.extend(self.displayed.iter().map(|(&f, &v)| (f, v)));
             return;
@@ -976,13 +1124,17 @@ mod tests {
         // rows beyond the enumeration cap use a window of k around the visible part
         let mut w = overlay();
         w.set_source(1_000_000_000, 30, (499_999_000, 500_001_000));
-        let s = w.source.unwrap();
-        assert_eq!(s.k_hi - s.k_lo + 1, ROW_ENUM_CAP);
-        assert!(s.k_lo <= 499_999_000 && s.k_hi >= 500_001_000);
+        let window = |w: &WaveOverlay| match w.source {
+            Some(Source::Row { k_lo, k_hi, .. }) => (k_lo, k_hi),
+            other => panic!("{other:?}"),
+        };
+        let (k_lo, k_hi) = window(&w);
+        assert_eq!(k_hi - k_lo + 1, ROW_ENUM_CAP);
+        assert!(k_lo <= 499_999_000 && k_hi >= 500_001_000);
         // ... clamped to the row
         w.set_source(1_000_000_000, 30, (999_999_990, 1_000_000_000));
-        let s = w.source.unwrap();
-        assert_eq!((s.k_hi, s.k_hi - s.k_lo + 1), (1_000_000_000, ROW_ENUM_CAP));
+        let (k_lo, k_hi) = window(&w);
+        assert_eq!((k_hi, k_hi - k_lo + 1), (1_000_000_000, ROW_ENUM_CAP));
         run(&mut w, 0.2, 1.0 / 60.0);
         assert_eq!(w.label(), "row 1,000,000,000 · mod 30");
         assert!(w.note().starts_with("k 999,983,617–1,000,000,000"), "{}", w.note());
@@ -1062,6 +1214,89 @@ mod tests {
         w.set_viewport(Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0)), Vec2::new(1100.0, 660.0), 1.0);
         w.update(1.0 / 60.0);
         assert!(w.box_rect().is_some() && w.is_animating());
+    }
+
+    #[test]
+    fn region_waves_average_their_cells() {
+        // brute force: every cell of rows 3..=9 whose centre lies between the marks
+        let (m, a, b) = (5u64, (9u64, 2u64), (3u64, 2u64)); // x2 = 2k − n: −5 and 1
+        let mut w = overlay();
+        w.set_region(m, a, b);
+        w.update(1.0 / 60.0);
+        let mut want: HashMap<i64, f64> = HashMap::new();
+        let mut cells = 0u64;
+        for n in 3..=9u32 {
+            for k in 0..=n {
+                let x2 = 2 * k as i64 - n as i64;
+                if (-5..=1).contains(&x2) {
+                    cells += 1;
+                    *want.entry(n as i64 - 2 * k as i64).or_default() += (binom_exact(n, k).unwrap() % m as u128) as f64;
+                }
+            }
+        }
+        for v in want.values_mut() {
+            *v /= cells as f64;
+        }
+        for f in -12..=12i64 {
+            let got = w.target(f) as f64;
+            let exp = want.get(&f).copied().unwrap_or(0.0);
+            assert!((got - exp).abs() < 1e-6, "f = {f}: {got} vs {exp}");
+        }
+        assert_eq!(w.label(), "rows 3–9 · mod 5 · selection");
+        assert_eq!(w.note(), format!("average of {cells} cells"));
+        // the marks in either order, and one cell alone
+        let mut w2 = overlay();
+        w2.set_region(m, b, a);
+        assert_eq!(w2.source, w.source);
+        w2.set_region(7, (6, 2), (6, 2));
+        w2.update(1.0 / 60.0);
+        assert_eq!(w2.target(2), 1.0, "C(6,2) = 15 ≡ 1 mod 7, at frequency 2");
+        assert_eq!(w2.note(), "average of 1 cell");
+        // a region off the triangle has no cells and stays flat
+        w2.set_region(7, (6, 0), (2, 0));
+        w2.update(1.0 / 60.0);
+        assert!(w2.samples().iter().all(|s| s.is_finite()));
+    }
+
+    #[test]
+    fn big_regions_are_sampled_within_budget() {
+        // half a million cells (rows 0..1000, all of them): every few rows
+        let mut w = overlay();
+        w.set_region(3, (0, 0), (999, 999));
+        w.update(1.0 / 60.0);
+        let st = w.region_stats;
+        assert!(st.cells <= REGION_CELL_BUDGET && st.cells > REGION_CELL_BUDGET / 4, "{st:?}");
+        assert!(st.row_step > 1 && w.note().contains("sampled"), "{}", w.note());
+        // deep rows through the closed form, a wide window, still bounded
+        let mut w = overlay();
+        w.set_region(30, (1_000_000_000, 400_000_000), (999_000_000, 600_000_000));
+        let t = std::time::Instant::now();
+        w.update(1.0 / 60.0);
+        assert!(w.region_stats.cells <= REGION_CELL_BUDGET);
+        assert!(t.elapsed().as_secs_f32() < 5.0);
+        assert!(w.samples().iter().all(|s| s.is_finite()));
+    }
+
+    #[test]
+    fn without_smoothing_waves_snap() {
+        let mut w = overlay();
+        w.config.smooth = false;
+        w.set_source(6, 5, (0, 6));
+        w.update(1.0 / 60.0);
+        for f in [-6i64, -4, -2, 0, 2, 4, 6] {
+            assert_eq!(w.displayed(f), w.target(f), "f = {f}");
+        }
+        let norm6 = w.norm();
+        w.set_source(7, 5, (0, 7));
+        w.update(1.0 / 60.0);
+        assert_eq!(w.displayed(6), 0.0, "the old row is gone at once");
+        assert_eq!(w.displayed(5), w.target(5));
+        assert!(w.norm() != norm6);
+        // and with it, one frame only gets part of the way
+        let mut w = overlay();
+        w.set_source(6, 5, (0, 6));
+        w.update(1.0 / 60.0);
+        assert!(w.displayed(6) < w.target(6));
     }
 
     #[test]

@@ -28,6 +28,20 @@ const CANVAS_BG: Color32 = Color32::from_rgb(10, 10, 10);
 const NUMBERS_MIN_PX: f64 = 18.0;
 const NUMBERS_MAX_CELLS: u64 = 9000;
 
+/// Picking a block of cells whose average wave the overlay plays (like the pin, but
+/// for a rectangle of cells between a red start mark and a blue end mark).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum WaveSelect {
+    #[default]
+    Off,
+    /// Armed: the next click on a cell marks the start (red).
+    PickStart,
+    /// The next click marks the end (blue).
+    PickEnd((u32, u32)),
+    /// The overlay plays the cells between the two marks.
+    Active((u32, u32), (u32, u32)),
+}
+
 /// Everything the user can change.
 struct Model {
     m: u32,
@@ -38,6 +52,9 @@ struct Model {
     palette: Palette,
     /// Color offset and cell decorations (outlines, glow around zeros).
     style: CanvasStyle,
+    /// The offset cycles on its own while this is on: one full turn per period.
+    offset_playing: bool,
+    offset_period: f32,
     layers: LayerState,
     view: View,
     fit_rows: f64,
@@ -67,6 +84,7 @@ struct Model {
     /// else the hovered row, else the last visible row.
     wave: WaveOverlay,
     pinned_row: Option<u32>,
+    wave_select: WaveSelect,
     wave_row: u32,
     /// The pointer is over the overlay box: the canvas under it gets no hover.
     over_wave: bool,
@@ -88,6 +106,8 @@ impl Model {
             scheme: Scheme::Spectral,
             palette: Palette::new(Scheme::Spectral),
             style: CanvasStyle::default(),
+            offset_playing: false,
+            offset_period: 4.0,
             layers: LayerState::default(),
             view: View::fit(800.0, 600.0, 128.0),
             fit_rows: 128.0,
@@ -108,6 +128,7 @@ impl Model {
             last_step: None,
             wave: WaveOverlay::new(),
             pinned_row: None,
+            wave_select: WaveSelect::Off,
             wave_row: 0,
             over_wave: false,
             pin_before_click: None,
@@ -221,6 +242,25 @@ impl Model {
         let moved = v != self.m;
         self.set_m_with(v, !self.link_hold_sweep);
         moved
+    }
+
+    /// Turn the color offset by `dt` seconds' worth while it plays. The offset is cyclic
+    /// (a whole turn changes nothing), so it wraps into [0, 1) and repeats forever.
+    fn advance_offset(&mut self, dt: f32) {
+        if !self.offset_playing || self.offset_period.is_nan() || self.offset_period <= 0.0 || !dt.is_finite() {
+            return;
+        }
+        self.style.offset = (self.style.offset + dt.max(0.0) / self.offset_period).rem_euclid(1.0);
+    }
+
+    /// A click on `cell` while picking a selection: the first marks the start, the
+    /// second the end.
+    fn select_click(&mut self, cell: (u32, u32)) {
+        self.wave_select = match self.wave_select {
+            WaveSelect::PickStart => WaveSelect::PickEnd(cell),
+            WaveSelect::PickEnd(a) => WaveSelect::Active(a, cell),
+            other => other,
+        };
     }
 
     /// Back to the defaults (the export folder stays), fitted to the canvas.
@@ -664,6 +704,7 @@ impl App {
             _ => 1.0 / 60.0,
         };
         self.last_frame = Some(now);
+        self.model.advance_offset(dt);
         self.fps_frames += 1;
         let fps_t0 = *self.fps_t0.get_or_insert(now);
         if now.duration_since(fps_t0).as_secs_f32() >= 1.0 {
@@ -836,7 +877,7 @@ impl App {
 
         self.frame_ms = t0.elapsed().as_secs_f32() * 1000.0;
         let delay = viewport_output.get(&egui::ViewportId::ROOT).map(|v| v.repaint_delay).unwrap_or(std::time::Duration::MAX);
-        self.continuous = delay.is_zero() || model.sweep.playing || self.tween_t0.is_some() || !self.canvas_current || model.wave.is_animating();
+        self.continuous = delay.is_zero() || model.sweep.playing || self.tween_t0.is_some() || !self.canvas_current || model.offset_playing || model.wave.is_animating();
         if self.continuous {
             gfx.window.request_redraw();
             self.repaint_at = None;
@@ -1019,7 +1060,34 @@ fn panel_ui(ui: &mut egui::Ui, model: &mut Model, canvas_px: (u32, u32), _frame_
                 }
             }
         });
-        note(ui, "Plays one row as w(θ) = Σ (C(n,k) mod m)·cos((n−2k)θ + φ): the row under the pointer, else the last visible row. Click a cell to pin its row.");
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut model.wave.config.smooth, "smooth").on_hover_text("Ease from one wave to the next; off snaps straight to the new one");
+            match model.wave_select {
+                WaveSelect::Off => {
+                    if ui.small_button("select cells").on_hover_text("Average the waves of a block of cells: click a start cell (red mark), then an end cell (blue mark)").clicked() {
+                        model.wave_select = WaveSelect::PickStart;
+                    }
+                }
+                WaveSelect::PickStart | WaveSelect::PickEnd(_) => {
+                    if ui.small_button("cancel").on_hover_text("Stop picking cells (Esc)").clicked() {
+                        model.wave_select = WaveSelect::Off;
+                    }
+                }
+                WaveSelect::Active(..) => {
+                    if ui.small_button("clear selection").on_hover_text("Back to the pinned / hovered row (Esc)").clicked() {
+                        model.wave_select = WaveSelect::Off;
+                    }
+                }
+            }
+        });
+        let status = match model.wave_select {
+            WaveSelect::Off => "selection: none".to_string(),
+            WaveSelect::PickStart => "click the start cell (red)".to_string(),
+            WaveSelect::PickEnd((n, k)) => format!("start ({n}, {k}) · click the end cell (blue)"),
+            WaveSelect::Active((n1, k1), (n2, k2)) => format!("cells ({n1}, {k1}) – ({n2}, {k2})"),
+        };
+        mono_line(ui, &status);
+        note(ui, "Plays one row as w(θ) = Σ (C(n,k) mod m)·cos((n−2k)θ + φ): the row under the pointer, else the last visible row. Click a cell to pin its row; a selection plays the average of its cells instead.");
     });
 
     section(ui, "Color", |ui| {
@@ -1053,6 +1121,15 @@ fn panel_ui(ui: &mut egui::Ui, model: &mut Model, canvas_px: (u32, u32), _frame_
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("offset").color(ui.visuals().weak_text_color()));
             mono_drag(ui, &mut model.style.offset, -1.0..=1.0, 0.005).on_hover_text("Fractional color offset: moves every residue color this far along the palette, wrapping around (0 and spectral's 1 stay)");
+            let playing = model.offset_playing;
+            let tip = if playing { "Stop cycling the offset" } else { "Cycle the offset: it turns round and round, one full turn per period, as long as this is on" };
+            if ui.add(egui::Button::new(if playing { "❚❚" } else { "▶" }).small().selected(playing)).on_hover_text(tip).clicked() {
+                model.offset_playing = !playing;
+            }
+            mono_drag(ui, &mut model.offset_period, 0.1..=120.0, 0.05).on_hover_text("Seconds per full turn of the cycling offset");
+            ui.label(egui::RichText::new("s / turn").color(ui.visuals().weak_text_color()));
+        });
+        ui.horizontal(|ui| {
             ui.checkbox(&mut model.style.outlines, "outlines").on_hover_text("A faint outline around each cell once cells are a few pixels wide");
             ui.checkbox(&mut model.style.glow, "glow").on_hover_text("A soft halo around zero cells — where m divides C(n,k) — once cells are a few pixels wide");
         });
@@ -1408,9 +1485,16 @@ fn canvas_interaction(ui: &mut egui::Ui, model: &mut Model, response: &egui::Res
     if handle && response.double_clicked() {
         model.pinned_row = model.pin_before_click;
     } else if handle && response.clicked() {
-        model.pin_before_click = model.pinned_row;
-        if let Some((n, _)) = model.hover {
-            model.pinned_row = if model.pinned_row == Some(n) { None } else { Some(n) };
+        if matches!(model.wave_select, WaveSelect::PickStart | WaveSelect::PickEnd(_)) {
+            // picking a selection: clicks mark cells instead of pinning rows
+            if let Some(cell) = model.hover {
+                model.select_click(cell);
+            }
+        } else {
+            model.pin_before_click = model.pinned_row;
+            if let Some((n, _)) = model.hover {
+                model.pinned_row = if model.pinned_row == Some(n) { None } else { Some(n) };
+            }
         }
     }
 
@@ -1436,7 +1520,12 @@ fn canvas_interaction(ui: &mut egui::Ui, model: &mut Model, response: &egui::Res
         }
         // Esc that left a text field or closed a popup is not an unpin
         if esc && !model.focus_last_frame {
-            model.pinned_row = None;
+            // a selection (or picking one) goes first, then the pin
+            if model.wave_select != WaveSelect::Off {
+                model.wave_select = WaveSelect::Off;
+            } else {
+                model.pinned_row = None;
+            }
         }
         let big: i64 = if shift { 10 } else { 1 };
         if space {
@@ -1588,17 +1677,47 @@ fn wave_overlay(ui: &mut egui::Ui, model: &mut Model, rect: Rect, ppp: f32, dt: 
             model.view.visible_rows(ch).map(|r| r.1).unwrap_or(model.wave_row)
         };
         model.wave_row = row;
-        let (k_lo, k_hi) = model.view.visible_k(row, cw);
         model.wave.share_closed_form(&model.modulus);
-        model.wave.set_source(row as u64, model.m as u64, (k_lo as u64, k_hi as u64));
+        if let WaveSelect::Active(a, b) = model.wave_select {
+            model.wave.set_region(model.m as u64, (a.0 as u64, a.1 as u64), (b.0 as u64, b.1 as u64));
+        } else {
+            let (k_lo, k_hi) = model.view.visible_k(row, cw);
+            model.wave.set_source(row as u64, model.m as u64, (k_lo as u64, k_hi as u64));
+        }
         model.wave.set_pinned(model.pinned_row.is_some());
         model.wave.set_viewport(rect, ui.ctx().viewport_rect().size(), ppp);
         model.wave.update(dt);
     }
     let painter = ui.painter_at(rect);
+    // the selection: its rectangle, a red start mark and a blue end mark (the end
+    // follows the pointer while it is being picked)
+    let to_pt = |x: f64, y: f64| Pos2::new(rect.min.x + (x / ppp as f64) as f32, rect.min.y + (y / ppp as f64) as f32);
+    let cell_box = |(n, k): (u32, u32)| {
+        let (x, y, w, h) = model.view.cell_rect(n, k);
+        Rect::from_min_max(to_pt(x, y), to_pt(x + w, y + h))
+    };
+    let (start, end) = match model.wave_select {
+        WaveSelect::PickEnd(a) => (Some(a), model.hover),
+        WaveSelect::Active(a, b) => (Some(a), Some(b)),
+        _ => (None, None),
+    };
+    if let (Some(a), Some(b)) = (start, end) {
+        let r = cell_box(a).union(cell_box(b));
+        painter.rect_stroke(r, 0.0, egui::Stroke::new(1.0, Color32::from_white_alpha(140)), egui::StrokeKind::Outside);
+    }
+    for (cell, rgb) in [(start, (235, 64, 64)), (end, (70, 130, 255))] {
+        if let Some(c) = cell {
+            let b = cell_box(c);
+            // at least 8 pt across, so a mark shows when cells are tiny
+            let b = if b.width() < 8.0 { Rect::from_center_size(b.center(), Vec2::splat(8.0)) } else { b };
+            let col = Color32::from_rgb(rgb.0, rgb.1, rgb.2);
+            painter.rect_filled(b, 0.0, col.gamma_multiply(0.35));
+            painter.rect_stroke(b, 0.0, egui::Stroke::new(2.0, col), egui::StrokeKind::Outside);
+        }
+    }
     // ticks at the canvas edges mark the row the wave plays (solid when pinned)
     let fade = model.wave.fade();
-    if fade > 0.0 {
+    if fade > 0.0 && !matches!(model.wave_select, WaveSelect::Active(..)) {
         let (_, y, _, h) = model.view.cell_rect(model.wave_row, 0);
         let yc = rect.min.y + ((y + h / 2.0) / ppp as f64) as f32;
         if (rect.min.y..=rect.max.y - STATUS_H as f32).contains(&yc) {
@@ -1840,6 +1959,43 @@ mod tests {
                 assert_eq!(v, 500, "Enter applies the typed value");
             }
         }
+    }
+
+    #[test]
+    fn the_offset_cycles_while_it_plays() {
+        let mut md = model();
+        md.offset_period = 4.0;
+        md.advance_offset(1.0);
+        assert_eq!(md.style.offset, 0.0, "not playing: nothing moves");
+        md.offset_playing = true;
+        md.advance_offset(1.0);
+        assert!((md.style.offset - 0.25).abs() < 1e-6);
+        for _ in 0..3 {
+            md.advance_offset(1.0);
+        }
+        assert!(md.style.offset.abs() < 1e-5 || (md.style.offset - 1.0).abs() < 1e-5, "a whole turn: {}", md.style.offset);
+        md.advance_offset(5.0);
+        assert!((0.0..1.0).contains(&md.style.offset), "wraps, round and round");
+        md.style.offset = -0.9; // set by hand while playing: carries on from there
+        md.advance_offset(0.4);
+        assert!((md.style.offset - 0.2).abs() < 1e-5, "{}", md.style.offset);
+        md.offset_playing = false;
+        md.advance_offset(1.0);
+        assert!((md.style.offset - 0.2).abs() < 1e-5);
+    }
+
+    #[test]
+    fn selections_take_a_start_then_an_end() {
+        let mut md = model();
+        md.select_click((5, 2));
+        assert_eq!(md.wave_select, WaveSelect::Off, "clicks do nothing until armed");
+        md.wave_select = WaveSelect::PickStart;
+        md.select_click((9, 3));
+        assert_eq!(md.wave_select, WaveSelect::PickEnd((9, 3)));
+        md.select_click((4, 1));
+        assert_eq!(md.wave_select, WaveSelect::Active((9, 3), (4, 1)));
+        md.select_click((7, 7));
+        assert_eq!(md.wave_select, WaveSelect::Active((9, 3), (4, 1)), "an active selection keeps its marks");
     }
 
     #[test]
