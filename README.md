@@ -104,10 +104,14 @@ button. When cells are at least 18 px wide their residue is printed inside them.
 **Rows follow m** (the reference's LINK) parents the row count to the modulus: rows
 = m × factor (factor 1 by default: one full period of a prime modulus, whose zero
 blocks start at row m), refitted whenever m changes — typed, stepped, slid or swept.
-The link runs both ways: with it on, typing a row count moves the modulus to rows ÷
-factor (snapped to the sweep's selection mode), and ↑/↓ step the modulus. "Hold rows
-while the sweep plays" keeps the count still during playback only. `--link` turns it
-on from the command line.
+A view you have zoomed or panned keeps its zoom relative to the fit and the same spot
+of the triangle as it grows. The link runs both ways: with it on, a row count typed
+into the field (applied on Enter) moves the modulus to rows ÷ factor, snapped to the
+sweep's selection mode, and ↑/↓ — on the canvas or in the field — step to the next
+modulus that way. "Hold rows while sweeping" keeps the count still while the sweep
+plays or frame-steps (|◀ ▶|); typed moduli, ◀ ▶ and the arrow keys still move it.
+With the rows following, every frame changes the view, so a tween cross-fades instead
+of morphing. `--link` turns the link on from the command line.
 
 ## From the square scanner
 
@@ -211,7 +215,9 @@ while the modulus or the mode changes:
   step, π digits, Fibonacci, primes, squares, powers of 2, 2×Pn, 3×Pn, primes + 2×Pn,
   semiprimes, primes + semiprimes, sphenic numbers.
 * **Range, frame time (ms) and loop:** the frame time has a slider (16 ms–1 s) and a
-  field that takes any value typed or dragged, 16 ms–10 s. Looping wraps at the range
+  field that takes any value typed or dragged, 16 ms–10 s. The bar's number fields
+  apply typed values on Enter (or when they lose focus), so a half-typed number never
+  drives the sweep; dragging them is live. Looping wraps at the range
   ends; with loop off, playback stops on the last frame.
 * **Tween (ms):** a display-only transition. When consecutive frames run the same
   field pipeline on the same view, the field morphs (smoothstep lerp, as in the

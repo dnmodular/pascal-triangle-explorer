@@ -139,24 +139,53 @@ impl Model {
         (self.m as f64 * self.link_factor).round().clamp(2.0, 1.0e9)
     }
 
-    /// With rows linked, set them from the modulus and refit.
+    /// With rows linked, set them from the modulus and refit. A view the user zoomed
+    /// or panned (auto_fit off) keeps its zoom relative to the fit and the same spot of
+    /// the triangle, scaled with it (the world origin is the apex), so stepping or
+    /// sweeping a linked modulus never throws the view away.
     fn apply_link(&mut self) {
         if !self.link_rows {
             return;
         }
+        let old_rows = self.fit_rows;
         self.fit_rows = self.linked_rows();
-        if self.canvas.0 > 0.0 && self.canvas.1 > 0.0 {
-            self.fit(self.canvas.0, self.canvas.1);
-        } else {
+        let (cw, ch) = self.canvas;
+        if !(cw > 0.0 && ch > 0.0) {
             self.auto_fit = true; // the first frame fits
+            return;
         }
+        if self.auto_fit || old_rows <= 0.0 {
+            self.fit(cw, ch);
+            return;
+        }
+        let zoom = self.view.ppc / View::fit(cw, ch, old_rows).ppc;
+        let v = self.view;
+        // the canvas centre in world units (cells, rows), per row of the old count
+        let rx = (v.x0 + cw / 2.0 / v.ppc) / old_rows;
+        let ry = (v.y0 + ch / 2.0 / (v.ppc * ROW_H)) / old_rows;
+        let ppc = View::fit(cw, ch, self.fit_rows).ppc * zoom;
+        self.view = View { x0: rx * self.fit_rows - cw / 2.0 / ppc, y0: ry * self.fit_rows - ch / 2.0 / (ppc * ROW_H), ppc };
     }
 
     /// Rows typed in: with the link on, the modulus moves instead (m = rows / factor,
-    /// snapped to the selection mode) and the rows follow it.
+    /// snapped to the selection mode) and the rows follow it. The modulus is rounded in
+    /// the direction of the edit, and an edit that would snap back to the same modulus
+    /// takes the next one that way, so a ±1 nudge always moves.
     fn set_rows(&mut self, rows: f64) {
         if self.link_rows {
-            self.goto((rows / self.link_factor).round() as i64);
+            // (not signum: it calls 0 positive)
+            let dir = if rows > self.fit_rows { 1 } else if rows < self.fit_rows { -1 } else { 0 };
+            if dir == 0 {
+                return;
+            }
+            let exact = rows / self.link_factor;
+            let target = if dir > 0 { exact.ceil() } else { exact.floor() };
+            let before = self.m;
+            self.goto(target as i64);
+            if self.m == before {
+                let v = self.sweep.step_by(self.m, dir);
+                self.set_m(v);
+            }
             self.apply_link();
         } else {
             self.fit_rows = rows.clamp(2.0, 1.0e9);
@@ -839,9 +868,14 @@ fn note(ui: &mut egui::Ui, text: &str) {
 
 /// A number field in the monospace font.
 fn mono_drag<N: egui::emath::Numeric>(ui: &mut egui::Ui, v: &mut N, range: std::ops::RangeInclusive<N>, speed: f64) -> egui::Response {
+    mono_drag_with(ui, v, range, speed, true)
+}
+
+/// `mono_drag`; with `live` false a typed value applies on Enter or focus loss only.
+fn mono_drag_with<N: egui::emath::Numeric>(ui: &mut egui::Ui, v: &mut N, range: std::ops::RangeInclusive<N>, speed: f64, live: bool) -> egui::Response {
     let old = ui.style().override_font_id.clone();
     ui.style_mut().override_font_id = Some(FontId::monospace(12.0));
-    let r = ui.add(egui::DragValue::new(v).range(range).speed(speed));
+    let r = ui.add(egui::DragValue::new(v).range(range).speed(speed).update_while_editing(live));
     ui.style_mut().override_font_id = old;
     r
 }
@@ -912,10 +946,15 @@ fn panel_ui(ui: &mut egui::Ui, model: &mut Model, canvas_px: (u32, u32), _frame_
     section(ui, "View", |ui| {
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("rows").color(ui.visuals().weak_text_color()));
-            let mut rows = model.fit_rows.round() as u32;
+            let shown = model.fit_rows.round() as u32;
+            let mut rows = shown;
             let tip = if model.link_rows { "Linked to the modulus: a new row count moves m to rows ÷ factor" } else { "Rows to fit" };
-            let resp = mono_drag(ui, &mut rows, 2..=1_000_000_000u32, 1.0).on_hover_text(tip);
-            if resp.changed() {
+            // while linked a typed count moves the modulus, so apply it once, on Enter or
+            // focus loss (each keystroke would snap and rewrite the text being typed)
+            let resp = mono_drag_with(ui, &mut rows, 2..=1_000_000_000u32, 1.0, !model.link_rows).on_hover_text(tip);
+            // a deferred field reports changed() for every keystroke of its text; act on
+            // the number only
+            if resp.changed() && rows != shown {
                 model.canvas = (canvas_px.0 as f64, canvas_px.1 as f64);
                 model.set_rows(rows.max(2) as f64);
             }
@@ -937,7 +976,7 @@ fn panel_ui(ui: &mut egui::Ui, model: &mut Model, canvas_px: (u32, u32), _frame_
             }
         });
         ui.add_enabled_ui(model.link_rows, |ui| {
-            ui.checkbox(&mut model.link_hold_sweep, "hold rows while the sweep plays").on_hover_text("Sweep the modulus without the row count following it (typed and stepped moduli still move the rows)");
+            ui.checkbox(&mut model.link_hold_sweep, "hold rows while sweeping").on_hover_text("Play or frame-step the sweep (|◀ ▶|) without the row count following the modulus; typed moduli, ◀ ▶ and the arrow keys still move the rows");
         });
         if let Some((a, b)) = model.view.visible_rows(canvas_px.1 as f64) {
             mono_line(ui, &format!("rows {}–{} · {:.3} px/cell", group(a as u64), group(b as u64), model.view.ppc));
@@ -1140,12 +1179,14 @@ fn bar_label(ui: &mut egui::Ui, text: &str) {
     ui.label(egui::RichText::new(text).color(ui.visuals().weak_text_color()));
 }
 
-/// Fixed-size monospace number field.
+/// Fixed-size monospace number field. A typed value applies on Enter or focus loss
+/// (dragging stays live): the sweep reads these every frame, and a half-typed value
+/// (the "5" of "500" clamped to a 16 ms frame) would already drive it.
 fn bar_drag<N: egui::emath::Numeric>(ui: &mut egui::Ui, w: f32, v: &mut N, range: std::ops::RangeInclusive<N>, speed: f64) -> egui::Response {
     let old = ui.style().override_font_id.clone();
     ui.style_mut().override_font_id = Some(FontId::monospace(12.0));
     let h = ui.spacing().interact_size.y;
-    let r = ui.add_sized([w, h], egui::DragValue::new(v).range(range).speed(speed));
+    let r = ui.add_sized([w, h], egui::DragValue::new(v).range(range).speed(speed).update_while_editing(false));
     ui.style_mut().override_font_id = old;
     r
 }
@@ -1269,7 +1310,7 @@ fn sweep_bar(ui: &mut egui::Ui, model: &mut Model) {
         ui.checkbox(&mut sw.looping, "loop").on_hover_text("Wrap at the range ends; off stops on the last frame.");
         bar_sep(ui);
         bar_label(ui, "tween");
-        bar_drag(ui, 56.0, &mut sw.tween_ms, 0..=3000u32, 5.0).on_hover_text("Display-only transition between moduli: fields morph, plain residue coloring cross-dissolves. Exports, layer history and the inspector use the true frames. 0 = hard cuts.");
+        bar_drag(ui, 56.0, &mut sw.tween_ms, 0..=3000u32, 5.0).on_hover_text("Display-only transition between moduli: fields morph, plain residue coloring cross-dissolves. Exports, layer history and the inspector use the true frames. 0 = hard cuts. With rows following m the view changes too, so frames cross-fade rather than morph.");
         bar_label(ui, "ms");
         bar_sep(ui);
         let preview = sw.preview(8);
@@ -1289,7 +1330,12 @@ fn sweep_bar(ui: &mut egui::Ui, model: &mut Model) {
             let v = if model.sweep.dir > 0 { lo } else { hi };
             model.set_m(v);
         }
-        Some(n) => model.step(n),
+        Some(n) => {
+            // the sweep's own frame steps, like playback, leave held rows alone
+            model.sweep.playing = false;
+            let v = model.sweep.step_by(model.m, n);
+            model.set_m_with(v, !model.link_hold_sweep);
+        }
         None => {}
     }
     // re-snap when the mode or its parameters changed, as the reference does
@@ -1699,6 +1745,101 @@ mod tests {
         // a typed modulus still moves them
         md.goto(64);
         assert_eq!(md.fit_rows, 64.0);
+    }
+
+    #[test]
+    fn linked_row_nudges_always_move_the_modulus() {
+        let mut md = model();
+        md.link_rows = true;
+        md.set_m(8);
+        md.link_factor = 2.5;
+        md.apply_link();
+        assert_eq!(md.fit_rows, 20.0);
+        md.set_rows(21.0); // 21 / 2.5 = 8.4: up means 9
+        assert_eq!(md.m, 9);
+        md.set_rows(md.fit_rows - 1.0);
+        assert_eq!(md.m, 8, "and back down");
+        // modes that snap back to the current modulus take the next one that way
+        md.link_factor = 1.0;
+        md.sweep.mode = pascal::sweep::ModMode::Prime;
+        md.set_m(7);
+        md.set_rows(8.0);
+        assert_eq!((md.m, md.fit_rows), (11, 11.0));
+        md.set_rows(10.0);
+        assert_eq!(md.m, 7);
+        md.sweep.mode = pascal::sweep::ModMode::Odd;
+        md.set_rows(6.0);
+        assert_eq!(md.m, 5);
+        md.set_rows(6.0);
+        assert_eq!(md.m, 7);
+        // the same count again is not a nudge (a deferred field reports changed()
+        // while its text is being typed, with the old number)
+        for _ in 0..3 {
+            md.set_rows(md.fit_rows);
+        }
+        assert_eq!((md.m, md.fit_rows), (7, 7.0));
+    }
+
+    #[test]
+    fn linked_steps_keep_a_zoomed_view() {
+        let mut md = model();
+        md.link_rows = true;
+        md.set_m(100);
+        let fit100 = View::fit(980.0, 736.0, 100.0);
+        assert_eq!(md.view, fit100);
+        // zoom 3× into a spot left of the apex, as the wheel would
+        md.view.zoom_at(300.0, 200.0, 3.0);
+        md.auto_fit = false;
+        let rel = |v: &View, rows: f64| ((v.x0 + 490.0 / v.ppc) / rows, (v.y0 + 368.0 / (v.ppc * ROW_H)) / rows);
+        let (zoom, spot) = (md.view.ppc / fit100.ppc, rel(&md.view, 100.0));
+        md.step(1);
+        assert_eq!(md.fit_rows, 101.0);
+        let fit101 = View::fit(980.0, 736.0, 101.0);
+        assert!((md.view.ppc / fit101.ppc - zoom).abs() < 1e-9, "the zoom stays");
+        let spot2 = rel(&md.view, 101.0);
+        assert!((spot.0 - spot2.0).abs() < 1e-9 && (spot.1 - spot2.1).abs() < 1e-9, "{spot:?} vs {spot2:?}");
+        assert!(!md.auto_fit);
+        // a fitted view simply refits
+        md.fit(980.0, 736.0);
+        md.step(1);
+        assert_eq!(md.view, View::fit(980.0, 736.0, 102.0));
+    }
+
+    /// One egui frame of a single field at the origin, with these input events.
+    fn field_frame(ctx: &egui::Context, v: &mut u32, live: bool, events: Vec<egui::Event>) -> Rect {
+        let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(400.0, 200.0))), events, ..Default::default() };
+        let mut rect = Rect::NOTHING;
+        let _ = ctx.run_ui(input, |ui| {
+            rect = mono_drag_with(ui, v, 2..=100_000u32, 1.0, live).rect;
+        });
+        rect
+    }
+
+    #[test]
+    fn deferred_fields_apply_typed_values_on_enter() {
+        for live in [false, true] {
+            let ctx = egui::Context::default();
+            let mut v = 7u32;
+            let r = field_frame(&ctx, &mut v, live, vec![]);
+            let p = r.center();
+            let press = |down| egui::Event::PointerButton { pos: p, button: egui::PointerButton::Primary, pressed: down, modifiers: Default::default() };
+            field_frame(&ctx, &mut v, live, vec![egui::Event::PointerMoved(p), press(true)]);
+            field_frame(&ctx, &mut v, live, vec![press(false)]);
+            field_frame(&ctx, &mut v, live, vec![]);
+            // the click selected the text: type over it, one key per frame
+            for ch in ["5", "0", "0"] {
+                field_frame(&ctx, &mut v, live, vec![egui::Event::Text(ch.into())]);
+            }
+            if live {
+                assert_eq!(v, 500, "live fields follow each key");
+            } else {
+                assert_eq!(v, 7, "nothing applies before Enter");
+                let enter = egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() };
+                field_frame(&ctx, &mut v, live, vec![enter]);
+                field_frame(&ctx, &mut v, live, vec![]);
+                assert_eq!(v, 500, "Enter applies the typed value");
+            }
+        }
     }
 
     #[test]
