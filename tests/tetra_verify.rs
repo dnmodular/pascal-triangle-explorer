@@ -11,7 +11,7 @@ use pascal::gpu::Gpu;
 use pascal::math::{triangle_dp, Modulus};
 use pascal::palette::{Palette, Scheme};
 use pascal::sweep::{ModMode, Seq};
-use pascal::tetra::{ray_cast, selected_moduli, Camera, CubeId, Layout, Shape, Spacing, TetraConfig};
+use pascal::tetra::{ray_cast, selected_moduli, Camera, CubeId, Layout, Shape, Spacing, TetraConfig, View, FOLD};
 use pascal::tetra_gpu::{DrawOptions, TetraRenderer, BACKGROUND};
 
 fn device() -> (Gpu, TetraRenderer) {
@@ -21,44 +21,50 @@ fn device() -> (Gpu, TetraRenderer) {
 }
 
 fn scene(r: &mut TetraRenderer, mods: &[u32], spacing: Spacing, budget: u32) -> (Layout, Vec<Modulus>) {
-    scene_shaped(r, mods, spacing, Shape::Regular, budget)
+    scene_of(r, View::Stack, mods, spacing, Shape::Regular, budget)
 }
 
-fn scene_shaped(r: &mut TetraRenderer, mods: &[u32], spacing: Spacing, shape: Shape, budget: u32) -> (Layout, Vec<Modulus>) {
-    let layout = Layout::with_shape(mods, spacing, shape, budget);
-    let mds: Vec<Modulus> = mods.iter().map(|&m| Modulus::new(m)).collect();
+/// Build `view`, upload it and run the residue pass; the moduli of its slices.
+fn scene_of(r: &mut TetraRenderer, view: View, mods: &[u32], spacing: Spacing, shape: Shape, budget: u32) -> (Layout, Vec<Modulus>) {
+    let layout = Layout::build(view, mods, spacing, shape, budget);
+    let mds: Vec<Modulus> = layout.slices.iter().map(|s| Modulus::new(s.m)).collect();
     r.set_scene(&layout, &mds, &Palette::new(Scheme::Spectral), 0.0);
     (layout, mds)
 }
 
-/// Every strided cell appears exactly once, in the nonzero list iff its residue is
+/// Every cell of the view appears exactly once, in the nonzero list iff its residue is
 /// nonzero, with the additive rule's residue.
-fn check_residues(r: &mut TetraRenderer, mods: &[u32], spacing: Spacing, budget: u32) -> Layout {
-    let (layout, _) = scene(r, mods, spacing, budget);
+fn check_view(r: &mut TetraRenderer, view: View, mods: &[u32], spacing: Spacing, budget: u32) -> Layout {
+    let (layout, _) = scene_of(r, view, mods, spacing, Shape::Regular, budget);
     let (nz, z) = r.read_cubes();
-    assert_eq!((nz.len() + z.len()) as u32, layout.total, "every cell is written once");
+    assert_eq!((nz.len() + z.len()) as u32, layout.total, "{view:?}: every cell is written once");
+    let index: HashMap<(usize, u32, u32), u32> = (0..layout.total).map(|g| {
+        let (si, n, k) = layout.cell(g).unwrap();
+        ((si, n, k), g)
+    }).collect();
+    // the additive rule per slice modulus (rows up to the largest n the slice draws)
     let dp: HashMap<u32, Vec<u32>> = layout.slices.iter().map(|s| (s.m, triangle_dp(s.m as usize, s.m))).collect();
     let mut seen = vec![false; layout.total as usize];
-    let index_of = |c: &CubeId| {
-        let s = &layout.slices[c.slice as usize];
-        let (i, j) = (c.n / layout.stride, c.k / layout.stride);
-        (s.cell_base + i * (i + 1) / 2 + j) as usize
-    };
     for (list, nonzero) in [(&nz, true), (&z, false)] {
         for w in list.iter() {
             let c = CubeId::unpack(*w);
-            let s = &layout.slices[c.slice as usize];
-            assert!(c.n < s.m && c.k <= c.n && c.n.is_multiple_of(layout.stride) && c.k.is_multiple_of(layout.stride), "{c:?} in slice m={}", s.m);
+            let si = c.slice as usize;
+            let s = &layout.slices[si];
+            assert!(c.n < s.m && c.k <= c.n, "{c:?} in slice m={}", s.m);
             let want = dp[&s.m][(c.n * (c.n + 1) / 2 + c.k) as usize];
-            assert_eq!(c.residue, want, "C({},{}) mod {}", c.n, c.k, s.m);
-            assert_eq!(want != 0, nonzero, "C({},{}) mod {} in the wrong list", c.n, c.k, s.m);
-            let g = index_of(&c);
-            assert!(!seen[g], "{c:?} written twice");
-            seen[g] = true;
+            assert_eq!(c.residue, want, "{view:?}: C({},{}) mod {}", c.n, c.k, s.m);
+            assert_eq!(want != 0, nonzero, "{view:?}: C({},{}) mod {} in the wrong list", c.n, c.k, s.m);
+            let g = *index.get(&(si, c.n, c.k)).unwrap_or_else(|| panic!("{view:?}: {c:?} is not a cell of the layout"));
+            assert!(!seen[g as usize], "{c:?} written twice");
+            seen[g as usize] = true;
         }
     }
     assert!(seen.iter().all(|&v| v));
     layout
+}
+
+fn check_residues(r: &mut TetraRenderer, mods: &[u32], spacing: Spacing, budget: u32) -> Layout {
+    check_view(r, View::Stack, mods, spacing, budget)
 }
 
 #[test]
@@ -82,12 +88,37 @@ fn every_slice_matches_the_additive_rule() {
 }
 
 #[test]
+fn the_face_and_the_diamond_match_too() {
+    let (_gpu, mut r) = device();
+    let all: Vec<u32> = (2..=200).collect();
+    for view in [View::Face, View::Diamond] {
+        let l = check_view(&mut r, view, &all, Spacing::True, u32::MAX);
+        assert_eq!(l.stride, 1);
+        // under a stride: every s-th row, every s-th cell, the base always there
+        let l = check_view(&mut r, view, &all, Spacing::Packed, 3_000);
+        assert!(l.stride > 1, "{view:?} stride {}", l.stride);
+        assert_eq!(l.slices.last().unwrap().m, 200);
+    }
+    // a prime selection: the face's rows alternate 1, p − 1 (C(p−1, k) ≡ (−1)^k)
+    let primes: Vec<u32> = (2..=150).filter(|&m| pascal::math::is_prime(m)).collect();
+    let l = check_view(&mut r, View::Face, &primes, Spacing::True, u32::MAX);
+    let (nz, z) = r.read_cubes();
+    assert!(z.is_empty(), "no zeros on a prime face");
+    for w in nz {
+        let c = CubeId::unpack(w);
+        let m = l.slices[c.slice as usize].m;
+        assert_eq!(c.residue, if c.k.is_multiple_of(2) { 1 % m } else { m - 1 }, "C({}, {}) mod {m}", c.n, c.k);
+    }
+}
+
+#[test]
 fn strided_and_deep_slices_match_too() {
     let (_gpu, mut r) = device();
-    // a wide range under a small budget: a cell stride
+    // a wide range under a small budget: a stride on slices, rows and cells
     let mods: Vec<u32> = (2..=300).collect();
     let l = check_residues(&mut r, &mods, Spacing::True, 200_000);
     assert!(l.stride > 1, "stride {}", l.stride);
+    assert!(l.slices.len() < mods.len() && l.slices.last().unwrap().m == 300);
     // the deepest slices (moduli up to the cap, many digits per prime factor)
     let deep = [2048, 2310, 3125, 3600, 4093, 4095, 4096];
     let l = check_residues(&mut r, &deep, Spacing::True, 400_000);
@@ -100,29 +131,64 @@ fn strided_and_deep_slices_match_too() {
 fn the_pick_buffer_names_the_cube_the_ray_hits() {
     let (_gpu, mut r) = device();
     let small: Vec<u32> = (2..=26).collect();
-    pick_agrees(&mut r, &small, Spacing::True, Shape::Regular, u32::MAX, 400, 100);
-    pick_agrees(&mut r, &small, Spacing::Packed, Shape::Regular, u32::MAX, 300, 100);
+    let orbit = |l: &Layout| -> Vec<Camera> {
+        [(0.0, 0.0, 0.0), (0.9, 0.3, 300.0), (-2.2, -0.6, 600.0), (2.8, 1.2, 0.0)].iter().map(|&(yaw, pitch, zoom)| {
+            let mut cam = Camera::framing(l.bounds());
+            cam.yaw += yaw;
+            cam.pitch = (cam.pitch + pitch).clamp(-1.5, 1.5);
+            cam.zoom(zoom);
+            cam
+        }).collect()
+    };
+    pick_agrees(&mut r, View::Stack, &small, Spacing::True, Shape::Regular, u32::MAX, &orbit, 400, 100);
+    pick_agrees(&mut r, View::Stack, &small, Spacing::Packed, Shape::Regular, u32::MAX, &orbit, 300, 100);
     // the flush shapes shift every slice differently
-    pick_agrees(&mut r, &small, Spacing::True, Shape::CornerApex, u32::MAX, 400, 100);
-    pick_agrees(&mut r, &small, Spacing::True, Shape::FaceLeft, u32::MAX, 400, 100);
-    // cubes s cells wide
-    let l = pick_agrees(&mut r, &(2..=120).collect::<Vec<_>>(), Spacing::True, Shape::Regular, 20_000, 300, 100);
+    pick_agrees(&mut r, View::Stack, &small, Spacing::True, Shape::CornerApex, u32::MAX, &orbit, 400, 100);
+    pick_agrees(&mut r, View::Stack, &small, Spacing::True, Shape::FaceLeft, u32::MAX, &orbit, 400, 100);
+    // cubes s cells wide, every s-th slice
+    let l = pick_agrees(&mut r, View::Stack, &(2..=120).collect::<Vec<_>>(), Spacing::True, Shape::Regular, 20_000, &orbit, 300, 100);
     assert!(l.stride > 1, "stride {}", l.stride);
+    // the flat views, straight on (orthographic), zoomed and panned
+    let flat = |l: &Layout| -> Vec<Camera> {
+        let base = Camera::flat(l.at_rest().bounds(), 320.0 / 240.0);
+        let mut near = base;
+        near.zoom(700.0);
+        near.pan(30.0, -20.0, 240.0);
+        vec![base, near]
+    };
+    let face: Vec<u32> = (2..=40).collect();
+    pick_agrees(&mut r, View::Face, &face, Spacing::True, Shape::Regular, u32::MAX, &flat, 200, 100);
+    pick_agrees(&mut r, View::Diamond, &face, Spacing::True, Shape::Regular, u32::MAX, &flat, 200, 100);
+    // and the diamond halfway through its hinge, seen at an angle
+    let half_open = |l: &Layout| -> Vec<Camera> {
+        let mut side = Camera::framing(l.bounds());
+        side.yaw = 2.6;
+        side.pitch = 0.3;
+        let mut front = side;
+        front.yaw = std::f32::consts::PI - 0.25;
+        front.pitch = 0.15;
+        vec![side, front]
+    };
+    // (a thin sheet seen at a slant: few rays clear the next cube by a margin)
+    pick_agrees(&mut r, View::Diamond, &face, Spacing::True, Shape::Regular, u32::MAX, &half_open, 60, 30);
 }
 
-/// GPU picks against the CPU ray cast over a grid of pixels from four camera views.
-fn pick_agrees(r: &mut TetraRenderer, mods: &[u32], spacing: Spacing, shape: Shape, budget: u32, min_hits: usize, min_misses: usize) -> Layout {
-    let (layout, mds) = scene_shaped(r, mods, spacing, shape, budget);
+/// GPU picks against the CPU ray cast over a grid of pixels from each camera.
+#[allow(clippy::too_many_arguments)]
+fn pick_agrees(r: &mut TetraRenderer, view: View, mods: &[u32], spacing: Spacing, shape: Shape, budget: u32, cams: &dyn Fn(&Layout) -> Vec<Camera>, min_hits: usize, min_misses: usize) -> Layout {
+    let (mut layout, mds) = scene_of(r, view, mods, spacing, shape, budget);
+    if view == View::Diamond {
+        // the flat cameras see it open; the angled one halfway
+        let open = if cams(&layout).iter().all(|c| c.ortho > 0.0) { 0.0 } else { FOLD / 2.0 };
+        layout.set_fold(open);
+        r.set_placement(&layout);
+    }
     let (w, h) = (320u32, 240u32);
     r.ensure_target(w, h);
     let he = layout.half_extents();
     let mut tested = 0;
     let mut misses = 0;
-    for (yaw, pitch, zoom) in [(0.0, 0.0, 0.0), (0.9, 0.3, 300.0), (-2.2, -0.6, 600.0), (2.8, 1.2, 0.0)] {
-        let mut cam = Camera::framing(layout.bounds());
-        cam.yaw += yaw;
-        cam.pitch = (cam.pitch + pitch).clamp(-1.5, 1.5);
-        cam.zoom(zoom);
+    for cam in cams(&layout) {
         for py in (3..h).step_by(13) {
             for px in (5..w).step_by(11) {
                 let (o, d) = cam.ray(w, h, px as f32, py as f32);
@@ -140,7 +206,7 @@ fn pick_agrees(r: &mut TetraRenderer, mods: &[u32], spacing: Spacing, shape: Sha
                         // margins are its distance to the face's edges
                         let clear = sorted[1] > 0.03 && hit.next_t - hit.t > 0.05;
                         if clear {
-                            assert_eq!(gpu, Some(hit.cube), "pixel ({px},{py}), camera {cam:?}");
+                            assert_eq!(gpu, Some(hit.cube), "{view:?}: pixel ({px},{py}), camera {cam:?}");
                             tested += 1;
                         }
                     }
@@ -151,7 +217,7 @@ fn pick_agrees(r: &mut TetraRenderer, mods: &[u32], spacing: Spacing, shape: Sha
                             let grow = 0.05;
                             let lo = [c[0] - he[0] - grow, c[1] - he[1] - grow, c[2] - he[2] - grow];
                             let hi = [c[0] + he[0] + grow, c[1] + he[1] + grow, c[2] + he[2] + grow];
-                            assert!(pascal::tetra::ray_box(o, d, lo, hi).is_some(), "pixel ({px},{py}): GPU picked {g:?}, which the ray misses");
+                            assert!(pascal::tetra::ray_box(o, d, lo, hi).is_some(), "{view:?}: pixel ({px},{py}): GPU picked {g:?}, which the ray misses");
                         } else {
                             misses += 1;
                         }
@@ -160,9 +226,9 @@ fn pick_agrees(r: &mut TetraRenderer, mods: &[u32], spacing: Spacing, shape: Sha
             }
         }
     }
-    eprintln!("{spacing:?}, stride {}: {tested} hits and {misses} misses agreed", layout.stride);
-    assert!(tested > min_hits, "only {tested} decisive hits");
-    assert!(misses > min_misses, "only {misses} misses");
+    eprintln!("{view:?} {spacing:?}, stride {}: {tested} hits and {misses} misses agreed", layout.stride);
+    assert!(tested > min_hits, "{view:?}: only {tested} decisive hits");
+    assert!(misses > min_misses, "{view:?}: only {misses} misses");
     layout
 }
 
@@ -174,7 +240,7 @@ fn the_stack_draws_green_wire_and_lit_brush_cells() {
     let (w, h) = (400u32, 300u32);
     r.ensure_target(w, h);
     let cam = Camera::framing(layout.bounds());
-    let mut o = DrawOptions { camera: cam, fill: f32::INFINITY, hover: None, brush: 3.0, color_slice: false, ghosts: false, mask: false };
+    let mut o = DrawOptions { camera: cam, fill: f32::INFINITY, hover: None, brush: 3.0, color_slice: false, ghosts: false, mask: false, flat: false };
     r.draw_blocking(&o);
     let (_, _, plain) = r.read_target_rgba();
     let bg = BACKGROUND.map(|c| (c * 255.0).round() as u8);
@@ -205,8 +271,8 @@ fn the_stack_draws_green_wire_and_lit_brush_cells() {
     };
     let all = (0..n).filter(|&i| colored(&full, i)).count();
     assert!(all > n / 20, "filled pixels: {all}");
-    let top = layout.slices[0].height;
-    let bottom = layout.slices.last().unwrap().height;
+    let top = layout.slices[0].height();
+    let bottom = layout.slices.last().unwrap().height();
     o.fill = -(top + bottom) / 2.0;
     r.draw_blocking(&o);
     let (_, _, half) = r.read_target_rgba();

@@ -256,11 +256,39 @@ voids run through the solid as tunnels.
   30 frames a second, as a green wireframe. Hover it and the palette colors run down
   it from the apex to the base in about a third of a second (ease-out, so it snaps
   in), and back up when the pointer leaves. Click it, or **Open 3D view** in the panel, for the isolated
-  space: the stack, a HUD and a thumbnail of the 2D view, nothing else. Click the
-  thumbnail or press **Esc** to return with all 2D state intact. The 2D canvas keeps
+  space: the view, its options panel, a HUD and a thumbnail of the 2D view. Click the
+  thumbnail or press **Esc** to return with all 2D state intact.
+* **Options live in the 3D space.** The main panel only has the way in (Open 3D view)
+  and the tile's toggles. Everything else is in the space's own left panel: the
+  view, the range and selection mode, shape, spacing, highlight, ghost zeros and the
+  cube budget. **O** (or *hide ◀* / *options ▶*) hides and shows it. The 2D canvas keeps
   rendering while you are away if the sweep plays, so the thumbnail stays live.
-* **Navigation.** Drag to orbit, right-, middle- or shift-drag to pan, wheel or pinch
-  to zoom, double-click to reset the camera. **G** toggles the spacing.
+* **Navigation.** In the stack: drag to orbit, right-, middle- or shift-drag to pan,
+  wheel or pinch to zoom. In the face and the diamond (an orthographic camera,
+  straight on): drag to pan, wheel to zoom about the pointer. Double-click reframes.
+  **V** cycles the views, **G** toggles the spacing, **U** swings the diamond's hinge
+  open again.
+* **Views.**
+  * *Stack*: the tetrahedron.
+  * *Front face*: the face the slices' last rows make, laid flat. Slice m's last row
+    is row m − 1 of the triangle mod m; stacked, they form a triangle again (the
+    tetrahedron's face is equilateral), whose row r is C(r, k) mod (r + 1). Rows sit
+    at m − 1 in true spacing (skipped moduli leave blank rows), one per modulus when
+    packed, with m labeled down the left edge.
+  * *Diamond*: the front face with the whole base slice (the last modulus, every
+    row, not just the last one it shares with the face) hinged down along that shared
+    row: the tetrahedron's net of two faces, a rhombus. When the view is chosen the
+    base starts folded where it sits in the tetrahedron (109.47° out of the face's
+    plane, i.e. at the dihedral angle arccos(1/3)) and swings flat in about a second;
+    each slice's placement is an origin and a row vector, so the swing only rewrites
+    one slice's entry on the GPU.
+  * Things to look at: a face row alternates 1, m − 1, 1, … exactly when m is prime
+    (C(m − 1, k) ≡ (−1)^k mod m; tested for m ≤ 600), so prime rows read as two-tone
+    stripes. Zeros on the face are rare: none until m = 30 = 2·3·5, and (tested up to
+    1200) only for moduli with three or more distinct prime factors, though not all
+    of them (42 has none); they show as dark streaks. Hovering a face row reports
+    both facts for that row. The face and the diamond are drawn in the palette's true
+    colors (faces toward the viewer are not shaded).
 * **Look.** In the 3D space every cube is filled in its palette color, through the
   same residue → level table, color offset and palette as the 2D view, with flat
   shading and darker edges. The tile's wire is green on near-black: its edges are
@@ -284,13 +312,17 @@ voids run through the solid as tunnels.
   ("+4" between 7 and 11), so prime gaps read as spacing. The tetrahedron's edges stay
   straight. *Packed*: slice height follows the slice index, no gaps. The HUD notes that the sides
   now curve, because slice size no longer tracks height.
-* **Level of detail.** The stack has about M³/6 cells. A cube budget (250K–8M,
-  default 1M) picks the smallest cell stride s that fits: every s-th row and cell
-  of every slice, cubes s cells wide. The HUD reports the stride and how many cells
-  are shown, instead of the app freezing.
+* **Level of detail, as cubes.** The stack has about M³/6 cells. A cube budget
+  (250K–8M, default 1M) picks the smallest stride s that fits: every s-th slice
+  (counted from the base, so the base slice is always there), and every s-th row and
+  cell in each. Every cube is a cube, s cells on a side, in all three directions:
+  slices, rows and cells are each at least a cube apart, so a wide range no longer
+  turns into stacked slabs. The face and the diamond use the same rule on their rows.
+  The HUD reports the stride and how many cells are shown.
 
 How it runs: a compute pass (`shaders/tetra_cells.wgsl`, with `shaders/binom.wgsl`
-prepended) takes one thread per cell. It finds its slice by a 16-step binary search
+prepended) takes one thread per cell (a slice is a triangle of rows, or a single face
+row). It finds its slice by a 16-step binary search
 and its row from an f32 root corrected to exact integers. It then computes C(n,k)
 mod m with that slice's own factor descriptors: Granville / Lucas per prime power,
 with tables shared between slices with the same prime power, then Garner's CRT, as
@@ -488,6 +520,16 @@ Verified (by `cargo test` on Mesa lavapipe, and by the headless export):
   equals a fresh render pixel for pixel. The on-screen canvas equals the exported
   PNG byte for byte (checked under Xvfb with AFTERIMAGE on), and Save PNG leaves
   the screen unchanged.
+* Tetra stack: strided cubes stay cubes and never overlap (all views, true and
+  packed, all moduli and primes to 2000), the base slice is always drawn, and each
+  view's cell enumeration is complete. The face is row m − 1 of every slice, centred,
+  rows √3/2 apart; the diamond's base meets it along that row at the dihedral angle
+  arccos(1/3) when folded, and lies flat as a mirrored triangle when open. The
+  face-row facts above. The flat camera frames the views, keeps x to the right,
+  casts straight rays and zooms about the pointer. GPU residues match the additive
+  rule for the face and the diamond (stride 1 and strided; a prime face is all ±1),
+  and GPU picks match the CPU ray cast on the flat face, the open diamond and the
+  half-open diamond at a slant.
 * Tetra stack: the equilateral stack's edges are all equal (a regular tetrahedron),
   every slice's centroid is on the axis, and each flush shape keeps its corner or
   edge midpoint on the axis. Every cube's residue equals the additive rule for moduli 2–64, the

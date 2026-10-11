@@ -26,7 +26,7 @@ struct DrawParams {
   half: vec4<f32>,      // cube half extents, w = brush radius (world units)
   wire: vec4<f32>,      // wire rgb, a = wire opacity
   hover_slice: u32,     // slice of the hovered cube
-  flags: u32,           // bit 0 whole slice, bit 1 mask lens, bit 2 ghost pass
+  flags: u32,           // bit 0 whole slice, bit 1 mask lens, bit 2 ghost pass, bit 3 flat view
   line_px: f32,         // wire half width in px
   ghost_alpha: f32,
   fill: vec4<f32>,      // x: cubes whose centre is at or above this height are filled in color
@@ -39,10 +39,15 @@ struct Slice {
   nfactors: u32,
   factor_off: u32,
   level_off: u32,
-  height: f32,
-  ox: f32,
+  kind: u32,
+  row_n: u32,
+  ox: f32,          // cell (n, k) sits at o + n·nv + (k, 0, 0)
+  oy: f32,
   oz: f32,
   pad0: u32,
+  nx: f32,
+  ny: f32,
+  nz: f32,
   pad1: u32,
 };
 
@@ -56,6 +61,7 @@ const SQRT3_2: f32 = 0.8660254;
 const FLAG_SLICE: u32 = 1u;
 const FLAG_MASK: u32 = 2u;
 const FLAG_GHOST: u32 = 4u;
+const FLAG_FLAT: u32 = 8u;   // a flat view: faces toward the viewer keep their true color
 const LIGHT: vec3<f32> = vec3<f32>(236.0 / 255.0, 236.0 / 255.0, 226.0 / 255.0);
 
 fn unpack_rgb(c: u32) -> vec3<f32> {
@@ -65,7 +71,7 @@ fn unpack_rgb(c: u32) -> vec3<f32> {
 fn cube_center(c: vec2<u32>, s: Slice) -> vec3<f32> {
   let n = f32(c.x & 0xffffu);
   let k = f32(c.x >> 16u);
-  return vec3<f32>(k - 0.5 * n + s.ox, -s.height, n * SQRT3_2 + s.oz);
+  return vec3<f32>(s.ox + n * s.nx + k, s.oy + n * s.ny, s.oz + n * s.nz);
 }
 
 fn corner_of(vi: u32) -> vec3<f32> {
@@ -143,7 +149,10 @@ fn cube_fs(in: CubeOut) -> @location(0) vec4<f32> {
     // filled: flat shading from the face normal, with darker edges; highlighted
     // cubes (the hover brush) lighten and get bright edges
     let l = normalize(vec3<f32>(0.35, 0.85, -0.4));
-    let shade = 0.55 + 0.45 * abs(dot(n, l));
+    // (in the flat views a face turned to the viewer shows the palette color itself, as
+    // in the 2D view; faces turned away, as the hinge swings, still shade)
+    let lit_shade = 0.55 + 0.45 * abs(dot(n, l));
+    let shade = select(lit_shade, mix(lit_shade, 1.0, abs(n.z)), (D.flags & FLAG_FLAT) != 0u);
     var col = in.color * shade;
     var edge_col = col * 0.35;
     if (in.lit == 2u) {

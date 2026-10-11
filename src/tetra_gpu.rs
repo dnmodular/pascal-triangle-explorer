@@ -16,7 +16,7 @@ use wgpu::util::DeviceExt;
 use crate::gpu::{GpuFactor, BINOM_WGSL};
 use crate::math::{to_mont, Modulus};
 use crate::palette::{level_map, level_map_words, residue_level, Palette, Scheme};
-use crate::tetra::{Camera, CubeId, Layout, Mat4};
+use crate::tetra::{Camera, CubeId, Layout, Mat4, SliceKind, View};
 
 pub const TETRA_CELLS_WGSL: &str = include_str!("../shaders/tetra_cells.wgsl");
 pub const TETRA_DRAW_WGSL: &str = include_str!("../shaders/tetra_draw.wgsl");
@@ -56,11 +56,21 @@ pub struct GpuSlice {
     pub nfactors: u32,
     pub factor_off: u32,
     pub level_off: u32,
-    pub height: f32,
-    pub ox: f32,
-    pub oz: f32,
+    /// 0 a triangle of rows, 1 the single row `row_n`.
+    pub kind: u32,
+    pub row_n: u32,
+    /// Cell (n, k) sits at origin + n·nvec + (k, 0, 0).
+    pub origin: [f32; 3],
     pub pad0: u32,
+    pub nvec: [f32; 3],
     pub pad1: u32,
+}
+
+impl GpuSlice {
+    fn place(&mut self, s: &crate::tetra::Slice) {
+        self.origin = s.origin;
+        self.nvec = s.nvec;
+    }
 }
 
 #[repr(C)]
@@ -80,6 +90,7 @@ struct DrawParams {
 const FLAG_SLICE: u32 = 1;
 const FLAG_MASK: u32 = 2;
 const FLAG_GHOST: u32 = 4;
+const FLAG_FLAT: u32 = 8;
 
 /// One line vertex: position, premultiplied-later RGBA, dash coordinate (< 0 solid).
 #[repr(C)]
@@ -141,7 +152,11 @@ impl SceneData {
                     pad1: 0,
                 });
             }
-            slices.push(GpuSlice { m: s.m, rows: s.rows, cell_base: s.cell_base, nfactors: md.factors.len() as u32, factor_off, level_off, height: s.height, ox: s.ox, oz: s.oz, pad0: 0, pad1: 0 });
+            let (kind, row_n) = match s.kind {
+                SliceKind::Triangle => (0, 0),
+                SliceKind::Row(n) => (1, n),
+            };
+            slices.push(GpuSlice { m: s.m, rows: s.rows, cell_base: s.cell_base, nfactors: md.factors.len() as u32, factor_off, level_off, kind, row_n, origin: s.origin, pad0: 0, nvec: s.nvec, pad1: 0 });
             level_off += s.m;
         }
         if tables.is_empty() {
@@ -198,6 +213,8 @@ pub struct DrawOptions {
     pub ghosts: bool,
     /// Zero / nonzero mask lens instead of the palette.
     pub mask: bool,
+    /// A flat view (the face, the diamond): faces toward the viewer in true colors.
+    pub flat: bool,
 }
 
 struct Target {
@@ -217,6 +234,9 @@ struct PickTarget {
 
 struct Scene {
     layout: Layout,
+    /// The slice table as uploaded (the diamond's hinge rewrites its last entry).
+    gpu_slices: Vec<GpuSlice>,
+    slices: wgpu::Buffer,
     /// The residue levels were built for spectral.
     spectral: bool,
     levels: wgpu::Buffer,
@@ -464,7 +484,24 @@ impl TetraRenderer {
         let draw_nz = draw_bg(&self.draw_ubuf, &nonzero);
         let draw_z = draw_bg(&self.ghost_ubuf, &zeros);
         let pick_nz = draw_bg(&self.pick_ubuf, &nonzero);
-        self.scene = Some(Scene { layout: layout.clone(), spectral: palette.scheme == Scheme::Spectral, levels, colors, nonzero, zeros, counters, draw_nz, draw_z, pick_nz });
+        self.scene = Some(Scene { layout: layout.clone(), gpu_slices: data.slices.clone(), slices, spectral: palette.scheme == Scheme::Spectral, levels, colors, nonzero, zeros, counters, draw_nz, draw_z, pick_nz });
+    }
+
+    /// Move the slices of the same scene (the diamond's hinge swinging): only their
+    /// placements change, the residues stay.
+    pub fn set_placement(&mut self, layout: &Layout) {
+        let Some(s) = &mut self.scene else { return };
+        if s.layout.slices.len() != layout.slices.len() {
+            return;
+        }
+        for (i, (g, l)) in s.gpu_slices.iter_mut().zip(&layout.slices).enumerate() {
+            if g.origin != l.origin || g.nvec != l.nvec {
+                g.place(l);
+                let size = std::mem::size_of::<GpuSlice>();
+                self.queue.write_buffer(&s.slices, (i * size) as u64, bytemuck::bytes_of(g));
+            }
+        }
+        s.layout = layout.clone();
     }
 
     /// New palette or color offset for the same selection.
@@ -532,6 +569,9 @@ impl TetraRenderer {
         if ghost {
             flags |= FLAG_GHOST;
         }
+        if o.flat {
+            flags |= FLAG_FLAT;
+        }
         let brush = o.brush.max(0.0) * s.layout.stride as f32;
         DrawParams { view_proj, hover, half: [he[0], he[1], he[2], brush], wire: if ghost { [0.55, 0.75, 0.6, 1.0] } else { WIRE }, hover_slice, flags, line_px: 0.75, ghost_alpha: 0.07, fill: [o.fill.clamp(-1e30, 1e30), 0.0, 0.0, 0.0] }
     }
@@ -596,7 +636,7 @@ impl TetraRenderer {
             return false;
         }
         let (Some(t), Some(s)) = (&self.target, &self.scene) else { return false };
-        let o = DrawOptions { camera: *camera, fill: f32::INFINITY, hover: None, brush: 0.0, color_slice: false, ghosts: false, mask: false };
+        let o = DrawOptions { camera: *camera, fill: f32::INFINITY, hover: None, brush: 0.0, color_slice: false, ghosts: false, mask: false, flat: false };
         let p = self.params(&o, camera.pick_view_proj(t.w, t.h, px, py), false);
         self.queue.write_buffer(&self.pick_ubuf, 0, bytemuck::bytes_of(&p));
         {
@@ -755,8 +795,11 @@ pub fn outline_vertices(layout: &Layout) -> Vec<LineVertex> {
             v.push(LineVertex { pos: b, color, dash: dashes });
         }
     };
+    if layout.view != View::Stack {
+        return v;
+    }
     for s in &layout.slices {
-        tri(layout.outline(s.m, s.height), [0.32, 0.95, 0.48, 0.16], false);
+        tri(layout.outline(s.m, s.height()), [0.32, 0.95, 0.48, 0.16], false);
     }
     for m in layout.missing() {
         tri(layout.outline(m, layout.height_of(m)), [0.45, 0.8, 0.55, 0.22], true);

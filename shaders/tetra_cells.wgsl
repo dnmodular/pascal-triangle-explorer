@@ -3,7 +3,8 @@
 //
 // One thread per cell (m, n, k) of the stack, in the CPU's enumeration: slices
 // in order, and inside a slice the strided rows i = 0.. with cells j = 0..i
-// (n = i·stride, k = j·stride). Each slice carries its own modulus: the factor
+// (n = i·stride, k = j·stride), or for a face row (kind 1) its cells
+// k = j·stride of row row_n. Each slice carries its own modulus: the factor
 // descriptors from `factor_off` (their tables shared between slices with the
 // same prime power), recombined by Garner's CRT exactly as the 2D passes do.
 //
@@ -26,10 +27,15 @@ struct Slice {
   nfactors: u32,
   factor_off: u32,    // factors[factor_off ..] (garner constants per slice)
   level_off: u32,     // residue → palette level bytes at levels[level_off + r] (draw pass)
-  height: f32,        // y = −height
-  ox: f32,            // the shape's shift of the slice in x and z (draw pass)
+  kind: u32,          // 0 rows 0, s, 2s, … (a triangle); 1 the single row row_n
+  row_n: u32,
+  ox: f32,            // cell (n, k) sits at o + n·nv + (k, 0, 0) (draw pass)
+  oy: f32,
   oz: f32,
   pad0: u32,
+  nx: f32,
+  ny: f32,
+  nz: f32,
   pad1: u32,
 };
 
@@ -78,6 +84,13 @@ fn tetra_cells(@builtin(global_invocation_id) gid: vec3<u32>) {
   }
   let s = slices[lo];
   let l = g - s.cell_base;
+  var n = 0u;
+  var k = 0u;
+  if (s.kind == 1u) {
+    // a face row: row_n, cells 0, s, 2s, …
+    n = s.row_n;
+    k = l * C.stride;
+  } else {
   // row i with i(i+1)/2 ≤ l < (i+1)(i+2)/2: the f32 root is within one, then exact
   var i = u32(max(floor((sqrt(8.0 * f32(l) + 1.0) - 1.0) * 0.5), 0.0));
   for (var a = 0u; a < 2u; a = a + 1u) {
@@ -87,8 +100,9 @@ fn tetra_cells(@builtin(global_invocation_id) gid: vec3<u32>) {
     if ((i + 1u) * (i + 2u) / 2u <= l) { i = i + 1u; }
   }
   let j = l - i * (i + 1u) / 2u;
-  let n = i * C.stride;
-  let k = j * C.stride;
+  n = i * C.stride;
+  k = j * C.stride;
+  }
   let r = slice_residue(n, k, s);
   let w = vec2<u32>(n | (k << 16u), lo | (r << 16u));
   if (r != 0u) {
