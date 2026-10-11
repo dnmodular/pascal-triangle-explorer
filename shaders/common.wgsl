@@ -66,7 +66,7 @@ struct Params {
 
   style_flags: u32,  // resolve decorations: bit 0 cell outlines, bit 1 glow around zeros
   glow_rgb: u32,     // 0xRRGGBB of the glow (the palette ramp at 0.8)
-  pad_e: u32,
+  row_limit: u32,    // rows at or past this are not drawn (the fitted view's last row + 1; 0 = all)
   pad_f: u32,
 
   dparams: array<vec4<u32>, 8>, // per-layer values derived on the CPU (LayerDef::derive / dslot)

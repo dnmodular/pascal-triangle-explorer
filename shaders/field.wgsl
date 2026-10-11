@@ -237,6 +237,11 @@ fn resolve_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 fn sample_color(px: f32, py: f32) -> vec3<f32> {
   let t = texel_of(px, py);
   if (t.x < 0) { return BG_COLOR; }
+  if (P.row_limit != 0u) {
+    // a fitted view draws its rows only (the canvas past them is background)
+    let yf = P.y0f + py * P.rows_per_px;
+    if (f32(P.n0) + floor(yf) >= f32(P.row_limit)) { return BG_COLOR; }
+  }
   let idx = u32(t.y) * P.grid_w + u32(t.x);
   let c = cells[idx];
   if (!cell_valid(c)) { return BG_COLOR; }

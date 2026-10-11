@@ -926,10 +926,10 @@ fn offset_outlines_and_glow_match_cpu() {
     let (w, h) = (180u32, 150u32);
     let layers = LayerState::default();
     let styles = [
-        CanvasStyle { offset: 0.3, outlines: false, glow: false },
-        CanvasStyle { offset: 0.0, outlines: true, glow: false },
-        CanvasStyle { offset: 0.0, outlines: false, glow: true },
-        CanvasStyle { offset: -0.62, outlines: true, glow: true },
+        CanvasStyle { offset: 0.3, outlines: false, glow: false, row_limit: 0 },
+        CanvasStyle { offset: 0.0, outlines: true, glow: false, row_limit: 0 },
+        CanvasStyle { offset: 0.0, outlines: false, glow: true, row_limit: 0 },
+        CanvasStyle { offset: -0.62, outlines: true, glow: true, row_limit: 0 },
     ];
     let mut checked = 0usize;
     let mut decorated = [0usize; 4];
@@ -972,7 +972,7 @@ fn offset_outlines_and_glow_match_cpu() {
     let md = Modulus::new(7);
     r.render_blocking(&FrameInput { grid, modulus: &md, palette: &pal, layers: &layers, advance: true, tween: pascal::gpu::Tween::Off, style: CanvasStyle::default() });
     let (_, _, plain) = r.read_output_rgba();
-    r.render_blocking(&FrameInput { grid, modulus: &md, palette: &pal, layers: &layers, advance: true, tween: pascal::gpu::Tween::Off, style: CanvasStyle { offset: 0.0, outlines: true, glow: true } });
+    r.render_blocking(&FrameInput { grid, modulus: &md, palette: &pal, layers: &layers, advance: true, tween: pascal::gpu::Tween::Off, style: CanvasStyle { offset: 0.0, outlines: true, glow: true, row_limit: 0 } });
     let (_, _, styled) = r.read_output_rgba();
     assert_eq!(plain, styled, "2 px cells: no outlines or glow");
 }
@@ -992,7 +992,7 @@ fn svg_colors_match_the_gpu() {
     let md = Modulus::new(3);
     for (scheme, offset) in [(Scheme::Viridis, 0.17f32), (Scheme::Spectral, -0.4)] {
         let pal = Palette::new(scheme);
-        let style = CanvasStyle { offset, outlines: false, glow: false };
+        let style = CanvasStyle { offset, outlines: false, glow: false, row_limit: 0 };
         let mut layers = LayerState::default();
         for preset in 0..3 {
             match preset {
@@ -1029,4 +1029,40 @@ fn svg_colors_match_the_gpu() {
             }
         }
     }
+}
+
+#[test]
+fn row_limit_draws_the_fitted_rows_only() {
+    // a narrow canvas: the fit is width-limited and shows rows past 40; with the limit
+    // those are background and the rest is unchanged
+    use pascal::gpu::CanvasStyle;
+    let (_gpu, mut r) = device();
+    let (w, h) = (200u32, 400u32);
+    let view = View::fit(w as f64, h as f64, 40.0);
+    let grid = GridSpec::new(&view, w, h, 1, 1 << 24);
+    let pal = Palette::new(Scheme::Spectral);
+    let md = Modulus::new(7);
+    let layers = LayerState::default();
+    let frame = |r: &mut Renderer, row_limit| {
+        r.render_blocking(&FrameInput { grid, modulus: &md, palette: &pal, layers: &layers, advance: true, tween: pascal::gpu::Tween::Off, style: CanvasStyle { row_limit, ..Default::default() } });
+        r.read_output_rgba().2
+    };
+    let all = frame(&mut r, 0);
+    let limited = frame(&mut r, 40);
+    let (mut below, mut above) = (0, 0);
+    for py in 0..h {
+        for px in 0..w {
+            let o = ((py * w + px) * 4) as usize;
+            let row = view.row_at(py as f64 + 0.5);
+            if row.is_some_and(|n| n >= 40) {
+                assert_eq!(&limited[o..o + 3], &pascal::palette::BG, "pixel ({px},{py}) below the limit");
+                below += 1;
+            } else if row.is_some_and(|n| n < 39) {
+                assert_eq!(&limited[o..o + 3], &all[o..o + 3], "pixel ({px},{py}) above the limit");
+                above += 1;
+            }
+        }
+    }
+    assert!(below > 1000 && above > 1000, "{below} {above}");
+    assert!(all != limited);
 }

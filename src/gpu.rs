@@ -93,7 +93,7 @@ pub struct GpuParams {
     pub pad_d: u32,
     pub style_flags: u32,
     pub glow_rgb: u32,
-    pub pad_e: u32,
+    pub row_limit: u32,
     pub pad_f: u32,
     pub dparams: [[u32; 4]; 8],
     pub factors: [GpuFactor; MAX_FACTORS],
@@ -528,6 +528,9 @@ pub struct CanvasStyle {
     /// A soft halo in the palette's 0.8 color spilling from zero cells (where m divides
     /// C(n,k)) onto their neighbours, once cells are a few pixels wide.
     pub glow: bool,
+    /// Rows at or past this are drawn as background (0 = every row): a fitted view shows
+    /// exactly its rows even on a canvas narrower than the triangle.
+    pub row_limit: u32,
 }
 
 /// `style_flags` bits.
@@ -1181,6 +1184,7 @@ impl Renderer {
             field_stride: self.stride,
             signed_mask: plan.measures.iter().take(n_measures as usize).enumerate().fold(0u32, |acc, (i, d)| acc | ((d.signed as u32) << i)),
             style_flags: (input.style.outlines as u32 * STYLE_OUTLINES) | (input.style.glow as u32 * STYLE_GLOW),
+            row_limit: input.style.row_limit,
             glow_rgb: {
                 let [r, g, b] = input.palette.glow_color();
                 (r as u32) << 16 | (g as u32) << 8 | b as u32

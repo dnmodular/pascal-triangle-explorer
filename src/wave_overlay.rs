@@ -54,6 +54,10 @@ const ROW_ENUM_CAP: u64 = 16_384;
 /// sampled (every s-th row, every c-th cell of a long row), and the note says so.
 const REGION_CELL_BUDGET: u64 = 65_536;
 const REGION_ROW_BUDGET: u64 = 4_096;
+/// A region is summed exactly when stepping Pascal's rule over its light cone costs at
+/// most this many additions (rows × cone width; ~20–40 ms), and its first row, when
+/// past PASCAL_MAX_ROW, at most REGION_CELL_BUDGET closed-form cells.
+const REGION_EXACT_BUDGET: u64 = 24_000_000;
 /// Sample count: ~2 per pixel of plot width (≈ 400–500 at the default size), within
 /// these bounds.
 const MIN_SAMPLES: usize = 256;
@@ -136,22 +140,35 @@ enum Source {
     Region { modulus: u64, n_lo: u64, n_hi: u64, x2_lo: i64, x2_hi: i64 },
 }
 
-impl Source {
-    /// The deepest row involved (long rows draw only their largest terms).
-    fn max_row(&self) -> u64 {
-        match *self {
-            Source::Row { row, .. } => row,
-            Source::Region { n_hi, .. } => n_hi,
-        }
-    }
-}
-
-/// How a region was sampled: cells averaged, and the row / cell strides.
+/// How a region was sampled: cells used, the region's (estimated) size, and the
+/// largest row / cell strides.
 #[derive(Clone, Copy, Default, Debug)]
 struct RegionStats {
     cells: u64,
+    total: u64,
     row_step: u64,
     cell_step: u64,
+}
+
+fn gcd(mut a: u64, mut b: u64) -> u64 {
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a
+}
+
+/// The smallest stride ≥ `step` coprime with 2m. Strided rows (and cells) then run
+/// through every residue class mod 2 and mod every prime power of m: an even row stride
+/// would keep rows of one parity only — and a row's frequencies n − 2k all share its
+/// parity — while a stride sharing a prime with m would follow the triangle's
+/// self-similar blocks.
+fn coprime_step(step: u64, m: u64) -> u64 {
+    let g = 2 * m.max(1);
+    let mut s = step.max(1);
+    while s > 1 && gcd(s, g) != 1 {
+        s += 1;
+    }
+    s
 }
 
 /// Cells of row `n` whose x2 = 2k − n lies in lo..=hi: (first x2, count), stepping by 2.
@@ -453,9 +470,10 @@ impl WaveOverlay {
             if !self.in_range {
                 self.note.push_str("beyond the overlay's range");
             } else {
-                let _ = write!(self.note, "average of {} cell{}", group(st.cells), if st.cells == 1 { "" } else { "s" });
-                if st.row_step > 1 || st.cell_step > 1 {
-                    let _ = write!(self.note, " (sampled 1/{})", group(st.row_step * st.cell_step));
+                if st.cells < st.total {
+                    let _ = write!(self.note, "average of {} of ~{} cells (sampled)", group(st.cells), group(st.total));
+                } else {
+                    let _ = write!(self.note, "average of {} cell{}", group(st.cells), if st.cells == 1 { "" } else { "s" });
                 }
                 if self.target.is_empty() && st.cells > 0 {
                     self.note.push_str(" · every r is 0");
@@ -529,16 +547,19 @@ impl WaveOverlay {
         true
     }
 
-    /// Fill `target` with the average term of a region's cells (see `Source::Region`).
+    /// Fill `target` with a region's cells (see `Source::Region`): each cell's r at its
+    /// frequency. The wave is their average; the target keeps the sum, which differs by
+    /// the constant 1/N only (the plot is normalized), so no average term is so small
+    /// that it falls under DROP_EPS.
+    ///
+    /// Rows up to PASCAL_MAX_ROW are summed exactly (Pascal's rule walks them anyway).
+    /// Deeper rows go through the closed form, cell by cell, so past the budget they are
+    /// sampled by whole rows with a stride coprime with 2m (see `coprime_step`), each
+    /// sampled row bringing its full spectrum and weighing for the rows it stands for.
+    /// Only rows longer than ROW_ENUM_CAP are thinned, each starting one cell further
+    /// on, so the thinning does not comb out the same frequencies every row.
     fn rebuild_region(&mut self, m: u64, n_lo: u64, n_hi: u64, x2_lo: i64, x2_hi: i64) -> bool {
-        // sample rows, then cells within long rows, to stay within the budgets
-        let rows = n_hi - n_lo + 1;
-        let mut row_step = rows.div_ceil(REGION_ROW_BUDGET).max(1);
-        let sampled: u64 = (n_lo..=n_hi).step_by(row_step as usize).map(|n| region_row(n, x2_lo, x2_hi).1.min(ROW_ENUM_CAP)).sum();
-        if sampled > REGION_CELL_BUDGET {
-            row_step *= sampled.div_ceil(REGION_CELL_BUDGET);
-        }
-        let mut stats = RegionStats { cells: 0, row_step, cell_step: 1 };
+        let mut stats = RegionStats { cells: 0, total: 0, row_step: 1, cell_step: 1 };
         let in_range = m <= 1 || n_hi <= PASCAL_MAX_ROW || (m <= MOD_CAP as u64 && n_hi <= u32::MAX as u64);
         if !in_range {
             log::debug!("wave overlay: region to row {n_hi} mod {m} is beyond the overlay's range");
@@ -546,53 +567,198 @@ impl WaveOverlay {
             return false;
         }
         if m > 1 && n_hi > PASCAL_MAX_ROW {
-            let m32 = m as u32;
-            if self.closed.as_ref().map(|c| c.m) != Some(m32) {
-                self.closed = Some(Arc::new(Modulus::new(m32)));
+            let exact = self.region_cone(m, n_lo, n_hi, x2_lo, x2_hi, &mut stats);
+            if exact {
+                stats.total = stats.cells;
+            }
+            if exact || self.region_bands(m, n_lo, n_hi, x2_lo, x2_hi, &mut stats) {
+                self.region_stats = stats;
+                for &f in self.target.keys() {
+                    self.displayed.entry(f).or_insert(0.0);
+                }
+                return true;
             }
         }
-        let mut n = n_lo;
-        while n <= n_hi {
-            let (x0, count) = region_row(n, x2_lo, x2_hi);
-            if count > 0 {
-                let cell_step = count.div_ceil(ROW_ENUM_CAP).max(1);
-                stats.cell_step = stats.cell_step.max(cell_step);
-                let ni = n as i64;
-                let mut add = |x2: i64, r: u64| {
+        // the exact part
+        if n_lo <= PASCAL_MAX_ROW {
+            for n in n_lo..=n_hi.min(PASCAL_MAX_ROW) {
+                let (x0, count) = region_row(n, x2_lo, x2_hi);
+                stats.total += count;
+                stats.cells += count;
+                if count == 0 || m <= 1 {
+                    continue;
+                }
+                let row = self.pascal.get(n, m);
+                for i in 0..count {
+                    let x2 = x0 + 2 * i as i64;
+                    let r = row[((x2 + n as i64) / 2) as usize];
                     if r != 0 {
                         *self.target.entry(-x2).or_insert(0.0) += r as f32;
                     }
-                };
-                if m <= 1 {
-                    // every residue is 0: the cells count, nothing adds
-                } else if n <= PASCAL_MAX_ROW {
-                    let row = self.pascal.get(n, m);
-                    for i in (0..count).step_by(cell_step as usize) {
-                        let x2 = x0 + 2 * i as i64;
-                        add(x2, row[((x2 + ni) / 2) as usize]);
-                    }
-                } else {
-                    let md = self.closed.as_ref().expect("closed form built above");
-                    for i in (0..count).step_by(cell_step as usize) {
-                        let x2 = x0 + 2 * i as i64;
-                        add(x2, md.binom(n as u32, ((x2 + ni) / 2) as u32) as u64);
-                    }
                 }
-                stats.cells += count.div_ceil(cell_step);
             }
-            n = match n.checked_add(row_step) {
-                Some(v) => v,
-                None => break,
-            };
         }
-        if stats.cells > 0 {
-            let inv = 1.0 / stats.cells as f32;
-            self.target.values_mut().for_each(|v| *v *= inv);
+        // the deep part, sampled within the budget
+        let deep_lo = n_lo.max(PASCAL_MAX_ROW + 1);
+        if n_hi >= deep_lo {
+            if m > 1 {
+                let m32 = m as u32;
+                if self.closed.as_ref().map(|c| c.m) != Some(m32) {
+                    self.closed = Some(Arc::new(Modulus::new(m32)));
+                }
+            }
+            let rows = n_hi - deep_lo + 1;
+            let probe = rows.div_ceil(REGION_ROW_BUDGET).max(1);
+            let est: u64 = (deep_lo..=n_hi).step_by(probe as usize).map(|n| region_row(n, x2_lo, x2_hi).1.min(ROW_ENUM_CAP)).sum::<u64>() * probe;
+            let row_step = coprime_step(probe.max(est.div_ceil(REGION_CELL_BUDGET)), m);
+            stats.row_step = row_step;
+            let mut n = deep_lo;
+            while n <= n_hi {
+                let (x0, count) = region_row(n, x2_lo, x2_hi);
+                stats.total += count * row_step;
+                if count > 0 {
+                    let cell_step = coprime_step(count.div_ceil(ROW_ENUM_CAP), m);
+                    stats.cell_step = stats.cell_step.max(cell_step);
+                    // the thinning's phase moves on by one cell per sampled row
+                    let first = (((n - deep_lo) / row_step) % cell_step).min(count - 1);
+                    let weight = (row_step * cell_step) as f32;
+                    if m > 1 {
+                        let md = self.closed.as_ref().expect("closed form built above");
+                        for i in (first..count).step_by(cell_step as usize) {
+                            let x2 = x0 + 2 * i as i64;
+                            let r = md.binom(n as u32, ((x2 + n as i64) / 2) as u32);
+                            if r != 0 {
+                                *self.target.entry(-x2).or_insert(0.0) += r as f32 * weight;
+                            }
+                        }
+                    }
+                    stats.cells += (count - first).div_ceil(cell_step);
+                }
+                n = match n.checked_add(row_step) {
+                    Some(v) => v,
+                    None => break,
+                };
+            }
         }
+        stats.total = stats.total.max(stats.cells);
         self.region_stats = stats;
         for &f in self.target.keys() {
             self.displayed.entry(f).or_insert(0.0);
         }
+        true
+    }
+
+    /// A deep region exactly, if affordable: row n_lo over the k the region's cells
+    /// depend on (from the closed form, or Pascal's rule when shallow), then Pascal's rule
+    /// down to n_hi. Cell (n, k) depends on row n_lo from k − (n − n_lo) to k, so the
+    /// window starts (n_hi − n_lo) cells left of the region's left edge at n_hi; values
+    /// left of that light cone go stale and are never read. False (nothing touched) when
+    /// over the budgets.
+    fn region_cone(&mut self, m: u64, n_lo: u64, n_hi: u64, x2_lo: i64, x2_hi: i64, stats: &mut RegionStats) -> bool {
+        self.region_cone_weighted(m, n_lo, n_hi, x2_lo, x2_hi, 1.0, REGION_EXACT_BUDGET, stats)
+    }
+
+    /// `region_cone` with every cell counted `weight` times, within `budget` additions.
+    #[allow(clippy::too_many_arguments)] // the region's bounds, and how to count it
+    fn region_cone_weighted(&mut self, m: u64, n_lo: u64, n_hi: u64, x2_lo: i64, x2_hi: i64, weight: f32, budget: u64, stats: &mut RegionStats) -> bool {
+        let rows = n_hi - n_lo + 1;
+        let k_first = |n: u64| ((x2_lo + n as i64 + 1).div_euclid(2)).max(0) as u64; // ⌈(x2_lo + n)/2⌉
+        let k_last = |n: u64| ((x2_hi + n as i64).div_euclid(2)).min(n as i64); // ⌊(x2_hi + n)/2⌋
+        if k_last(n_hi) < 0 {
+            return false; // nothing of the region inside the triangle: let the slow path say so
+        }
+        let lo = k_first(n_hi).saturating_sub(rows - 1);
+        let hi = k_last(n_hi) as u64;
+        if hi < lo {
+            return false;
+        }
+        let width = hi - lo + 1;
+        let first_row_cells = width.min(n_lo.saturating_sub(lo) + 1);
+        if rows.saturating_mul(width) > budget || (n_lo > PASCAL_MAX_ROW && first_row_cells > REGION_CELL_BUDGET) {
+            return false;
+        }
+        // row n_lo on [lo, hi] (zeros past its end)
+        let mut seg = vec![0u64; width as usize];
+        if n_lo <= PASCAL_MAX_ROW {
+            let row = self.pascal.get(n_lo, m);
+            for (i, v) in seg.iter_mut().enumerate() {
+                if let Some(&r) = row.get(lo as usize + i) {
+                    *v = r;
+                }
+            }
+        } else {
+            let m32 = m as u32;
+            if self.closed.as_ref().map(|c| c.m) != Some(m32) {
+                self.closed = Some(Arc::new(Modulus::new(m32)));
+            }
+            let md = self.closed.as_ref().expect("closed form just built");
+            for (i, v) in seg.iter_mut().enumerate() {
+                let k = lo + i as u64;
+                if k <= n_lo {
+                    *v = md.binom(n_lo as u32, k as u32) as u64;
+                }
+            }
+        }
+        let mut n = n_lo;
+        loop {
+            // the region's cells of row n
+            let (a, b) = (k_first(n), k_last(n));
+            if b >= a as i64 {
+                for k in a..=b as u64 {
+                    let r = seg[(k - lo) as usize];
+                    stats.cells += 1;
+                    if r != 0 {
+                        *self.target.entry(n as i64 - 2 * k as i64).or_insert(0.0) += r as f32 * weight;
+                    }
+                }
+            }
+            if n == n_hi {
+                break;
+            }
+            // row n + 1, in place, right to left (as PascalRow::get)
+            for i in (1..seg.len()).rev() {
+                let (x, y) = (seg[i], seg[i - 1]);
+                let s = x.wrapping_add(y);
+                seg[i] = if s < x || s >= m { s.wrapping_sub(m) } else { s };
+            }
+            n += 1;
+        }
+        true
+    }
+
+    /// A deep region too large to sum: BANDS bands of consecutive rows spread evenly
+    /// over it, each summed exactly with `region_cone_weighted` and weighed for the rows
+    /// it stands for. Consecutive rows keep both parities and the local structure that
+    /// isolated sample rows lose. False when even one band is unaffordable.
+    fn region_bands(&mut self, m: u64, n_lo: u64, n_hi: u64, x2_lo: i64, x2_hi: i64, stats: &mut RegionStats) -> bool {
+        const BANDS: u64 = 16;
+        let rows = n_hi - n_lo + 1;
+        let cells_per_row = (((x2_hi - x2_lo).max(0) / 2 + 1) as u64).min(n_hi + 1);
+        // band height h with BANDS · h · (cells + h) ≤ budget
+        let per_band = REGION_EXACT_BUDGET / BANDS;
+        let mut h = (per_band / (cells_per_row + 1)).clamp(1, rows / BANDS);
+        while h > 1 && h * (cells_per_row + h) > per_band {
+            h /= 2;
+        }
+        if h * (cells_per_row + h) > per_band || h * BANDS >= rows {
+            return false;
+        }
+        let weight = rows as f32 / (h * BANDS) as f32;
+        let (cells0, mut total) = (stats.cells, 0u64);
+        for i in 0..BANDS {
+            let start = n_lo + i * (rows - h) / (BANDS - 1);
+            let mut band = RegionStats::default();
+            if !self.region_cone_weighted(m, start, start + h - 1, x2_lo, x2_hi, weight, per_band, &mut band) {
+                // undo the bands already added: the caller falls back to row sampling
+                self.target.clear();
+                stats.cells = cells0;
+                return false;
+            }
+            stats.cells += band.cells;
+            total += band.cells;
+        }
+        stats.total += (total as f32 * weight) as u64;
+        stats.row_step = rows / (h * BANDS);
         true
     }
 
@@ -754,7 +920,9 @@ impl WaveOverlay {
     /// choice deterministic and the ±f pairs of a symmetric row together.
     fn select_active(&mut self) {
         self.active.clear();
-        let long_row = self.source.is_some_and(|s| s.max_row() > LARGE_ROW);
+        // (a region's terms are averages over many rows, with no few dominant ones; the
+        // frequency folding already bounds its per-frame cost)
+        let long_row = matches!(self.source, Some(Source::Row { row, .. }) if row > LARGE_ROW);
         if !long_row || self.displayed.len() <= TOP_K {
             self.active.extend(self.displayed.iter().map(|(&f, &v)| (f, v)));
             return;
@@ -1234,12 +1402,10 @@ mod tests {
                 }
             }
         }
-        for v in want.values_mut() {
-            *v /= cells as f64;
-        }
+        // the target holds the cells' sum: the average times N
         for f in -12..=12i64 {
-            let got = w.target(f) as f64;
-            let exp = want.get(&f).copied().unwrap_or(0.0);
+            let got = w.target(f) as f64 / cells as f64;
+            let exp = want.get(&f).copied().unwrap_or(0.0) / cells as f64;
             assert!((got - exp).abs() < 1e-6, "f = {f}: {got} vs {exp}");
         }
         assert_eq!(w.label(), "rows 3–9 · mod 5 · selection");
@@ -1251,6 +1417,7 @@ mod tests {
         w2.set_region(7, (6, 2), (6, 2));
         w2.update(1.0 / 60.0);
         assert_eq!(w2.target(2), 1.0, "C(6,2) = 15 ≡ 1 mod 7, at frequency 2");
+        assert_eq!(w2.target(4), 0.0);
         assert_eq!(w2.note(), "average of 1 cell");
         // a region off the triangle has no cells and stays flat
         w2.set_region(7, (6, 0), (2, 0));
@@ -1258,23 +1425,110 @@ mod tests {
         assert!(w2.samples().iter().all(|s| s.is_finite()));
     }
 
+    /// The exact average (as a sum per frequency) of a region, by brute force.
+    fn region_exact(m: u64, a: (u64, u64), b: (u64, u64)) -> HashMap<i64, f64> {
+        let (n_lo, n_hi) = (a.0.min(b.0), a.0.max(b.0));
+        let x2 = |(n, k): (u64, u64)| 2 * k as i64 - n as i64;
+        let (lo, hi) = (x2(a).min(x2(b)), x2(a).max(x2(b)));
+        let mut pr = PascalRow::default();
+        let mut out = HashMap::new();
+        for n in n_lo..=n_hi {
+            let row = pr.get(n, m).to_vec();
+            for (k, &r) in row.iter().enumerate() {
+                let x = 2 * k as i64 - n as i64;
+                if (lo..=hi).contains(&x) && r != 0 {
+                    *out.entry(-x).or_insert(0.0) += r as f64;
+                }
+            }
+        }
+        out
+    }
+
+    /// Relative L2 distance between two spectra after scaling each to unit length (the
+    /// plot is normalized, so only the shape counts).
+    fn shape_error(a: &HashMap<i64, f64>, b: &HashMap<i64, f64>) -> f64 {
+        let na = a.values().map(|v| v * v).sum::<f64>().sqrt().max(1e-30);
+        let nb = b.values().map(|v| v * v).sum::<f64>().sqrt().max(1e-30);
+        let keys: std::collections::HashSet<i64> = a.keys().chain(b.keys()).copied().collect();
+        keys.iter().map(|f| (a.get(f).unwrap_or(&0.0) / na - b.get(f).unwrap_or(&0.0) / nb).powi(2)).sum::<f64>().sqrt()
+    }
+
     #[test]
-    fn big_regions_are_sampled_within_budget() {
-        // half a million cells (rows 0..1000, all of them): every few rows
+    fn big_regions_are_sampled_within_budget_and_keep_their_shape() {
+        // the reviewer's cases, within Pascal's range: summed exactly now
+        for (m, a, b) in [(3u64, (0u64, 0u64), (511u64, 511u64)), (7, (0, 0), (511, 511)), (2, (0, 0), (999, 999)), (5, (0, 0), (1023, 0))] {
+            let mut w = overlay();
+            w.set_region(m, a, b);
+            w.update(1.0 / 60.0);
+            let st = w.region_stats;
+            assert_eq!(st.cells, st.total, "{st:?}");
+            let got: HashMap<i64, f64> = w.target.iter().map(|(&f, &v)| (f, v as f64)).collect();
+            let err = shape_error(&got, &region_exact(m, a, b));
+            assert!(err < 1e-6, "m = {m} {a:?}–{b:?}: shape error {err}");
+        }
+        // deep regions within the cone budget are exact too
+        for (m, a, b) in [(3u64, (2100u64, 0u64), (4000u64, 4000u64)), (7, (2100, 300), (4000, 2500)), (2, (3000, 1400), (3010, 1600)), (6, (2049, 0), (2049, 2049))] {
+            let mut w = overlay();
+            w.set_region(m, a, b);
+            w.update(1.0 / 60.0);
+            let st = w.region_stats;
+            assert_eq!(st.cells, st.total, "{st:?}");
+            let got: HashMap<i64, f64> = w.target.iter().map(|(&f, &v)| (f, v as f64)).collect();
+            let err = shape_error(&got, &region_exact(m, a, b));
+            assert!(err < 1e-5, "m = {m} {a:?}–{b:?}: shape error {err}");
+        }
+        // past it they are sampled in bands of whole consecutive rows, summed exactly:
+        // both parities kept, and the shape near the exact average
+        for (m, a, b) in [(3u64, (3000u64, 0u64), (9000u64, 9000u64)), (7, (3000, 0), (9000, 9000)), (2, (2500, 0), (8500, 8500))] {
+            let mut w = overlay();
+            w.set_region(m, a, b);
+            let t = std::time::Instant::now();
+            w.update(1.0 / 60.0);
+            let took = t.elapsed();
+            let st = w.region_stats;
+            assert!(st.cells < st.total, "{st:?}");
+            assert!(w.note().contains("sampled"), "{}", w.note());
+            let got: HashMap<i64, f64> = w.target.iter().map(|(&f, &v)| (f, v as f64)).collect();
+            assert!(got.keys().any(|f| f.rem_euclid(2) == 0) && got.keys().any(|f| f.rem_euclid(2) == 1), "both parities");
+            let err = shape_error(&got, &region_exact(m, a, b));
+            assert!(err < 0.35, "m = {m} {a:?}–{b:?}: shape error {err} ({st:?})");
+            assert!(took.as_secs_f32() < 1.0, "{took:?}");
+        }
+        // the row-sampling fallback for regions too wide for a band: strides coprime
+        // with 2m and both parities
         let mut w = overlay();
-        w.set_region(3, (0, 0), (999, 999));
+        w.set_region(3, (500_000, 0), (900_000, 900_000));
         w.update(1.0 / 60.0);
         let st = w.region_stats;
-        assert!(st.cells <= REGION_CELL_BUDGET && st.cells > REGION_CELL_BUDGET / 4, "{st:?}");
-        assert!(st.row_step > 1 && w.note().contains("sampled"), "{}", w.note());
+        assert!(gcd(st.row_step, 6) == 1 && gcd(st.cell_step, 6) == 1 && st.cells < st.total, "{st:?}");
+        assert!(w.target.keys().any(|f| f.rem_euclid(2) == 0) && w.target.keys().any(|f| f.rem_euclid(2) == 1));
         // deep rows through the closed form, a wide window, still bounded
         let mut w = overlay();
         w.set_region(30, (1_000_000_000, 400_000_000), (999_000_000, 600_000_000));
         let t = std::time::Instant::now();
         w.update(1.0 / 60.0);
-        assert!(w.region_stats.cells <= REGION_CELL_BUDGET);
+        assert!(w.region_stats.cells <= REGION_CELL_BUDGET + REGION_CELL_BUDGET / 8, "{:?}", w.region_stats);
         assert!(t.elapsed().as_secs_f32() < 5.0);
         assert!(w.samples().iter().all(|s| s.is_finite()));
+    }
+
+    #[test]
+    fn wide_small_modulus_regions_keep_every_term() {
+        // averages over tens of thousands of cells used to fall under DROP_EPS; and a
+        // region past row 2000 draws all of its terms (no top-K)
+        for (m, a, b) in [(2u64, (1500u64, 0u64), (1530u64, 1530u64)), (3, (1500, 0), (2400, 2400))] {
+            let mut w = overlay();
+            w.set_region(m, a, b);
+            run(&mut w, 1.0, 1.0 / 60.0);
+            let exact = region_exact(m, a, b);
+            let st = w.region_stats;
+            if st.cells == st.total {
+                assert_eq!(w.active_len(), exact.len(), "every frequency drawn");
+            }
+            let got: HashMap<i64, f64> = w.displayed.iter().map(|(&f, &v)| (f, v as f64)).collect();
+            let err = shape_error(&got, &exact);
+            assert!(err < 0.5, "m = {m}: shape error {err}");
+        }
     }
 
     #[test]

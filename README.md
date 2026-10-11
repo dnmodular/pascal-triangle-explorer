@@ -97,8 +97,9 @@ driver works: `sudo apt install mesa-vulkan-drivers` (lavapipe) and run
 | **F11** | fullscreen: the canvas alone, panel, bars and buttons hidden; **Esc** returns |
 
 Fitting R rows shows exactly rows 0..R−1: the apex on the top edge and row R−1
-ending on the bottom edge (on any canvas wider than the triangle's 2 : √3; a narrower
-one shows its full width and more rows below). The status line is a bar of its own
+ending on the bottom edge (a canvas narrower than the triangle's 2 : √3 shows its full
+width, and the space below row R−1 stays background while the view is fitted; zoom or
+pan and the whole triangle is there again). The status line is a bar of its own
 under the canvas, so the canvas is exactly what is in view, and the readouts, the
 in-cell numbers and the wave's last-visible-row fallback (the last whole row, never
 past R−1 while fitted) agree with it.
@@ -179,8 +180,13 @@ The row is the pinned one if any, else the row under the pointer, else the last
 visible row; small ticks at the canvas edges mark it. **Select cells** (next to
 "smooth") plays a block of cells instead: click a start cell (red mark), then an end
 cell (blue mark); the overlay plays the average of every cell in the rectangle
-between them, (1/N) Σ r_{n,k} cos((n − 2k)θ + φ), binned by frequency like a row
-(rectangles of more than 65,536 cells are sampled, and the note says so). "Clear
+between them, (1/N) Σ r_{n,k} cos((n − 2k)θ + φ), binned by frequency like a row.
+It is exact for any selection Pascal's rule can step through in about 24 million
+additions — rows up to 2048 directly, deeper ones from their first row (closed form)
+down the selection's light cone. Larger selections are summed in 16 exact bands of
+consecutive rows spread over them, and wider ones still by whole rows at a stride
+coprime with 2m (so no parity or prime-power class is skipped); the note then says
+"sampled". "Clear
 selection" or Esc ends it, as unpinning does for a pinned row; a selection takes
 precedence over the pin. **Smooth** off makes the wave snap from one row (or
 selection) to the next instead of easing. Each coefficient sits at

@@ -20,7 +20,8 @@ pub const MAX_PPC: f64 = 4096.0;
 /// own strip under the canvas, so the canvas is exactly the visible view).
 pub const FIT_PAD: f64 = 12.0;
 pub const STATUS_H: f64 = 18.0;
-/// Slack for row edges that fall on a canvas edge up to float rounding.
+/// Slack for row edges on a canvas edge: up to rounding, or half a pixel (a canvas
+/// height rounded to whole pixels, at fractional scale factors).
 const EDGE_EPS: f64 = 1e-6;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -123,16 +124,24 @@ impl View {
         if hi <= 0.0 || lo >= hi {
             return None;
         }
-        // a row edge on the canvas edge (up to rounding) does not make the next row visible
-        let first = (lo + EDGE_EPS).floor().min(hi);
-        Some((first as u32, ((hi - EDGE_EPS).ceil() - 1.0).max(first) as u32))
+        // a row edge within half a pixel of the canvas edge does not make the next row
+        // visible
+        let eps = self.edge_eps();
+        let first = (lo + eps).floor().min(hi);
+        Some((first as u32, ((hi - eps).ceil() - 1.0).max(first) as u32))
+    }
+
+    /// Half a pixel in rows (at least float slack).
+    fn edge_eps(&self) -> f64 {
+        (0.5 * self.rows_per_px()).clamp(EDGE_EPS, 0.25)
     }
 
     /// Inclusive range of rows wholly inside a canvas of height `h` (None when no row
     /// fits completely, e.g. zoomed in past a single row).
     pub fn full_rows(&self, h: f64) -> Option<(u32, u32)> {
-        let lo = (self.y0 - EDGE_EPS).ceil().max(0.0);
-        let hi = ((self.y0 + h * self.rows_per_px() + EDGE_EPS).floor() - 1.0).min(MAX_ROW);
+        let eps = self.edge_eps();
+        let lo = (self.y0 - eps).ceil().max(0.0);
+        let hi = ((self.y0 + h * self.rows_per_px() + eps).floor() - 1.0).min(MAX_ROW);
         (hi >= lo).then_some((lo as u32, hi as u32))
     }
 
@@ -269,6 +278,16 @@ mod tests {
             let last = rows as u32 - 1;
             assert_eq!(v.visible_rows(h), Some((0, last)), "{w}x{h} {rows} rows");
             assert_eq!(v.full_rows(h), Some((0, last)), "{w}x{h} {rows} rows");
+        }
+        // at fractional scale factors the canvas height is rounded: half a pixel either
+        // way changes nothing
+        for dh in [-0.49, 0.49] {
+            let v = View::fit(980.0, 736.4, 2.0);
+            assert_eq!(v.visible_rows(736.4 + dh), Some((0, 1)), "{dh}");
+            assert_eq!(v.full_rows(736.4 + dh), Some((0, 1)), "{dh}");
+            let v = View::fit(980.0, 736.4, 128.0);
+            assert_eq!(v.visible_rows(736.4 + dh), Some((0, 127)), "{dh}");
+            assert_eq!(v.full_rows(736.4 + dh), Some((0, 127)), "{dh}");
         }
         // a canvas narrower than the triangle shows its full width and more rows below
         let v = View::fit(300.0, 900.0, 64.0);

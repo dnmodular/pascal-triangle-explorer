@@ -13,7 +13,7 @@ use pascal::layers::{AvgMode, BlendMode, FieldColorMode, Kind, LayerId, LayerSta
 use pascal::math::{self, Modulus, MOD_CAP};
 use pascal::palette::{Palette, Scheme};
 use pascal::sweep::{ModMode, PrimeOrder, Seq, Sweep};
-use pascal::view::{GridSpec, View, ROW_H, STATUS_H};
+use pascal::view::{GridSpec, View, MAX_PPC, MIN_PPC, ROW_H, STATUS_H};
 use pascal::wave_overlay::{Corner, WaveOverlay};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
@@ -27,6 +27,8 @@ const CANVAS_BG: Color32 = Color32::from_rgb(10, 10, 10);
 /// Cells at least this wide (px) get their residue printed inside.
 const NUMBERS_MIN_PX: f64 = 18.0;
 const NUMBERS_MAX_CELLS: u64 = 9000;
+/// Largest in-cell number, in points (egui's glyph atlas grows with every size drawn).
+const NUMBERS_MAX_PT: f64 = 96.0;
 
 /// Picking a block of cells whose average wave the overlay plays (like the pin, but
 /// for a rectangle of cells between a red start mark and a blue end mark).
@@ -55,6 +57,8 @@ struct Model {
     /// The offset cycles on its own while this is on: one full turn per period.
     offset_playing: bool,
     offset_period: f32,
+    /// The offset field is being typed into or dragged: the cycle waits.
+    offset_editing: bool,
     layers: LayerState,
     view: View,
     fit_rows: f64,
@@ -90,8 +94,10 @@ struct Model {
     wave_row: u32,
     /// The pointer is over the overlay box: the canvas under it gets no hover.
     over_wave: bool,
-    /// The pin before the latest click (a double click undoes its first click).
+    /// The pin and selection before the latest click (a double click undoes its first
+    /// click, whichever it was).
     pin_before_click: Option<u32>,
+    select_before_click: WaveSelect,
     /// The canvas is being dragged (the wave keeps its row while the view pans).
     dragging: bool,
     /// A widget had keyboard focus or a popup was open last frame (its Esc is not ours).
@@ -110,6 +116,7 @@ impl Model {
             style: CanvasStyle::default(),
             offset_playing: false,
             offset_period: 4.0,
+            offset_editing: false,
             layers: LayerState::default(),
             view: View::fit(800.0, 600.0, 128.0),
             fit_rows: 128.0,
@@ -135,6 +142,7 @@ impl Model {
             wave_row: 0,
             over_wave: false,
             pin_before_click: None,
+            select_before_click: WaveSelect::Off,
             dragging: false,
             focus_last_frame: false,
         }
@@ -156,6 +164,17 @@ impl Model {
         if changed && follow {
             self.apply_link();
         }
+    }
+
+    /// The rows drawn on a canvas `h` px tall: the visible ones, and while fitted none
+    /// past the fit (the canvas below it is background).
+    fn shown_rows(&self, h: f64) -> Option<(u32, u32)> {
+        let (a, b) = self.view.visible_rows(h)?;
+        if !self.auto_fit {
+            return Some((a, b));
+        }
+        let last = (self.fit_rows.round() as u32).saturating_sub(1);
+        (a <= last).then_some((a, b.min(last)))
     }
 
     /// The row count the link gives for the current modulus.
@@ -187,7 +206,7 @@ impl Model {
         // the canvas centre in world units (cells, rows), per row of the old count
         let rx = (v.x0 + cw / 2.0 / v.ppc) / old_rows;
         let ry = (v.y0 + ch / 2.0 / (v.ppc * ROW_H)) / old_rows;
-        let ppc = View::fit(cw, ch, self.fit_rows).ppc * zoom;
+        let ppc = (View::fit(cw, ch, self.fit_rows).ppc * zoom).clamp(MIN_PPC, MAX_PPC);
         self.view = View { x0: rx * self.fit_rows - cw / 2.0 / ppc, y0: ry * self.fit_rows - ch / 2.0 / (ppc * ROW_H), ppc };
     }
 
@@ -250,7 +269,7 @@ impl Model {
     /// Turn the color offset by `dt` seconds' worth while it plays. The offset is cyclic
     /// (a whole turn changes nothing), so it wraps into [0, 1) and repeats forever.
     fn advance_offset(&mut self, dt: f32) {
-        if !self.offset_playing || self.offset_period.is_nan() || self.offset_period <= 0.0 || !dt.is_finite() {
+        if !self.offset_playing || self.offset_editing || self.offset_period.is_nan() || self.offset_period <= 0.0 || !dt.is_finite() {
             return;
         }
         self.style.offset = (self.style.offset + dt.max(0.0) / self.offset_period).rem_euclid(1.0);
@@ -637,6 +656,11 @@ impl ApplicationHandler for App {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
+                // the OS or window manager may leave fullscreen on its own: follow it
+                if self.fullscreen_applied && gfx.window.fullscreen().is_none() {
+                    self.fullscreen_applied = false;
+                    self.model.fullscreen = false;
+                }
                 if size.width > 0 && size.height > 0 {
                     gfx.config.width = size.width;
                     gfx.config.height = size.height;
@@ -803,8 +827,14 @@ impl App {
 
         // ---- GPU frame ----
         let grid = GridSpec::new(&model.view, canvas_px.0, canvas_px.1, model.ss, gfx.renderer.max_texels());
+        // a fitted view draws its rows only
+        model.style.row_limit = if model.auto_fit { model.fit_rows.round().clamp(1.0, u32::MAX as f64) as u32 } else { 0 };
         let inputs = (model.m, model.scheme, model.style, model.layers.clone(), model.view, model.ss, canvas_px);
-        let advance = self.last_inputs.as_ref() != Some(&inputs);
+        let changed = self.last_inputs.as_ref() != Some(&inputs);
+        // a new color offset alone recolors the same frame: the history layers (temporal
+        // AVERAGE, AFTERIMAGE) must not count it as a new one
+        let recolor_only = changed && self.last_inputs.as_ref().is_some_and(|l| (l.0, l.1, CanvasStyle { offset: 0.0, ..l.2 }, &l.3, l.4, l.5, l.6) == (inputs.0, inputs.1, CanvasStyle { offset: 0.0, ..inputs.2 }, &inputs.3, inputs.4, inputs.5, inputs.6));
+        let advance = changed && !recolor_only;
         self.last_inputs = Some(inputs);
         // Display-only tween between moduli (smoothstep over tween_ms, as in the reference).
         let now = Instant::now();
@@ -826,7 +856,7 @@ impl App {
         self.last_m = model.m;
         let mut encoder = gfx.gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
         let tween_off = matches!(tween, Tween::Off);
-        let render_canvas = advance || !tween_off || !self.canvas_current;
+        let render_canvas = changed || !tween_off || !self.canvas_current;
         if render_canvas {
             gfx.renderer.render(&mut encoder, &FrameInput { grid, modulus: &model.modulus, palette: &model.palette, layers: &model.layers, advance, tween, style: model.style });
             gfx.renderer.flush_pass_params();
@@ -880,7 +910,7 @@ impl App {
             gfx.renderer.render_blocking(&FrameInput { grid, modulus: &model.modulus, palette: &model.palette, layers: &model.layers, advance: false, tween: Tween::Off, style: model.style });
             self.tween_t0 = None;
             let (w, h, rgba) = gfx.renderer.read_output_rgba();
-            let rows = model.view.visible_rows(h as f64).unwrap_or((0, 0));
+            let rows = model.shown_rows(h as f64).unwrap_or((0, 0));
             let dir = PathBuf::from(model.export_dir.trim());
             let path = export::export_path(&dir, model.m, rows, model.scheme, &model.layers, "png");
             model.export_note = match export::write_png(&path, w, h, &rgba) {
@@ -1045,7 +1075,7 @@ fn panel_ui(ui: &mut egui::Ui, model: &mut Model, canvas_px: (u32, u32), _frame_
         ui.add_enabled_ui(model.link_rows, |ui| {
             ui.checkbox(&mut model.link_hold_sweep, "hold rows while sweeping").on_hover_text("Play or frame-step the sweep (|◀ ▶|) without the row count following the modulus; typed moduli, ◀ ▶ and the arrow keys still move the rows");
         });
-        if let Some((a, b)) = model.view.visible_rows(canvas_px.1 as f64) {
+        if let Some((a, b)) = model.shown_rows(canvas_px.1 as f64) {
             mono_line(ui, &format!("rows {}–{} · {:.3} px/cell", group(a as u64), group(b as u64), model.view.ppc));
         }
         ui.horizontal(|ui| {
@@ -1149,7 +1179,8 @@ fn panel_ui(ui: &mut egui::Ui, model: &mut Model, canvas_px: (u32, u32), _frame_
         });
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("offset").color(ui.visuals().weak_text_color()));
-            mono_drag(ui, &mut model.style.offset, -1.0..=1.0, 0.005).on_hover_text("Fractional color offset: moves every residue color this far along the palette, wrapping around (0 and spectral's 1 stay)");
+            let r = mono_drag(ui, &mut model.style.offset, -1.0..=1.0, 0.005).on_hover_text("Fractional color offset: moves every residue color this far along the palette, wrapping around (0 and spectral's 1 stay)");
+            model.offset_editing = r.has_focus() || r.dragged();
             let playing = model.offset_playing;
             let tip = if playing { "Stop cycling the offset" } else { "Cycle the offset: it turns round and round, one full turn per period, as long as this is on" };
             if ui.add(egui::Button::new(if playing { "❚❚" } else { "▶" }).small().selected(playing)).on_hover_text(tip).clicked() {
@@ -1475,8 +1506,9 @@ fn group(n: u64) -> String {
 // ---------------------------------------------------------------------------------
 
 fn canvas_interaction(ui: &mut egui::Ui, model: &mut Model, response: &egui::Response, rect: Rect, ppp: f32, handle: bool) {
-    let cw = (rect.width() * ppp) as f64;
-    let ch = (rect.height() * ppp) as f64;
+    // the canvas in whole pixels, as the GPU and the fits use it (rect × ppp is
+    // fractional at fractional scale factors)
+    let (cw, ch) = model.canvas;
     let to_px = |p: Pos2| ((p.x - rect.min.x) as f64 * ppp as f64, (p.y - rect.min.y) as f64 * ppp as f64);
 
     if handle && response.dragged_by(egui::PointerButton::Primary) {
@@ -1506,30 +1538,39 @@ fn canvas_interaction(ui: &mut egui::Ui, model: &mut Model, response: &egui::Res
     let pointer = response.hover_pos().filter(|_| response.hovered() && !response.dragged());
     model.over_wave = pointer.is_some_and(|p| model.wave.box_rect().is_some_and(|b| b.contains(p)));
     let pointer = pointer.filter(|_| !model.over_wave).map(to_px);
-    model.hover = pointer.and_then(|(px, py)| model.view.cell_at(px, py));
-    model.hover_row = pointer.and_then(|(_, py)| model.view.row_at(py));
+    // a fitted view shows its rows only: nothing to hover below them
+    let shown = |n: u32| !model.auto_fit || (n as f64) < model.fit_rows.round();
+    model.hover = pointer.and_then(|(px, py)| model.view.cell_at(px, py)).filter(|c| shown(c.0));
+    model.hover_row = pointer.and_then(|(_, py)| model.view.row_at(py)).filter(|&n| shown(n));
     model.dragging = response.dragged();
     // A click on a cell pins its row for the wave overlay; a click on the pinned row (or
     // Esc) releases it. A double click (fit) restores the pin from before its first click.
     if handle && response.double_clicked() {
         model.pinned_row = model.pin_before_click;
+        model.wave_select = model.select_before_click;
     } else if handle && response.clicked() {
+        model.pin_before_click = model.pinned_row;
+        model.select_before_click = model.wave_select;
         if matches!(model.wave_select, WaveSelect::PickStart | WaveSelect::PickEnd(_)) {
             // picking a selection: clicks mark cells instead of pinning rows
             if let Some(cell) = model.hover {
                 model.select_click(cell);
             }
         } else {
-            model.pin_before_click = model.pinned_row;
             if let Some((n, _)) = model.hover {
                 model.pinned_row = if model.pinned_row == Some(n) { None } else { Some(n) };
             }
         }
     }
 
+    // F11 even while a text field has focus (none of them takes it)
+    if handle && ui.input(|i| i.key_pressed(egui::Key::F11)) {
+        model.fullscreen = !model.fullscreen;
+    }
+
     // Keyboard, when no text field has focus.
     if handle && !ui.ctx().egui_wants_keyboard_input() {
-        let (space, shift, right, left, pgup, pgdn, up, down, fit, wave, esc, f11) = ui.input(|i| {
+        let (space, shift, right, left, pgup, pgdn, up, down, fit, wave, esc) = ui.input(|i| {
             (
                 i.key_pressed(egui::Key::Space),
                 i.modifiers.shift,
@@ -1542,12 +1583,8 @@ fn canvas_interaction(ui: &mut egui::Ui, model: &mut Model, response: &egui::Res
                 i.key_pressed(egui::Key::F),
                 i.key_pressed(egui::Key::W),
                 i.key_pressed(egui::Key::Escape),
-                i.key_pressed(egui::Key::F11),
             )
         });
-        if f11 {
-            model.fullscreen = !model.fullscreen;
-        }
         if wave {
             model.wave.toggle();
         }
@@ -1592,14 +1629,18 @@ fn canvas_interaction(ui: &mut egui::Ui, model: &mut Model, response: &egui::Res
 
 fn canvas_overlays(ui: &mut egui::Ui, model: &mut Model, rect: Rect, ppp: f32, handle: bool) {
     let painter = ui.painter_at(rect);
-    let cw = (rect.width() * ppp) as f64;
-    let ch = (rect.height() * ppp) as f64;
+    // the canvas in whole pixels, as the GPU and the fits use it (rect × ppp is
+    // fractional at fractional scale factors)
+    let (cw, ch) = model.canvas;
     let to_pt = |x: f64, y: f64| Pos2::new(rect.min.x + (x / ppp as f64) as f32, rect.min.y + (y / ppp as f64) as f32);
 
     // Residue numbers inside cells, when they are big enough.
     if model.show_numbers && model.view.ppc >= NUMBERS_MIN_PX && model.view.visible_cells(cw, ch) <= NUMBERS_MAX_CELLS {
-        if let Some((n_lo, n_hi)) = model.view.visible_rows(ch) {
-            let font = FontId::monospace(((model.view.ppc * 0.34).min(model.view.ppc * ROW_H * 0.55) / ppp as f64) as f32);
+        if let Some((n_lo, n_hi)) = model.shown_rows(ch) {
+            // capped, and stepped (four sizes an octave) so a smooth zoom reuses glyphs
+            // instead of rasterizing a new size every frame
+            let pt = ((model.view.ppc * 0.34).min(model.view.ppc * ROW_H * 0.55) / ppp as f64).clamp(4.0, NUMBERS_MAX_PT);
+            let font = FontId::monospace(((pt.log2() * 4.0).round() / 4.0).exp2() as f32);
             let x1 = model.view.x0 + cw / model.view.ppc;
             let level_map = model.palette.level_map(model.m, model.style.offset);
             for n in n_lo..=n_hi {
@@ -1685,7 +1726,7 @@ fn canvas_overlays(ui: &mut egui::Ui, model: &mut Model, rect: Rect, ppp: f32, h
 fn status_bar(ui: &mut egui::Ui, model: &Model, gpu_ms: Option<f32>, frame_ms: f32) {
     let (cw, ch) = model.canvas;
     let mut parts = vec![format!("m = {}", model.m)];
-    if let Some((a, b)) = model.view.visible_rows(ch) {
+    if let Some((a, b)) = model.shown_rows(ch) {
         parts.push(format!("rows {}–{}", group(a as u64), group(b as u64)));
     }
     parts.push(format!("{} cells", group(model.view.visible_cells(cw, ch))));
@@ -1701,8 +1742,9 @@ fn status_bar(ui: &mut egui::Ui, model: &Model, gpu_ms: Option<f32>, frame_ms: f
 /// The "modular wave" overlay, drawn last so it sits on top of the canvas. The state is
 /// advanced once per frame (egui may run the UI closure twice); drawing happens every pass.
 fn wave_overlay(ui: &mut egui::Ui, model: &mut Model, rect: Rect, ppp: f32, dt: f32, handle: bool) {
-    let cw = (rect.width() * ppp) as f64;
-    let ch = (rect.height() * ppp) as f64;
+    // the canvas in whole pixels, as the GPU and the fits use it (rect × ppp is
+    // fractional at fractional scale factors)
+    let (cw, ch) = model.canvas;
     if handle {
         let row = if let Some(n) = model.pinned_row {
             n
@@ -2036,6 +2078,51 @@ mod tests {
         assert_eq!(md.wave_select, WaveSelect::Active((9, 3), (4, 1)));
         md.select_click((7, 7));
         assert_eq!(md.wave_select, WaveSelect::Active((9, 3), (4, 1)), "an active selection keeps its marks");
+    }
+
+    #[test]
+    fn linked_refits_respect_the_zoom_cap() {
+        // zoomed all the way in at m = 40, then m = 2: the kept relative zoom would
+        // pass MAX_PPC (and the in-cell numbers' font with it)
+        let mut md = model();
+        md.link_rows = true;
+        md.set_m(40);
+        for _ in 0..200 {
+            md.view.zoom_at(490.0, 368.0, 1.5);
+        }
+        md.auto_fit = false;
+        assert_eq!(md.view.ppc, MAX_PPC);
+        md.set_m(2);
+        assert!(md.view.ppc <= MAX_PPC && md.view.ppc >= MIN_PPC, "{}", md.view.ppc);
+    }
+
+    #[test]
+    fn a_fitted_view_shows_its_rows_only() {
+        // a canvas narrower than the triangle: the fit is width-limited, and rows past
+        // the fit are background, not counted
+        let mut md = model();
+        md.canvas = (300.0, 900.0);
+        md.fit_rows = 64.0;
+        md.fit(300.0, 900.0);
+        assert!(md.view.visible_rows(900.0).unwrap().1 > 63);
+        assert_eq!(md.shown_rows(900.0), Some((0, 63)));
+        // zoomed or panned, the whole triangle is back
+        md.view.zoom_at(150.0, 450.0, 1.2);
+        md.auto_fit = false;
+        assert!(md.shown_rows(900.0).unwrap().1 > 63);
+    }
+
+    #[test]
+    fn typing_the_offset_holds_the_cycle() {
+        let mut md = model();
+        md.offset_playing = true;
+        md.offset_editing = true;
+        md.style.offset = 0.125;
+        md.advance_offset(1.0);
+        assert_eq!(md.style.offset, 0.125);
+        md.offset_editing = false;
+        md.advance_offset(1.0);
+        assert!((md.style.offset - 0.375).abs() < 1e-6);
     }
 
     #[test]
