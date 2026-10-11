@@ -89,18 +89,25 @@ driver works: `sudo apt install mesa-vulkan-drivers` (lavapipe) and run
 | **space** | play / pause the sweep |
 | **← / →** | one step back / forward through the sweep's selection mode |
 | **PgDn / PgUp** | ten steps back / forward |
-| **↑ / ↓** | rows to fit +1 / −1, then fit |
+| **↑ / ↓** | rows to fit +1 / −1, then fit (with rows following m: the next / previous modulus) |
 | **Shift** | ×10 for any of the above |
 | hover | inspector: *n*, *k*, `C(n,k)`, `C mod m`, ν_p for each prime factor, the Lucas digit product |
 | click a cell | pin its row for the wave overlay (click the row again, or **Esc**, to release) |
 | **W** | show / hide the wave overlay (it fades) |
 
-The panel on the left has the modulus (text, ◀ ▶, log slider, and the examples
-m = 2, 3, 5, 11), the rows to fit, supersampling, the palette, the three color
-presets (residue → palette, zero/nonzero mask, p-adic valuation heatmap), the
-color offset, cell outlines and zero glow, the layer stack, PNG and SVG export, and
-a Reset button. When cells are at least 18 px wide their residue is printed inside
-them.
+The panel on the left has the modulus (text, ◀ ▶, log slider), the rows to fit and
+the rows-follow-m link, supersampling, the palette, the three color presets
+(residue → palette, zero/nonzero mask, p-adic valuation heatmap), the color offset,
+cell outlines and zero glow, the layer stack, PNG and SVG export, and a Reset
+button. When cells are at least 18 px wide their residue is printed inside them.
+
+**Rows follow m** (the reference's LINK) parents the row count to the modulus: rows
+= m × factor (factor 1 by default: one full period of a prime modulus, whose zero
+blocks start at row m), refitted whenever m changes — typed, stepped, slid or swept.
+The link runs both ways: with it on, typing a row count moves the modulus to rows ÷
+factor (snapped to the sweep's selection mode), and ↑/↓ step the modulus. "Hold rows
+while the sweep plays" keeps the count still during playback only. `--link` turns it
+on from the command line.
 
 ## From the square scanner
 
@@ -127,7 +134,6 @@ Square Scanner"). These of its features earned a place here:
   fade in as cells grow from 3 to 6 px and vanish when zoomed out. Both start off, so
   the default view stays identical to `pascal-core.html`.
 * **Palettes** Ember, Ocean and Moss (its four-stop gradients).
-* **Examples**: one click to m = 2, 3, 5 (80 rows) or 11 (64 rows), as its presets.
 * **SVG export** (its "Save SVG"): rows 0..R−1 (the rows setting, up to 1024) as
   vector cells — one path per color, and with outlines on, one stroked path over all
   cells — for the residue, mask and valuation colorings, which the CPU reproduces.
@@ -204,8 +210,9 @@ while the modulus or the mode changes:
   composites, even, odd, and interval sequences starting at the range start: fixed
   step, π digits, Fibonacci, primes, squares, powers of 2, 2×Pn, 3×Pn, primes + 2×Pn,
   semiprimes, primes + semiprimes, sphenic numbers.
-* **Range, frame speed (ms) and loop:** looping wraps at the range ends; with loop
-  off, playback stops on the last frame.
+* **Range, frame time (ms) and loop:** the frame time has a slider (16 ms–1 s) and a
+  field that takes any value typed or dragged, 16 ms–10 s. Looping wraps at the range
+  ends; with loop off, playback stops on the last frame.
 * **Tween (ms):** a display-only transition. When consecutive frames run the same
   field pipeline on the same view, the field morphs (smoothstep lerp, as in the
   reference); otherwise the picture cross-dissolves. The resolve pass still writes

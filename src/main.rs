@@ -42,6 +42,13 @@ struct Model {
     view: View,
     fit_rows: f64,
     auto_fit: bool,
+    /// Rows parented to the modulus: rows = m × link_factor, refitted whenever m moves
+    /// (the reference's LINK). While the sweep plays they follow too, unless held.
+    link_rows: bool,
+    link_factor: f64,
+    link_hold_sweep: bool,
+    /// The canvas size (px) of the last frame, for fits made outside the canvas UI.
+    canvas: (f64, f64),
     ss: u32,
     show_numbers: bool,
     export_dir: String,
@@ -85,6 +92,10 @@ impl Model {
             view: View::fit(800.0, 600.0, 128.0),
             fit_rows: 128.0,
             auto_fit: true,
+            link_rows: false,
+            link_factor: 1.0,
+            link_hold_sweep: false,
+            canvas: (0.0, 0.0),
             ss: 2,
             show_numbers: true,
             export_dir: std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_else(|_| ".".into()),
@@ -106,12 +117,51 @@ impl Model {
     }
 
     fn set_m(&mut self, m: u32) {
+        self.set_m_with(m, true);
+    }
+
+    /// Set the modulus; with `follow`, linked rows follow it.
+    fn set_m_with(&mut self, m: u32, follow: bool) {
         let m = m.clamp(2, MOD_CAP);
-        if m != self.m {
+        let changed = m != self.m;
+        if changed {
             self.m = m;
             self.modulus = Arc::new(Modulus::new(m));
         }
         self.m_text = m.to_string();
+        if changed && follow {
+            self.apply_link();
+        }
+    }
+
+    /// The row count the link gives for the current modulus.
+    fn linked_rows(&self) -> f64 {
+        (self.m as f64 * self.link_factor).round().clamp(2.0, 1.0e9)
+    }
+
+    /// With rows linked, set them from the modulus and refit.
+    fn apply_link(&mut self) {
+        if !self.link_rows {
+            return;
+        }
+        self.fit_rows = self.linked_rows();
+        if self.canvas.0 > 0.0 && self.canvas.1 > 0.0 {
+            self.fit(self.canvas.0, self.canvas.1);
+        } else {
+            self.auto_fit = true; // the first frame fits
+        }
+    }
+
+    /// Rows typed in: with the link on, the modulus moves instead (m = rows / factor,
+    /// snapped to the selection mode) and the rows follow it.
+    fn set_rows(&mut self, rows: f64) {
+        if self.link_rows {
+            self.goto((rows / self.link_factor).round() as i64);
+            self.apply_link();
+        } else {
+            self.fit_rows = rows.clamp(2.0, 1.0e9);
+            self.fit(self.canvas.0, self.canvas.1);
+        }
     }
 
     /// Go to `m` snapped to the active selection mode (typed value, slider).
@@ -140,7 +190,7 @@ impl Model {
         self.last_step = Some(now);
         let v = self.sweep.tick(self.m);
         let moved = v != self.m;
-        self.set_m(v);
+        self.set_m_with(v, !self.link_hold_sweep);
         moved
     }
 
@@ -149,14 +199,6 @@ impl Model {
         let dir = std::mem::take(&mut self.export_dir);
         *self = Model::new();
         self.export_dir = dir;
-        self.fit(cw, ch);
-    }
-
-    /// One of the square scanner's examples: modulus `m` with `rows` rows fitted.
-    fn example(&mut self, m: u32, rows: u32, cw: f64, ch: f64) {
-        self.sweep.playing = false;
-        self.set_m(m);
-        self.fit_rows = rows as f64;
         self.fit(cw, ch);
     }
 
@@ -261,6 +303,7 @@ const USAGE: &str = "pascal-triangle-explorer [options]
   --palette NAME     spectral | viridis | magma | inferno | turbo | cividis | coolwarm | mono
                      | ember | ocean | moss
   --offset X         fractional color offset (−1..1)
+  --link             rows follow the modulus (rows = m)
   --outlines         outline each cell when zoomed in
   --glow             glow around zero cells when zoomed in
   --mode MODE        residue | mask | valuation
@@ -322,6 +365,11 @@ fn main() {
             "--svg" => svg = Some(PathBuf::from(next())),
             // as the panel's control: −1..1
             "--offset" => model.style.offset = next().parse::<f32>().ok().filter(|v| v.is_finite()).unwrap_or(0.0).clamp(-1.0, 1.0),
+            "--link" => {
+                model.link_rows = true;
+                i += 1;
+                continue;
+            }
             "--outlines" | "--glow" => {
                 if args[i] == "--outlines" {
                     model.style.outlines = true;
@@ -352,6 +400,7 @@ fn main() {
         }
         i += 2;
     }
+    model.apply_link();
     if let Some(path) = svg {
         let rows = model.fit_rows.round().clamp(1.0, export::SVG_MAX_ROWS as f64) as u32;
         // headless: the valuation is normalized over the exported rows
@@ -594,7 +643,7 @@ impl App {
             self.fps_t0 = Some(now);
         }
         // The panel runs before the canvas is laid out: give it last frame's canvas size
-        // (the first frame estimates it), so its Fit / Reset / examples fit the real canvas.
+        // (the first frame estimates it), so its Fit and Reset fit the real canvas.
         let mut canvas_px = if gfx.canvas_size.0 > 0 { gfx.canvas_size } else { (gfx.config.width.saturating_sub((PANEL_W * ppp) as u32).max(1), gfx.config.height.saturating_sub((SWEEP_BAR_H * ppp) as u32).max(1)) };
         let model = &mut self.model;
         let frame_ms = self.frame_ms;
@@ -627,6 +676,7 @@ impl App {
                 let w = ((rect.width() * ppp).round() as u32).max(1);
                 let h = ((rect.height() * ppp).round() as u32).max(1);
                 canvas_px = (w, h);
+                model.canvas = (w as f64, h as f64);
                 let mut needs_tex_update = false;
                 if *canvas_size != (w, h) {
                     renderer.ensure_canvas(w, h);
@@ -857,28 +907,37 @@ fn panel_ui(ui: &mut egui::Ui, model: &mut Model, canvas_px: (u32, u32), _frame_
         let info = if model.modulus.is_prime() { format!("{} is prime", model.m) } else { format!("{} = {}", model.m, math::factor_string(fs)) };
         // one fixed line, so nothing below moves while the modulus changes
         mono_line(ui, &info).on_hover_text("Zeros are where every prime-power factor of m divides C(n,k); the CRT layer shows which ones do.");
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("examples  m =").color(ui.visuals().weak_text_color()));
-            for (m, rows) in [(2u32, 80u32), (3, 80), (5, 80), (11, 64)] {
-                if ui.small_button(m.to_string()).on_hover_text(format!("m = {m} with {rows} rows")).clicked() {
-                    model.example(m, rows, canvas_px.0 as f64, canvas_px.1 as f64);
-                }
-            }
-        });
     });
 
     section(ui, "View", |ui| {
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("rows").color(ui.visuals().weak_text_color()));
             let mut rows = model.fit_rows.round() as u32;
-            let resp = mono_drag(ui, &mut rows, 2..=1_000_000_000u32, 1.0);
+            let tip = if model.link_rows { "Linked to the modulus: a new row count moves m to rows ÷ factor" } else { "Rows to fit" };
+            let resp = mono_drag(ui, &mut rows, 2..=1_000_000_000u32, 1.0).on_hover_text(tip);
             if resp.changed() {
-                model.fit_rows = rows.max(2) as f64;
-                model.fit(canvas_px.0 as f64, canvas_px.1 as f64);
+                model.canvas = (canvas_px.0 as f64, canvas_px.1 as f64);
+                model.set_rows(rows.max(2) as f64);
             }
             if ui.button("Fit").on_hover_text("Fit this many rows (F)").clicked() {
                 model.fit(canvas_px.0 as f64, canvas_px.1 as f64);
             }
+        });
+        ui.horizontal(|ui| {
+            let mut on = model.link_rows;
+            let resp = ui.checkbox(&mut on, "rows follow m").on_hover_text("Parent the rows to the modulus: rows = m × factor, refitted whenever m changes (typed, stepped or swept). With the link on, editing rows or ↑/↓ moves the modulus instead.");
+            if resp.changed() {
+                model.link_rows = on;
+                model.apply_link();
+            }
+            ui.label(egui::RichText::new("×").color(ui.visuals().weak_text_color()));
+            let f = ui.add_enabled_ui(model.link_rows, |ui| mono_drag(ui, &mut model.link_factor, 0.01..=1000.0, 0.01).on_hover_text("rows = m × this")).inner;
+            if f.changed() {
+                model.apply_link();
+            }
+        });
+        ui.add_enabled_ui(model.link_rows, |ui| {
+            ui.checkbox(&mut model.link_hold_sweep, "hold rows while the sweep plays").on_hover_text("Sweep the modulus without the row count following it (typed and stepped moduli still move the rows)");
         });
         if let Some((a, b)) = model.view.visible_rows(canvas_px.1 as f64) {
             mono_line(ui, &format!("rows {}–{} · {:.3} px/cell", group(a as u64), group(b as u64), model.view.ppc));
@@ -1203,10 +1262,10 @@ fn sweep_bar(ui: &mut egui::Ui, model: &mut Model) {
         ui.add_space(54.0);
         bar_label(ui, "frame");
         ui.spacing_mut().slider_width = 110.0;
-        ui.add(egui::Slider::new(&mut sw.speed_ms, 16..=1000).show_value(false));
-        slot(ui, 56.0, |ui| {
-            ui.label(egui::RichText::new(format!("{:>4} ms", sw.speed_ms)).font(FontId::monospace(12.0)));
-        });
+        // the slider spans 16 ms–1 s; the field takes any value typed or dragged up to 10 s
+        ui.add(egui::Slider::new(&mut sw.speed_ms, 16..=1000).show_value(false).clamping(egui::SliderClamping::Never));
+        bar_drag(ui, 56.0, &mut sw.speed_ms, 16..=10_000u32, 1.0).on_hover_text("Time per frame while playing, in ms: click to type, drag to change");
+        bar_label(ui, "ms");
         ui.checkbox(&mut sw.looping, "loop").on_hover_text("Wrap at the range ends; off stops on the last frame.");
         bar_sep(ui);
         bar_label(ui, "tween");
@@ -1344,8 +1403,13 @@ fn canvas_interaction(ui: &mut egui::Ui, model: &mut Model, response: &egui::Res
         }
         let dr = (up as i64 - down as i64) * big;
         if dr != 0 {
-            model.fit_rows = (model.fit_rows + dr as f64).clamp(2.0, 1.0e9);
-            model.fit(cw, ch);
+            if model.link_rows {
+                // rows are the modulus's child: step the modulus, the rows follow
+                model.step(dr.clamp(-100_000, 100_000) as i32);
+            } else {
+                model.fit_rows = (model.fit_rows + dr as f64).clamp(2.0, 1.0e9);
+                model.fit(cw, ch);
+            }
         }
         if fit {
             model.fit(cw, ch);
@@ -1565,4 +1629,84 @@ fn system_fonts() -> egui::FontDefinitions {
         have.insert(family.clone());
     }
     defs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn model() -> Model {
+        let mut m = Model::new();
+        m.canvas = (980.0, 736.0);
+        m
+    }
+
+    #[test]
+    fn rows_follow_the_modulus_when_linked() {
+        let mut md = model();
+        md.set_m(11);
+        assert_eq!(md.fit_rows, 128.0, "unlinked rows stay");
+        md.link_rows = true;
+        md.apply_link();
+        assert_eq!(md.fit_rows, 11.0);
+        assert!(md.auto_fit);
+        // typed, stepped and slid moduli all carry the rows
+        md.goto(250);
+        assert_eq!(md.fit_rows, 250.0);
+        md.step(1);
+        assert_eq!((md.m, md.fit_rows), (251, 251.0));
+        // the factor scales; tiny factors still give 2 rows
+        md.link_factor = 2.5;
+        md.apply_link();
+        assert_eq!(md.fit_rows, 628.0);
+        md.link_factor = 0.01;
+        md.apply_link();
+        assert_eq!(md.fit_rows, 3.0);
+        md.set_m(7);
+        assert_eq!(md.fit_rows, 2.0);
+        // rows typed while linked move the modulus (rows ÷ factor), snapped to the mode
+        md.link_factor = 1.0;
+        md.set_rows(97.0);
+        assert_eq!((md.m, md.fit_rows), (97, 97.0));
+        md.sweep.mode = pascal::sweep::ModMode::Prime;
+        md.set_rows(100.0);
+        assert!(Modulus::new(md.m).is_prime() && md.fit_rows == md.m as f64, "m = {}", md.m);
+        // the view is refitted to the new rows
+        assert_eq!(md.view, View::fit(980.0, 736.0, md.fit_rows));
+        // unlinking leaves the rows where they are; rows typed then are just rows
+        md.link_rows = false;
+        let m_before = md.m;
+        md.set_rows(40.0);
+        assert_eq!((md.m, md.fit_rows), (m_before, 40.0));
+        md.set_m(200);
+        assert_eq!(md.fit_rows, 40.0);
+    }
+
+    #[test]
+    fn the_sweep_drags_linked_rows_unless_held() {
+        let mut md = model();
+        md.link_rows = true;
+        md.set_m(20);
+        md.sweep.playing = true;
+        let t0 = Instant::now();
+        assert!(md.play_tick(t0));
+        assert_eq!(md.fit_rows, md.m as f64, "rows follow the playing sweep");
+        md.link_hold_sweep = true;
+        let held = md.fit_rows;
+        assert!(md.play_tick(t0 + std::time::Duration::from_secs(1)));
+        assert_ne!(md.m as f64, held);
+        assert_eq!(md.fit_rows, held, "held while playing");
+        // a typed modulus still moves them
+        md.goto(64);
+        assert_eq!(md.fit_rows, 64.0);
+    }
+
+    #[test]
+    fn reset_unlinks() {
+        let mut md = model();
+        md.link_rows = true;
+        md.link_factor = 3.0;
+        md.reset(980.0, 736.0);
+        assert!(!md.link_rows && md.link_factor == 1.0 && md.fit_rows == 128.0);
+    }
 }
