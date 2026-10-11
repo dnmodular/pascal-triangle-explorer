@@ -6,11 +6,13 @@
 //! filtered through mod m:
 //!
 //! ```text
-//! w(θ) = Σ_k r_k · cos(f_k·θ + φ(t)),   θ ∈ [−π, π]
+//! w(θ) = Σ_k r_k · cos(f_k·(θ − s(t))),   θ ∈ [−π, π]
 //! ```
 //!
-//! A full row is symmetric (r_k = r_{n−k}), so w(θ) = cos φ · Σ r_k cos(f_k θ): the
-//! phase drift makes the wave breathe (swell, flatten, invert) rather than travel.
+//! The scroll s(t) slides the whole wave sideways at a steady speed (wrapping every
+//! 2π, the common period of the integer frequencies), so its shape never changes. (A
+//! phase drift cos(f θ + φ) instead would make a whole row, which is symmetric, swell,
+//! flatten and invert in place.)
 //!
 //! Coefficients live in maps keyed by frequency, so rows of different lengths line up.
 //! A source change only rebuilds `target`; every frame the `displayed` coefficients
@@ -32,8 +34,8 @@ use egui::{Color32, CornerRadius, FontId, Galley, Pos2, Rect, Shape, Stroke, Str
 
 use crate::math::{Modulus, MOD_CAP};
 
-/// Default phase drift φ'(t) in rad/s (see [`OverlayConfig::drift`]).
-pub const PHASE_DRIFT: f32 = 0.3;
+/// Default scroll speed s'(t) in rad/s of θ (see [`OverlayConfig::scroll`]).
+pub const SCROLL_SPEED: f32 = 0.3;
 /// Time constant of every easing in the overlay (coefficients, normalization, fade).
 pub const TAU: f32 = 0.12;
 /// Displayed entries are dropped once both their value and their target are below this.
@@ -76,7 +78,8 @@ const FORMULA_MIN_SIDE: f32 = 200.0;
 /// Boxes smaller than this (tiny canvases) are not drawn at all.
 const MIN_DRAW_SIDE: f32 = 2.0 * PAD + LABEL_H + 32.0;
 
-const WAVE_RGB: [u8; 3] = [0x4f, 0xc3, 0xf7];
+/// The tetra stack's wire green.
+const WAVE_RGB: [u8; 3] = [82, 242, 122];
 const FORMULA: &str = "C(n,k) mod m → Σ r_k cos((n−2k)θ)";
 
 /// Which corner of the canvas the overlay sits in.
@@ -115,8 +118,8 @@ pub struct OverlayConfig {
     pub size_frac: f32,
     pub min_side: f32,
     pub max_side: f32,
-    /// Phase drift in rad/s; 0 freezes φ.
-    pub drift: f32,
+    /// Horizontal scroll in rad/s of θ (positive moves right); 0 holds the wave still.
+    pub scroll: f32,
     /// Subtle fill between the wave and the zero line.
     pub fill: bool,
     /// Ease from one wave to the next (coefficients and scale); off snaps at once.
@@ -125,7 +128,7 @@ pub struct OverlayConfig {
 
 impl Default for OverlayConfig {
     fn default() -> Self {
-        OverlayConfig { corner: Corner::TopRight, margin: 16.0, top_clearance: 26.0, bottom_clearance: 0.0, size_frac: 0.28, min_side: 160.0, max_side: 420.0, drift: PHASE_DRIFT, fill: true, smooth: true }
+        OverlayConfig { corner: Corner::TopRight, margin: 16.0, top_clearance: 26.0, bottom_clearance: 0.0, size_frac: 0.28, min_side: 160.0, max_side: 420.0, scroll: SCROLL_SPEED, fill: true, smooth: true }
     }
 }
 
@@ -285,8 +288,10 @@ pub struct WaveOverlay {
     csum: Vec<f32>,
     ssum: Vec<f32>,
     /// Active coefficients folded by frequency mod P (reused).
-    buckets: Vec<f32>,
-    phase: f32,
+    /// Per bucket, the (re, im) sum of the terms folded into it, each turned by e^{−i f s}.
+    buckets: Vec<(f32, f32)>,
+    /// The scroll s in [0, 2π).
+    shift: f64,
     /// Smoothed running max of |w| over θ and the phase: the envelope max_θ |Σ c e^{ifθ}|.
     norm: f32,
     /// Geometry, from `set_viewport`.
@@ -338,7 +343,7 @@ impl WaveOverlay {
             csum: Vec::new(),
             ssum: Vec::new(),
             buckets: Vec::new(),
-            phase: 0.0,
+            shift: 0.0,
             norm: 0.0,
             viewport: Rect::NOTHING,
             window: Vec2::ZERO,
@@ -366,14 +371,14 @@ impl WaveOverlay {
         self.visible = !self.visible;
     }
 
-    /// True while the overlay changes from frame to frame (fading, easing or drifting),
+    /// True while the overlay changes from frame to frame (fading, easing or scrolling),
     /// i.e. while the app should keep requesting redraws for it.
     pub fn is_animating(&self) -> bool {
         if self.layout().is_none() {
             return false; // nothing to show (no viewport, or one too small for the box)
         }
         if self.visible {
-            self.fade < 1.0 || self.dirty || self.texts_dirty || !self.settled || self.config.drift != 0.0
+            self.fade < 1.0 || self.dirty || self.texts_dirty || !self.settled || self.config.scroll != 0.0
         } else {
             self.fade > 0.0
         }
@@ -796,7 +801,7 @@ impl WaveOverlay {
         Some(Layout { bx, plot, label, note, formula })
     }
 
-    /// Advance the animation by the real frame time `dt` (seconds): fade, phase drift,
+    /// Advance the animation by the real frame time `dt` (seconds): fade, scroll,
     /// coefficient easing, sampling, normalization and the prepared geometry. Call once
     /// per frame, after `set_source` and `set_viewport`.
     pub fn update(&mut self, dt: f32) {
@@ -807,8 +812,8 @@ impl WaveOverlay {
         if (self.fade - want).abs() < FADE_EPS {
             self.fade = want;
         }
-        let drift = if self.config.drift.is_finite() { self.config.drift } else { 0.0 };
-        self.phase = (self.phase + drift * dt).rem_euclid(std::f32::consts::TAU);
+        let speed = if self.config.scroll.is_finite() { self.config.scroll as f64 } else { 0.0 };
+        self.shift = (self.shift + speed * dt as f64).rem_euclid(std::f64::consts::TAU);
         if !self.visible && self.fade <= FADE_EPS {
             return; // hidden: nothing to compute
         }
@@ -861,43 +866,54 @@ impl WaveOverlay {
         }
         // e^{i f θ_j} = (−1)^f · e^{2πi ((f mod P)·j mod P) / P}: exact for any integer
         // frequency, so rows near 10⁹ need no large trig arguments, and frequencies with
-        // the same f mod P fold into one bucket (at most P² terms per frame).
+        // the same f mod P fold into one bucket (at most P² terms per frame). The scroll
+        // turns each term by e^{−i f s} first (f s reduced mod 2π in f64), which is what
+        // lets a sub-sample shift fold too.
         let p64 = period as i64;
         self.buckets.clear();
-        self.buckets.resize(period, 0.0);
+        self.buckets.resize(period, (0.0, 0.0));
+        let shift = self.shift;
         for &(f, c) in &self.active {
-            self.buckets[f.rem_euclid(p64) as usize] += if f.rem_euclid(2) == 1 { -c } else { c };
+            let c = if f.rem_euclid(2) == 1 { -c } else { c };
+            let b = &mut self.buckets[f.rem_euclid(p64) as usize];
+            if shift == 0.0 || f == 0 {
+                b.0 += c;
+            } else {
+                let (sn, cs) = (-(f as f64) * shift).rem_euclid(std::f64::consts::TAU).sin_cos();
+                b.0 += c * cs as f32;
+                b.1 += c * sn as f32;
+            }
         }
-        // C_j = Σ c cos(x), S_j = Σ c sin(x) with x = 2π b j / P; then
-        // w(θ_j) = Σ c cos(x + φ) = cos φ · C_j − sin φ · S_j
+        // z_j = Σ_b B_b e^{ix}, x = 2π b j / P: C_j = Re z_j is the wave, |z_j| its
+        // envelope (S_j = Im z_j)
         self.csum.clear();
         self.csum.resize(n_samples, 0.0);
         self.ssum.clear();
         self.ssum.resize(n_samples, 0.0);
-        for (b, &c) in self.buckets.iter().enumerate() {
-            if c == 0.0 {
+        for (b, &(re, im)) in self.buckets.iter().enumerate() {
+            if re == 0.0 && im == 0.0 {
                 continue;
             }
             let mut i = 0usize;
             for (cs, ss) in self.csum.iter_mut().zip(self.ssum.iter_mut()) {
-                *cs += c * self.cos_t[i];
-                *ss += c * self.sin_t[i];
+                let (c, s) = (self.cos_t[i], self.sin_t[i]);
+                *cs += re * c - im * s;
+                *ss += re * s + im * c;
                 i += b;
                 if i >= period {
                     i -= period;
                 }
             }
         }
-        let (cp, sp) = (self.phase.cos(), self.phase.sin());
         let mut env2 = 0.0f32;
         for ((s, &cs), &ss) in self.samples.iter_mut().zip(&self.csum).zip(&self.ssum) {
-            *s = cp * cs - sp * ss;
+            *s = cs;
             env2 = env2.max(cs * cs + ss * ss);
         }
 
-        // Normalize by a smoothed running max of |w|, taken over the phase as well: the
-        // envelope max_j |C_j + i S_j| does not move with φ, so the drift shows as the
-        // wave breathing (a whole row is w = cos φ · C) and peaks never clip.
+        // Normalize by a smoothed running max of the envelope max_j |C_j + i S_j| ≥ |w|:
+        // peaks never clip, and a whole row (real, so |w| = |z|) fills the box exactly
+        // however far it has scrolled.
         let raw = env2.sqrt().max(NORM_FLOOR);
         if !(self.norm > 0.0 && self.norm.is_finite()) {
             self.norm = raw;
@@ -1269,10 +1285,11 @@ mod tests {
         run(&mut w, 4.0, 1.0 / 60.0);
         let s = w.samples().to_vec();
         let period = s.len() - 1;
-        let phase = w.phase;
+        let shift = w.shift;
+        assert!(shift > 0.5, "it has scrolled");
         for (j, &got) in s.iter().enumerate().step_by(37) {
             let theta = -std::f64::consts::PI + 2.0 * std::f64::consts::PI * j as f64 / period as f64;
-            let want: f64 = (0..=9i64).map(|k| w.displayed(9 - 2 * k) as f64 * ((9 - 2 * k) as f64 * theta + phase as f64).cos()).sum();
+            let want: f64 = (0..=9i64).map(|k| w.displayed(9 - 2 * k) as f64 * ((9 - 2 * k) as f64 * (theta - shift)).cos()).sum();
             assert!((got as f64 - want).abs() < 1e-3 * (1.0 + want.abs()), "j={j}: {got} vs {want}");
         }
     }
@@ -1320,7 +1337,7 @@ mod tests {
         // rows 3001 → 3002 share no frequency (opposite parity): the old row's top terms
         // must fade out while the new row's fade in, not swap in one frame
         let mut w = overlay();
-        w.config.drift = 0.0;
+        w.config.scroll = 0.0;
         w.set_source(3001, 999_983, (0, 3001));
         run(&mut w, 3.0, 1.0 / 60.0);
         w.set_source(3002, 999_983, (0, 3002));
@@ -1352,20 +1369,22 @@ mod tests {
 
     #[test]
     fn normalization_follows_the_envelope() {
-        // a full drift cycle on a whole row: the wave breathes (|w| ∝ |cos φ|) and the
-        // normalized peaks never pass ±1, so nothing is clipped
+        // a full scroll cycle on a whole row: the wave slides without changing shape, so
+        // its normalized peak stays at 1 (no breathing or flipping) and never passes it
         let mut w = overlay();
         w.set_source(20, 7, (0, 20));
         run(&mut w, 2.0, 1.0 / 60.0);
         let (mut lo, mut hi) = (f32::MAX, 0.0f32);
-        for _ in 0..(std::f32::consts::TAU / PHASE_DRIFT * 60.0) as usize {
+        for _ in 0..(std::f32::consts::TAU / SCROLL_SPEED * 60.0) as usize {
             w.update(1.0 / 60.0);
             let peak = w.samples().iter().fold(0.0f32, |a, s| a.max(s.abs())) / w.norm();
-            assert!(peak <= 1.0 + 1e-4, "peak {peak} at φ = {}", w.phase);
+            // the envelope is sampled on the plot's grid, so as the wave slides its max
+            // wobbles by a hair (and the eased norm follows a frame late)
+            assert!(peak <= 1.0 + 2e-3, "peak {peak} at s = {}", w.shift);
             lo = lo.min(peak);
             hi = hi.max(peak);
         }
-        assert!(hi > 0.99 && lo < 0.05, "breathes from {lo} to {hi}");
+        assert!(hi > 0.99 && lo > 0.97, "the peak moved between {lo} and {hi}");
     }
 
     #[test]
@@ -1559,16 +1578,16 @@ mod tests {
         w.set_source(8, 3, (0, 8));
         run(&mut w, 1.0, 1.0 / 60.0);
         assert!(w.box_rect().is_some());
-        assert!(w.is_animating(), "the phase drifts");
+        assert!(w.is_animating(), "the wave scrolls");
         w.toggle();
         w.update(1.0 / 60.0);
         assert!(w.fade() > 0.5, "fades, does not pop");
         run(&mut w, 2.0, 1.0 / 60.0);
         assert!(w.box_rect().is_none());
         assert!(!w.is_animating(), "a hidden overlay needs no redraws");
-        // with the drift off, a settled overlay stops asking for frames
+        // with the scroll off, a settled overlay stops asking for frames
         let mut w = overlay();
-        w.config.drift = 0.0;
+        w.config.scroll = 0.0;
         w.set_source(8, 3, (0, 8));
         run(&mut w, 3.0, 1.0 / 60.0);
         assert!(!w.is_animating());

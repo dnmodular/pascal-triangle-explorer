@@ -11,7 +11,7 @@ use pascal::gpu::Gpu;
 use pascal::math::{triangle_dp, Modulus};
 use pascal::palette::{Palette, Scheme};
 use pascal::sweep::{ModMode, Seq};
-use pascal::tetra::{ray_cast, selected_moduli, Camera, CubeId, Layout, Spacing, TetraConfig};
+use pascal::tetra::{ray_cast, selected_moduli, Camera, CubeId, Layout, Shape, Spacing, TetraConfig};
 use pascal::tetra_gpu::{DrawOptions, TetraRenderer, BACKGROUND};
 
 fn device() -> (Gpu, TetraRenderer) {
@@ -21,7 +21,11 @@ fn device() -> (Gpu, TetraRenderer) {
 }
 
 fn scene(r: &mut TetraRenderer, mods: &[u32], spacing: Spacing, budget: u32) -> (Layout, Vec<Modulus>) {
-    let layout = Layout::new(mods, spacing, budget);
+    scene_shaped(r, mods, spacing, Shape::Regular, budget)
+}
+
+fn scene_shaped(r: &mut TetraRenderer, mods: &[u32], spacing: Spacing, shape: Shape, budget: u32) -> (Layout, Vec<Modulus>) {
+    let layout = Layout::with_shape(mods, spacing, shape, budget);
     let mds: Vec<Modulus> = mods.iter().map(|&m| Modulus::new(m)).collect();
     r.set_scene(&layout, &mds, &Palette::new(Scheme::Spectral), 0.0);
     (layout, mds)
@@ -96,16 +100,19 @@ fn strided_and_deep_slices_match_too() {
 fn the_pick_buffer_names_the_cube_the_ray_hits() {
     let (_gpu, mut r) = device();
     let small: Vec<u32> = (2..=26).collect();
-    pick_agrees(&mut r, &small, Spacing::True, u32::MAX, 400, 100);
-    pick_agrees(&mut r, &small, Spacing::Packed, u32::MAX, 300, 100);
+    pick_agrees(&mut r, &small, Spacing::True, Shape::Regular, u32::MAX, 400, 100);
+    pick_agrees(&mut r, &small, Spacing::Packed, Shape::Regular, u32::MAX, 300, 100);
+    // the flush shapes shift every slice differently
+    pick_agrees(&mut r, &small, Spacing::True, Shape::CornerApex, u32::MAX, 400, 100);
+    pick_agrees(&mut r, &small, Spacing::True, Shape::FaceLeft, u32::MAX, 400, 100);
     // cubes s cells wide
-    let l = pick_agrees(&mut r, &(2..=120).collect::<Vec<_>>(), Spacing::True, 20_000, 300, 100);
+    let l = pick_agrees(&mut r, &(2..=120).collect::<Vec<_>>(), Spacing::True, Shape::Regular, 20_000, 300, 100);
     assert!(l.stride > 1, "stride {}", l.stride);
 }
 
 /// GPU picks against the CPU ray cast over a grid of pixels from four camera views.
-fn pick_agrees(r: &mut TetraRenderer, mods: &[u32], spacing: Spacing, budget: u32, min_hits: usize, min_misses: usize) -> Layout {
-    let (layout, mds) = scene(r, mods, spacing, budget);
+fn pick_agrees(r: &mut TetraRenderer, mods: &[u32], spacing: Spacing, shape: Shape, budget: u32, min_hits: usize, min_misses: usize) -> Layout {
+    let (layout, mds) = scene_shaped(r, mods, spacing, shape, budget);
     let (w, h) = (320u32, 240u32);
     r.ensure_target(w, h);
     let he = layout.half_extents();
@@ -125,8 +132,7 @@ fn pick_agrees(r: &mut TetraRenderer, mods: &[u32], spacing: Spacing, budget: u3
                     Some(hit) => {
                         // only rays well inside a face and well in front of the next cube
                         // decide anything: at an edge, rasterization may pick either cube
-                        let s = &layout.slices[hit.cube.slice as usize];
-                        let c = pascal::tetra::cell_center(s.height, hit.cube.n, hit.cube.k);
+                        let c = layout.center(hit.cube.slice as usize, hit.cube.n, hit.cube.k);
                         let p = [o[0] + d[0] * hit.t, o[1] + d[1] * hit.t, o[2] + d[2] * hit.t];
                         let mut sorted = (0..3).map(|a| he[a] - (p[a] - c[a]).abs()).collect::<Vec<_>>();
                         sorted.sort_by(f32::total_cmp);
@@ -141,8 +147,7 @@ fn pick_agrees(r: &mut TetraRenderer, mods: &[u32], spacing: Spacing, budget: u3
                     None => {
                         if let Some(g) = gpu {
                             // the GPU hit something the CPU missed: it must be a grazing ray
-                            let s = &layout.slices[g.slice as usize];
-                            let c = pascal::tetra::cell_center(s.height, g.n, g.k);
+                            let c = layout.center(g.slice as usize, g.n, g.k);
                             let grow = 0.05;
                             let lo = [c[0] - he[0] - grow, c[1] - he[1] - grow, c[2] - he[2] - grow];
                             let hi = [c[0] + he[0] + grow, c[1] + he[1] + grow, c[2] + he[2] + grow];
@@ -169,7 +174,7 @@ fn the_stack_draws_green_wire_and_lit_brush_cells() {
     let (w, h) = (400u32, 300u32);
     r.ensure_target(w, h);
     let cam = Camera::framing(layout.bounds());
-    let mut o = DrawOptions { camera: cam, hover: None, brush: 3.0, color_slice: false, ghosts: false, mask: false };
+    let mut o = DrawOptions { camera: cam, fill: f32::INFINITY, hover: None, brush: 3.0, color_slice: false, ghosts: false, mask: false };
     r.draw_blocking(&o);
     let (_, _, plain) = r.read_target_rgba();
     let bg = BACKGROUND.map(|c| (c * 255.0).round() as u8);
@@ -189,6 +194,35 @@ fn the_stack_draws_green_wire_and_lit_brush_cells() {
     let (_, _, lit) = r.read_target_rgba();
     let changed = (0..n).filter(|&i| px(&plain, i) != px(&lit, i)).count();
     assert!(changed > 30, "the brush changed {changed} pixels");
+    // filled: the palette colors replace the green wire, everywhere or from the top down
+    o.hover = None;
+    o.fill = f32::NEG_INFINITY;
+    r.draw_blocking(&o);
+    let (_, _, full) = r.read_target_rgba();
+    let colored = |img: &[u8], i: usize| {
+        let c = px(img, i);
+        c != bg && !(c[1] > c[0] + 20 && c[1] > c[2] + 10)
+    };
+    let all = (0..n).filter(|&i| colored(&full, i)).count();
+    assert!(all > n / 20, "filled pixels: {all}");
+    let top = layout.slices[0].height;
+    let bottom = layout.slices.last().unwrap().height;
+    o.fill = -(top + bottom) / 2.0;
+    r.draw_blocking(&o);
+    let (_, _, half) = r.read_target_rgba();
+    let part = (0..n).filter(|&i| colored(&half, i)).count();
+    assert!(part > 30 && part < all, "half filled: {part} of {all}");
+    // the filled half is the top: colored rows sit above the green ones on average
+    let mean_row = |img: &[u8], pick: &dyn Fn(&[u8], usize) -> bool| {
+        let v: Vec<usize> = (0..n).filter(|&i| pick(img, i)).map(|i| i / w as usize).collect();
+        v.iter().sum::<usize>() as f64 / v.len().max(1) as f64
+    };
+    let green_px = |img: &[u8], i: usize| {
+        let c = px(img, i);
+        c[1] > c[0] + 20 && c[1] > c[2] + 10
+    };
+    assert!(mean_row(&half, &colored) < mean_row(&half, &green_px), "the color runs from the top");
+    o.fill = f32::INFINITY;
     // ghosts add faint zeros: only brighter, never darker
     o.hover = None;
     o.ghosts = true;

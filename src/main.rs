@@ -966,7 +966,7 @@ impl App {
 
         self.frame_ms = t0.elapsed().as_secs_f32() * 1000.0;
         let delay = viewport_output.get(&egui::ViewportId::ROOT).map(|v| v.repaint_delay).unwrap_or(std::time::Duration::MAX);
-        self.continuous = delay.is_zero() || model.sweep.playing || self.tween_t0.is_some() || !self.canvas_current || model.offset_playing || (!model.tetra.open && model.wave.is_animating()) || gfx.tetra.pick_in_flight();
+        self.continuous = delay.is_zero() || model.sweep.playing || self.tween_t0.is_some() || !self.canvas_current || model.offset_playing || (!model.tetra.open && model.wave.is_animating()) || gfx.tetra.pick_in_flight() || model.tetra.filling();
         if self.continuous {
             gfx.window.request_redraw();
             self.repaint_at = None;
@@ -1144,8 +1144,8 @@ fn panel_ui(ui: &mut egui::Ui, model: &mut Model, canvas_px: (u32, u32), _frame_
             });
         });
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("drift").color(ui.visuals().weak_text_color()));
-            mono_drag(ui, &mut model.wave.config.drift, 0.0..=3.0, 0.01).on_hover_text("Phase drift φ′ in rad/s; 0 holds the phase");
+            ui.label(egui::RichText::new("scroll").color(ui.visuals().weak_text_color()));
+            mono_drag(ui, &mut model.wave.config.scroll, -3.0..=3.0, 0.01).on_hover_text("The wave slides sideways at this many rad/s of θ (negative: to the left); 0 holds it still");
             ui.label(egui::RichText::new("rad/s").color(ui.visuals().weak_text_color()));
             ui.checkbox(&mut model.wave.config.fill, "fill");
             if let Some(n) = model.pinned_row {
@@ -1842,7 +1842,7 @@ fn wave_overlay(ui: &mut egui::Ui, model: &mut Model, rect: Rect, ppp: f32, dt: 
         let yc = rect.min.y + ((y + h / 2.0) / ppp as f64) as f32;
         if (rect.min.y..=rect.max.y).contains(&yc) {
             let a = if model.pinned_row.is_some() { 0.95 } else { 0.55 };
-            let stroke = egui::Stroke::new(2.0, Color32::from_rgba_unmultiplied(0x4f, 0xc3, 0xf7, (a * fade * 255.0) as u8));
+            let stroke = egui::Stroke::new(2.0, Color32::from_rgba_unmultiplied(82, 242, 122, (a * fade * 255.0) as u8));
             painter.line_segment([Pos2::new(rect.min.x, yc), Pos2::new(rect.min.x + 10.0, yc)], stroke);
             painter.line_segment([Pos2::new(rect.max.x - 10.0, yc), Pos2::new(rect.max.x, yc)], stroke);
         }

@@ -27,7 +27,10 @@ struct Slice {
   factor_off: u32,    // factors[factor_off ..] (garner constants per slice)
   level_off: u32,     // residue → palette level bytes at levels[level_off + r] (draw pass)
   height: f32,        // y = −height
-  pad: u32,
+  ox: f32,            // the shape's shift of the slice in x and z (draw pass)
+  oz: f32,
+  pad0: u32,
+  pad1: u32,
 };
 
 @group(0) @binding(0) var<uniform> C: CellParams;

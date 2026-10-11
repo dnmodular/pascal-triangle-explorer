@@ -2,10 +2,14 @@
 //! slice per modulus. Slice m holds rows 0..m−1 of the triangle mod m, so slices grow
 //! linearly with m and the stack is a tetrahedron (mod 2, two rows, is the apex).
 //!
-//! Cell (m, n, k) sits at x = k − n/2, z = n·√3/2 (the 2D brick layout laid flat) and
-//! y = −height(m): the slice's height is m itself (TRUE spacing: skipped moduli leave
-//! gaps, the edges stay straight) or its index in the selection (PACKED: no gaps, the
-//! sides curve because slice size no longer tracks height).
+//! Cell (m, n, k) sits at x = k − n/2, z = n·√3/2 (the 2D brick layout laid flat),
+//! shifted by the slice's offset, and y = −height(m). A slice of side s = m − 1 sits
+//! s·√(2/3) below the apex, the height of a regular tetrahedron of edge s, so with the
+//! slices' centroids on one vertical axis the stack is equilateral ([`Shape::Regular`]).
+//! The other shapes anchor a corner or the middle of an edge instead, which makes one
+//! or two faces vertical (flush). With TRUE spacing the height follows m itself, so
+//! skipped moduli leave gaps and the edges stay straight; PACKED uses the slice's index,
+//! with no gaps, and the sides curve because slice size no longer tracks height.
 //!
 //! This module is the CPU side: which moduli are stacked, the level of detail that keeps
 //! the cube count in budget, the camera, and the reference ray cast the picking test
@@ -20,10 +24,73 @@ pub const TETRA_MAX_M: u32 = 4096;
 pub const SQRT3_2: f32 = 0.866_025_4;
 /// Cube half extents as a fraction of the cell pitch (a small gap between cubes).
 pub const CUBE_FILL: f32 = 0.45;
-/// Half height of a cube; slices are one unit apart at their closest.
-pub const CUBE_HALF_Y: f32 = 0.42;
+/// √(2/3): the height of a regular tetrahedron per unit of edge, so the vertical step
+/// from one modulus to the next.
+pub const LEVEL: f32 = 0.816_496_6;
+/// Half height of a cube; slices are LEVEL apart at their closest.
+pub const CUBE_HALF_Y: f32 = 0.45 * LEVEL;
 /// Cube-count budgets offered in the panel.
 pub const BUDGETS: [u32; 6] = [250_000, 500_000, 1_000_000, 2_000_000, 4_000_000, 8_000_000];
+
+/// How the slices line up: their centroids (a regular tetrahedron), one corner (two
+/// faces vertical, meeting in a vertical edge) or the middle of one edge (one face
+/// vertical). The corners and edges are those of the 2D triangle: the apex (row 0), the
+/// left and right ends of the last row; the back edge is the last row.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Hash)]
+pub enum Shape {
+    #[default]
+    Regular,
+    CornerApex,
+    CornerLeft,
+    CornerRight,
+    FaceBack,
+    FaceLeft,
+    FaceRight,
+}
+
+impl Shape {
+    pub const ALL: [Shape; 7] = [Shape::Regular, Shape::CornerApex, Shape::CornerLeft, Shape::CornerRight, Shape::FaceBack, Shape::FaceLeft, Shape::FaceRight];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Shape::Regular => "equilateral",
+            Shape::CornerApex => "flush corner: apex",
+            Shape::CornerLeft => "flush corner: left",
+            Shape::CornerRight => "flush corner: right",
+            Shape::FaceBack => "flush face: back",
+            Shape::FaceLeft => "flush face: left",
+            Shape::FaceRight => "flush face: right",
+        }
+    }
+
+    pub fn note(self) -> &'static str {
+        match self {
+            Shape::Regular => "A regular tetrahedron: every slice centred on one vertical axis, all four faces equilateral and equally tilted.",
+            Shape::CornerApex => "The row-0 corners of all slices on one vertical line: the left and right faces stand vertical and meet in a vertical edge.",
+            Shape::CornerLeft => "The left ends of the last rows on one vertical line: the left and back faces stand vertical.",
+            Shape::CornerRight => "The right ends of the last rows on one vertical line: the right and back faces stand vertical.",
+            Shape::FaceBack => "The middles of the last rows on one vertical line: the back face (the last rows) stands vertical.",
+            Shape::FaceLeft => "The middles of the left edges (k = 0) on one vertical line: the left face stands vertical.",
+            Shape::FaceRight => "The middles of the right edges (k = n) on one vertical line: the right face stands vertical.",
+        }
+    }
+
+    /// The (x, z) shift of a slice of side s = m − 1 (in the 2D layout its apex is at
+    /// the origin and its last row at z = s·√3/2): the anchored point moves to the axis.
+    pub fn offset(self, m: u32) -> (f32, f32) {
+        let s = m.saturating_sub(1) as f32;
+        let back = s * SQRT3_2;
+        match self {
+            Shape::Regular => (0.0, -back * 2.0 / 3.0),
+            Shape::CornerApex => (0.0, 0.0),
+            Shape::CornerLeft => (s / 2.0, -back),
+            Shape::CornerRight => (-s / 2.0, -back),
+            Shape::FaceBack => (0.0, -back),
+            Shape::FaceLeft => (s / 4.0, -back / 2.0),
+            Shape::FaceRight => (-s / 4.0, -back / 2.0),
+        }
+    }
+}
 
 /// How slices are spaced vertically.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -57,11 +124,12 @@ pub struct TetraConfig {
     /// odd, interval / sequences). Only the selection fields are used, not playback.
     pub sweep: Sweep,
     pub spacing: Spacing,
+    pub shape: Shape,
     /// Zero cells as faint ghost cubes.
     pub ghosts: bool,
-    /// Hover brush radius in cell units (0 = the hovered cube only).
+    /// Hover highlight radius in cell units (0 = the hovered cube only).
     pub brush: f32,
-    /// Color the whole hovered slice instead of a brush.
+    /// Highlight the whole hovered slice instead of a brush.
     pub color_slice: bool,
     /// Most cubes drawn; a larger selection gets a cell stride.
     pub budget: u32,
@@ -75,7 +143,7 @@ impl Default for TetraConfig {
     fn default() -> Self {
         let mut sweep = Sweep::default();
         sweep.end = 48;
-        TetraConfig { sweep, spacing: Spacing::True, ghosts: false, brush: 2.0, color_slice: false, budget: 1_000_000, spin: true, tile: true }
+        TetraConfig { sweep, spacing: Spacing::True, shape: Shape::Regular, ghosts: false, brush: 2.0, color_slice: false, budget: 1_000_000, spin: true, tile: true }
     }
 }
 
@@ -83,11 +151,11 @@ impl TetraConfig {
     /// What the stack's geometry depends on (the scene is rebuilt when it changes).
     pub fn scene_key(&self) -> SceneKey {
         let s = &self.sweep;
-        (s.mode, s.prime_order, s.seq, s.step, s.start, s.end, self.spacing, self.budget)
+        (s.mode, s.prime_order, s.seq, s.step, s.start, s.end, self.spacing, self.budget, self.shape)
     }
 }
 
-pub type SceneKey = (crate::sweep::ModMode, crate::sweep::PrimeOrder, crate::sweep::Seq, u32, u32, u32, Spacing, u32);
+pub type SceneKey = (crate::sweep::ModMode, crate::sweep::PrimeOrder, crate::sweep::Seq, u32, u32, u32, Spacing, u32, Shape);
 
 /// The moduli in `start..=end` (clamped to 2..=TETRA_MAX_M) that the selection mode
 /// visits, ascending.
@@ -136,8 +204,11 @@ pub fn stride_for(mods: &[u32], budget: u32) -> u32 {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Slice {
     pub m: u32,
-    /// Distance below the top of the stack (y = −height).
+    /// Distance below the apex (y = −height).
     pub height: f32,
+    /// The shape's (x, z) shift of the slice.
+    pub ox: f32,
+    pub oz: f32,
     /// Strided rows and cells.
     pub rows: u32,
     pub cells: u32,
@@ -150,6 +221,7 @@ pub struct Slice {
 pub struct Layout {
     pub slices: Vec<Slice>,
     pub spacing: Spacing,
+    pub shape: Shape,
     /// Every `stride`-th row and cell is drawn (1 = all).
     pub stride: u32,
     /// Cells in the enumeration (nonzero cubes + zeros).
@@ -160,20 +232,25 @@ pub struct Layout {
 
 impl Layout {
     pub fn new(mods: &[u32], spacing: Spacing, budget: u32) -> Layout {
+        Layout::with_shape(mods, spacing, Shape::Regular, budget)
+    }
+
+    pub fn with_shape(mods: &[u32], spacing: Spacing, shape: Shape, budget: u32) -> Layout {
         let stride = stride_for(mods, budget);
         let mut slices = Vec::with_capacity(mods.len());
         let mut base = 0u32;
         for (i, &m) in mods.iter().enumerate() {
             let cells = strided_cells(m, stride) as u32;
             let height = match spacing {
-                Spacing::True => m as f32,
-                Spacing::Packed => i as f32,
+                Spacing::True => true_height(m),
+                Spacing::Packed => i as f32 * LEVEL,
             };
-            slices.push(Slice { m, height, rows: strided_rows(m, stride), cells, cell_base: base });
+            let (ox, oz) = shape.offset(m);
+            slices.push(Slice { m, height, ox, oz, rows: strided_rows(m, stride), cells, cell_base: base });
             base += cells;
         }
         let full_total = mods.iter().map(|&m| strided_cells(m, 1)).sum();
-        Layout { slices, spacing, stride, total: base, full_total }
+        Layout { slices, spacing, shape, stride, total: base, full_total }
     }
 
     /// Cube half extents (x, y, z) in world units.
@@ -187,8 +264,7 @@ impl Layout {
         let mut lo = [f32::MAX; 3];
         let mut hi = [f32::MIN; 3];
         for s in &self.slices {
-            let n_last = ((s.rows - 1) * self.stride) as f32;
-            for p in [[0.0, -s.height, 0.0], [-n_last / 2.0, -s.height, n_last * SQRT3_2], [n_last / 2.0, -s.height, n_last * SQRT3_2]] {
+            for p in self.corners(s.m, s.height) {
                 for a in 0..3 {
                     lo[a] = lo[a].min(p[a]);
                     hi[a] = hi[a].max(p[a]);
@@ -228,7 +304,24 @@ impl Layout {
 
     /// Centre of cube (slice, n, k).
     pub fn center(&self, slice: usize, n: u32, k: u32) -> [f32; 3] {
-        cell_center(self.slices[slice].height, n, k)
+        let s = &self.slices[slice];
+        cell_center(s.height, s.ox, s.oz, n, k)
+    }
+
+    /// The height a modulus has (or would have, skipped) in this layout's spacing.
+    pub fn height_of(&self, m: u32) -> f32 {
+        match self.spacing {
+            Spacing::True => true_height(m),
+            Spacing::Packed => self.slice_of(m).map_or(0.0, |i| self.slices[i].height),
+        }
+    }
+
+    /// The centres of the corner cubes of a slice of modulus m at height h: the apex,
+    /// the left and the right end of its last (strided) row.
+    pub fn corners(&self, m: u32, h: f32) -> [[f32; 3]; 3] {
+        let n_last = (strided_rows(m, self.stride) - 1) * self.stride;
+        let (ox, oz) = self.shape.offset(m);
+        [cell_center(h, ox, oz, 0, 0), cell_center(h, ox, oz, n_last, 0), cell_center(h, ox, oz, n_last, n_last)]
     }
 
     /// The moduli between the first and last slice that the selection skips (drawn as
@@ -249,20 +342,24 @@ impl Layout {
         self.slices.windows(2).filter(|w| w[1].m - w[0].m > 1).map(|w| (w[0].m, w[1].m)).collect()
     }
 
-    /// The outline of a slice of modulus m at height h: the triangle around its cubes.
+    /// The outline of a slice of modulus m at height h: the triangle around its cubes,
+    /// its edges pushed out past the cubes.
     pub fn outline(&self, m: u32, h: f32) -> [[f32; 3]; 3] {
-        let n_last = ((strided_rows(m, self.stride) - 1) * self.stride) as f32;
-        let e = self.half_extents();
-        let pad = e[0] + 0.25;
-        let y = -h;
-        let zl = n_last * SQRT3_2 + e[2] + 0.25;
-        [[0.0, y, -e[2] - 0.6], [-n_last / 2.0 - pad - 0.4, y, zl], [n_last / 2.0 + pad + 0.4, y, zl]]
+        let [a, l, r] = self.corners(m, h);
+        // an edge moves out by d when the corners move 2d away from the centroid
+        let d = 2.0 * (self.half_extents()[0] + 0.3);
+        [add(a, [0.0, 0.0, -d]), add(l, [-d * SQRT3_2, 0.0, d * 0.5]), add(r, [d * SQRT3_2, 0.0, d * 0.5])]
     }
 }
 
-/// Centre of cell (n, k) of a slice at height h.
-pub fn cell_center(h: f32, n: u32, k: u32) -> [f32; 3] {
-    [k as f32 - n as f32 / 2.0, -h, n as f32 * SQRT3_2]
+/// The height of modulus m in true spacing: s·√(2/3) for side s = m − 1.
+pub fn true_height(m: u32) -> f32 {
+    m.saturating_sub(1) as f32 * LEVEL
+}
+
+/// Centre of cell (n, k) of a slice at height h shifted by (ox, oz).
+pub fn cell_center(h: f32, ox: f32, oz: f32, n: u32, k: u32) -> [f32; 3] {
+    [k as f32 - n as f32 / 2.0 + ox, -h, n as f32 * SQRT3_2 + oz]
 }
 
 /// Packed instance words, as the compute pass writes them and the pick pass returns them:
@@ -501,7 +598,7 @@ pub fn ray_cast(layout: &Layout, mods: &[Modulus], o: [f32; 3], d: [f32; 3]) -> 
             let n = i * layout.stride;
             for j in 0..=i {
                 let k = j * layout.stride;
-                let c = cell_center(s.height, n, k);
+                let c = cell_center(s.height, s.ox, s.oz, n, k);
                 let Some(t) = ray_box(o, d, sub(c, he), add(c, he)) else { continue };
                 let r = md.binom(n, k);
                 if r == 0 {
@@ -550,12 +647,55 @@ mod tests {
     #[test]
     fn true_spacing_leaves_prime_gaps() {
         let l = Layout::new(&[2, 3, 5, 7, 11], Spacing::True, u32::MAX);
-        assert_eq!(l.slices.iter().map(|s| s.height).collect::<Vec<_>>(), vec![2.0, 3.0, 5.0, 7.0, 11.0]);
+        let h = |l: &Layout| l.slices.iter().map(|s| s.height / LEVEL).map(|x| (x * 1000.0).round() / 1000.0).collect::<Vec<_>>();
+        assert_eq!(h(&l), vec![1.0, 2.0, 4.0, 6.0, 10.0]);
         assert_eq!(l.gaps(), vec![(3, 5), (5, 7), (7, 11)]);
         assert_eq!(l.missing(), vec![4, 6, 8, 9, 10]);
         let p = Layout::new(&[2, 3, 5, 7, 11], Spacing::Packed, u32::MAX);
-        assert_eq!(p.slices.iter().map(|s| s.height).collect::<Vec<_>>(), vec![0.0, 1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(h(&p), vec![0.0, 1.0, 2.0, 3.0, 4.0]);
         assert!(p.gaps().is_empty() && p.missing().is_empty());
+    }
+
+    #[test]
+    fn the_equilateral_stack_is_a_regular_tetrahedron() {
+        let mods: Vec<u32> = (2..=60).collect();
+        let l = Layout::with_shape(&mods, Spacing::True, Shape::Regular, u32::MAX);
+        // the apex (side 0, m = 1) is the origin; the base is the last slice's corners
+        let base = l.corners(60, l.slices.last().unwrap().height);
+        let apex = [0.0f32, -true_height(1), 0.0];
+        let len = |a: [f32; 3], b: [f32; 3]| dot(sub(a, b), sub(a, b)).sqrt();
+        let edges = [len(apex, base[0]), len(apex, base[1]), len(apex, base[2]), len(base[0], base[1]), len(base[1], base[2]), len(base[2], base[0])];
+        for e in edges {
+            assert!((e - 59.0).abs() < 1e-3, "edges {edges:?}");
+        }
+        // every slice's centroid on the vertical axis
+        for sl in &l.slices {
+            let c = l.corners(sl.m, sl.height);
+            let cx = (c[0][0] + c[1][0] + c[2][0]) / 3.0;
+            let cz = (c[0][2] + c[1][2] + c[2][2]) / 3.0;
+            assert!(cx.abs() < 1e-3 && cz.abs() < 1e-3, "m {}: centroid ({cx}, {cz})", sl.m);
+        }
+    }
+
+    #[test]
+    fn flush_shapes_stand_their_faces_vertical() {
+        let mods: Vec<u32> = (2..=40).collect();
+        // which corners stay on the vertical axis through the stack
+        let on_axis = |shape: Shape, pick: &dyn Fn([[f32; 3]; 3]) -> [f32; 3]| {
+            let l = Layout::with_shape(&mods, Spacing::True, shape, u32::MAX);
+            l.slices.iter().all(|s| {
+                let p = pick(l.corners(s.m, s.height));
+                p[0].abs() < 1e-3 && p[2].abs() < 1e-3
+            })
+        };
+        let mid = |a: [f32; 3], b: [f32; 3]| scale(add(a, b), 0.5);
+        assert!(on_axis(Shape::CornerApex, &|c| c[0]));
+        assert!(on_axis(Shape::CornerLeft, &|c| c[1]));
+        assert!(on_axis(Shape::CornerRight, &|c| c[2]));
+        assert!(on_axis(Shape::FaceBack, &|c| mid(c[1], c[2])));
+        assert!(on_axis(Shape::FaceLeft, &|c| mid(c[0], c[1])));
+        assert!(on_axis(Shape::FaceRight, &|c| mid(c[0], c[2])));
+        assert!(!on_axis(Shape::Regular, &|c| c[0]));
     }
 
     #[test]

@@ -57,7 +57,10 @@ pub struct GpuSlice {
     pub factor_off: u32,
     pub level_off: u32,
     pub height: f32,
-    pub pad: u32,
+    pub ox: f32,
+    pub oz: f32,
+    pub pad0: u32,
+    pub pad1: u32,
 }
 
 #[repr(C)]
@@ -71,6 +74,7 @@ struct DrawParams {
     flags: u32,
     line_px: f32,
     ghost_alpha: f32,
+    fill: [f32; 4],
 }
 
 const FLAG_SLICE: u32 = 1;
@@ -137,7 +141,7 @@ impl SceneData {
                     pad1: 0,
                 });
             }
-            slices.push(GpuSlice { m: s.m, rows: s.rows, cell_base: s.cell_base, nfactors: md.factors.len() as u32, factor_off, level_off, height: s.height, pad: 0 });
+            slices.push(GpuSlice { m: s.m, rows: s.rows, cell_base: s.cell_base, nfactors: md.factors.len() as u32, factor_off, level_off, height: s.height, ox: s.ox, oz: s.oz, pad0: 0, pad1: 0 });
             level_off += s.m;
         }
         if tables.is_empty() {
@@ -184,7 +188,10 @@ pub fn color_words(layout: &Layout, palette: &Palette, offset: f32) -> Vec<u32> 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DrawOptions {
     pub camera: Camera,
-    /// The hovered cube, colored with its brush (or its slice).
+    /// Cubes whose centre is at or above this height (world y) are filled in their
+    /// palette color, the rest are wire: `f32::NEG_INFINITY` fills all.
+    pub fill: f32,
+    /// The hovered cube, highlighted with its brush (or its slice).
     pub hover: Option<CubeId>,
     pub brush: f32,
     pub color_slice: bool,
@@ -526,7 +533,7 @@ impl TetraRenderer {
             flags |= FLAG_GHOST;
         }
         let brush = o.brush.max(0.0) * s.layout.stride as f32;
-        DrawParams { view_proj, hover, half: [he[0], he[1], he[2], brush], wire: if ghost { [0.55, 0.75, 0.6, 1.0] } else { WIRE }, hover_slice, flags, line_px: 0.75, ghost_alpha: 0.07 }
+        DrawParams { view_proj, hover, half: [he[0], he[1], he[2], brush], wire: if ghost { [0.55, 0.75, 0.6, 1.0] } else { WIRE }, hover_slice, flags, line_px: 0.75, ghost_alpha: 0.07, fill: [o.fill.clamp(-1e30, 1e30), 0.0, 0.0, 0.0] }
     }
 
     /// Draw the stack into the target: the cubes, the outlines, then the ghosts.
@@ -589,7 +596,7 @@ impl TetraRenderer {
             return false;
         }
         let (Some(t), Some(s)) = (&self.target, &self.scene) else { return false };
-        let o = DrawOptions { camera: *camera, hover: None, brush: 0.0, color_slice: false, ghosts: false, mask: false };
+        let o = DrawOptions { camera: *camera, fill: f32::INFINITY, hover: None, brush: 0.0, color_slice: false, ghosts: false, mask: false };
         let p = self.params(&o, camera.pick_view_proj(t.w, t.h, px, py), false);
         self.queue.write_buffer(&self.pick_ubuf, 0, bytemuck::bytes_of(&p));
         {

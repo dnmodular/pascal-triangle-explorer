@@ -8,9 +8,11 @@
 // faces, measured in pixels with fwidth. Fragments away from the edges are
 // discarded, so the solid reads as a wireframe and its zero tunnels show.
 //
-// Cubes inside the hover brush (or the hovered slice) are filled instead, in
-// their palette color: the slice's residue → level table, its color-offset
-// map, then the palette's residue colors, as in the 2D view.
+// Cubes at or above the fill height are filled instead, in their palette color:
+// the slice's residue → level table, its color-offset map, then the palette's
+// residue colors, as in the 2D view. The 3D space fills everything; the preview
+// tile fills from the top down while it is hovered. Cubes inside the hover
+// brush (or the hovered slice) are highlighted.
 //
 //   cube_vs / cube_fs   the cubes (wire, or filled under the brush); the ghost
 //                       pass draws the zeros with the same shaders (flag bit 2)
@@ -27,6 +29,7 @@ struct DrawParams {
   flags: u32,           // bit 0 whole slice, bit 1 mask lens, bit 2 ghost pass
   line_px: f32,         // wire half width in px
   ghost_alpha: f32,
+  fill: vec4<f32>,      // x: cubes whose centre is at or above this height are filled in color
 };
 
 struct Slice {
@@ -37,7 +40,10 @@ struct Slice {
   factor_off: u32,
   level_off: u32,
   height: f32,
-  pad: u32,
+  ox: f32,
+  oz: f32,
+  pad0: u32,
+  pad1: u32,
 };
 
 @group(0) @binding(0) var<uniform> D: DrawParams;
@@ -59,7 +65,7 @@ fn unpack_rgb(c: u32) -> vec3<f32> {
 fn cube_center(c: vec2<u32>, s: Slice) -> vec3<f32> {
   let n = f32(c.x & 0xffffu);
   let k = f32(c.x >> 16u);
-  return vec3<f32>(k - 0.5 * n, -s.height, n * SQRT3_2);
+  return vec3<f32>(k - 0.5 * n + s.ox, -s.height, n * SQRT3_2 + s.oz);
 }
 
 fn corner_of(vi: u32) -> vec3<f32> {
@@ -83,7 +89,7 @@ struct CubeOut {
   @location(0) local: vec3<f32>,
   @location(1) color: vec3<f32>,
   @location(2) world: vec3<f32>,
-  @location(3) @interpolate(flat) lit: u32,
+  @location(3) @interpolate(flat) lit: u32,   // 0 wire, 1 filled, 2 filled and highlighted
 };
 
 @vertex
@@ -107,9 +113,10 @@ fn cube_vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> 
   out.pos = D.view_proj * vec4<f32>(world, 1.0);
   out.local = corner;
   out.world = world;
-  out.lit = select(0u, 1u, lit);
+  let filled = center.y >= D.fill.x || lit;
+  out.lit = select(select(0u, 1u, filled), 2u, lit);
   out.color = D.wire.rgb;
-  if (lit && (D.flags & FLAG_GHOST) == 0u) {
+  if (filled && (D.flags & FLAG_GHOST) == 0u) {
     out.color = residue_rgb(si, s, c.y >> 16u);
   }
   return out;
@@ -128,16 +135,22 @@ fn cube_fs(in: CubeOut) -> @location(0) vec4<f32> {
   let ink = 1.0 - smoothstep(D.line_px - 0.5, D.line_px + 0.5, edge);
 
   if ((D.flags & FLAG_GHOST) != 0u) {
-    let a = ink * D.ghost_alpha * select(1.0, 3.0, in.lit == 1u);
+    let a = ink * D.ghost_alpha * select(1.0, 3.0, in.lit == 2u);
     if (a < 0.004) { discard; }
     return vec4<f32>(in.color * a, a);       // premultiplied, added
   }
-  if (in.lit == 1u) {
-    // filled: flat shading from the face normal, with darker edges
+  if (in.lit >= 1u) {
+    // filled: flat shading from the face normal, with darker edges; highlighted
+    // cubes (the hover brush) lighten and get bright edges
     let l = normalize(vec3<f32>(0.35, 0.85, -0.4));
     let shade = 0.55 + 0.45 * abs(dot(n, l));
-    let col = in.color * shade;
-    return vec4<f32>(mix(col, col * 0.35, ink * 0.8), 1.0);
+    var col = in.color * shade;
+    var edge_col = col * 0.35;
+    if (in.lit == 2u) {
+      col = mix(col, vec3<f32>(1.0), 0.3);
+      edge_col = vec3<f32>(1.0);
+    }
+    return vec4<f32>(mix(col, edge_col, ink * 0.8), 1.0);
   }
   // wire: thin cubes far away merge into a translucent glow instead of a solid wall
   let a = ink * D.wire.a * clamp(cube_px / 10.0, 0.35, 1.0);

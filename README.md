@@ -175,18 +175,18 @@ reconstruction does not contain, so there was nothing to port.
 ## Modular wave
 
 A translucent square in a corner of the canvas (top right by default; the View
-section of the panel moves it, sets the drift, turns the fill off) plays one row
-of the triangle as a wave:
+section of the panel moves it, sets the scroll, turns the fill off) plays one row
+of the triangle as a green wave, the tetra stack's wire color:
 
 ```
-r_k = C(n, k) mod m        w(θ) = Σ_k r_k · cos((n − 2k)·θ + φ(t)),   θ ∈ [−π, π]
+r_k = C(n, k) mod m        w(θ) = Σ_k r_k · cos((n − 2k)·(θ − s(t))),   θ ∈ [−π, π]
 ```
 
 The row is the pinned one if any, else the row under the pointer, else the last
 visible row; small ticks at the canvas edges mark it. **Select cells** (next to
 "smooth") plays a block of cells instead: click a start cell (red mark), then an end
 cell (blue mark); the overlay plays the average of every cell in the rectangle
-between them, (1/N) Σ r_{n,k} cos((n − 2k)θ + φ), binned by frequency like a row.
+between them, (1/N) Σ r_{n,k} cos((n − 2k)(θ − s)), binned by frequency like a row.
 It is exact for any selection Pascal's rule can step through in about 24 million
 additions — rows up to 2048 directly, deeper ones from their first row (closed form)
 down the selection's light cone. Larger selections are summed in 16 exact bands of
@@ -202,12 +202,15 @@ row or modulus only the target coefficients are rebuilt; the displayed ones ease
 toward them (α = 1 − e^(−dt/0.12 s), from the real frame time), so the wave
 morphs instead of snapping.
 
-A whole row is symmetric (r_k = r_{n−k}), so w(θ) = cos φ · Σ r_k cos((n − 2k)θ):
-the phase drift (0.3 rad/s by default, 0 holds it) makes the wave breathe —
-swell, flatten, invert — rather than travel. The plot is normalized by a smoothed
-running max of |w| taken over the phase as well, i.e. the envelope
-max_θ |Σ r_k e^{i(n−2k)θ}|, which does not move with φ: the breathing stays
-visible and the peaks never clip.
+The scroll s(t) slides the whole wave sideways at a steady speed (0.3 rad/s of θ by
+default; negative moves left, 0 holds it), wrapping every 2π, the common period of
+the integer frequencies. Its shape never changes. It replaces the earlier phase
+drift cos(fθ + φ), which made a whole row, being symmetric, swell, flatten and
+invert in place. Each term is turned by e^{−ifs} (f·s reduced mod 2π in f64) before
+the frequency folding, so sub-sample shifts stay exact at any row. The plot is
+normalized by a smoothed running max of the envelope max_θ |Σ r_k e^{i(n−2k)θ}| ≥
+|w|, so the peaks never clip, and a whole row fills the box however far it has
+scrolled.
 
 * Rows up to 2048 are built with Pascal's rule mod m in `u64` (any m), stepping
   forward or backward from the cached row. Longer rows use the same closed form
@@ -235,36 +238,51 @@ A 3D view of many moduli at once. Each selected modulus m becomes one horizontal
 slice, rows 0..m−1 of the triangle mod m. Slices stack downward in order of m, so
 slice size grows with m and the solid is a tetrahedron, with mod 2 (two rows) as the
 apex. Cell (m, n, k) is a cube at x = k − n/2, z = n·√3/2 (the 2D brick layout laid
-flat) and y = −height. Zero cells get no cube, so the voids run through the solid as
-tunnels.
+flat), shifted by its slice's offset, and y = −height. Zero cells get no cube, so the
+voids run through the solid as tunnels.
+
+* **Shape.** A slice of side s = m − 1 sits s·√(2/3) below the apex: the height of a
+  regular tetrahedron of edge s. The default, **equilateral**, centres every slice on
+  one vertical axis, so the stack is a regular tetrahedron: four equilateral faces,
+  all equally tilted. The flush variants anchor something else on the axis:
+  * a **corner** (apex, left or right end of the last row): the two faces that meet
+    there stand vertical, along a vertical edge. The apex corner is the first
+    version's right-angled shape.
+  * the **middle of an edge** (back = the last rows, left = k = 0, right = k = n):
+    that one face stands vertical.
 
 * **Entry and exit.** A live preview tile sits in a bottom corner of the 2D canvas,
   in the wave box's style (the corner the wave doesn't use). It turns slowly at about
-  30 frames a second. Click it, or **Open 3D view** in the panel, for the isolated
+  30 frames a second, as a green wireframe. Hover it and the palette colors run down
+  it from the apex to the base in about a third of a second (ease-out, so it snaps
+  in), and back up when the pointer leaves. Click it, or **Open 3D view** in the panel, for the isolated
   space: the stack, a HUD and a thumbnail of the 2D view, nothing else. Click the
   thumbnail or press **Esc** to return with all 2D state intact. The 2D canvas keeps
   rendering while you are away if the sweep plays, so the thumbnail stays live.
 * **Navigation.** Drag to orbit, right-, middle- or shift-drag to pan, wheel or pinch
   to zoom, double-click to reset the camera. **G** toggles the spacing.
-* **Look.** Green wireframe on near-black. The edges are drawn in the fragment
-  shader: on a cube face the distance to the nearest edge is the middle of the three
-  face distances, measured in pixels with `fwidth`. Fragments away from the edges are
-  discarded. Faint green triangles outline every slice. *Ghost zeros* draws the zero
-  cells as faint additive cubes that glow through the wire, which shows the tunnels.
+* **Look.** In the 3D space every cube is filled in its palette color, through the
+  same residue → level table, color offset and palette as the 2D view, with flat
+  shading and darker edges. The tile's wire is green on near-black: its edges are
+  drawn in the fragment shader (on a cube face the distance to the nearest edge is the
+  middle of the three face distances, measured in pixels with `fwidth`, and
+  fragments away from the edges are discarded). The fill is a height in the
+  uniforms: cubes whose centre lies at or above it are filled, the rest are wire.
+  Faint green triangles outline every slice. *Ghost zeros* draws the zero cells as
+  faint additive cubes that glow through the solid, which shows the tunnels.
 * **Hover.** An ID pass renders the nonzero cubes into a 1 × 1 `Rg32Uint` target
   through a projection that maps the pointer's pixel onto it. It returns the
   frontmost cube's packed (n, k, slice, residue) words, read back asynchronously.
-  Cubes within the brush radius of that cube (or, with *whole slice*, the hovered
-  slice) are filled in their palette color, through the same residue → level table,
-  color offset and palette as the 2D view. The zero / nonzero mask lens shows them in
-  white; other layer setups fall back to residue coloring, and the HUD says so. The
-  HUD shows m and its factorization, n, k and the residue.
+  Cubes within the highlight radius of that cube (or, with *whole slice*, the
+  hovered slice) light up, with white edges. The zero / nonzero mask lens colors the
+  cubes white; other layer setups fall back to residue coloring, and the HUD says
+  so. The HUD shows the shape, m and its factorization, n, k and the residue.
 * **Selection.** A start / end range (2–4096) and the sweep's selection modes: all,
   primes (with their orderings), composites, even, odd, and the interval sequences.
-* **Spacing.** *True* (default): slice height = m. Skipped moduli leave gaps,
+* **Spacing.** *True* (default): slice height follows m. Skipped moduli leave gaps,
   each drawn as a faint dashed outline, and the gap between two slices is labeled
   ("+4" between 7 and 11), so prime gaps read as spacing. The tetrahedron's edges stay
-  straight. *Packed*: slice height = slice index, no gaps. The HUD notes that the sides
+  straight. *Packed*: slice height follows the slice index, no gaps. The HUD notes that the sides
   now curve, because slice size no longer tracks height.
 * **Level of detail.** The stack has about M³/6 cells. A cube budget (250K–8M,
   default 1M) picks the smallest cell stride s that fits: every s-th row and cell
@@ -453,7 +471,8 @@ Verified (by `cargo test` on Mesa lavapipe, and by the headless export):
   the cap, zero-sized and resized viewports and NaN/negative frame times stay
   finite; long-row morphs move at most a quarter of full scale per frame (the
   older selection jumped 0.85), ties keep ±f pairs, the normalized peaks stay
-  within ±1 through a full drift cycle, and tiny canvases draw nothing. Under
+  at 1 through a full scroll cycle (no breathing; within the grid's 0.2 %), and tiny
+  canvases draw nothing. Under
   Xvfb: hover, a modulus step and a row change morph, **W** fades out and in,
   pinning, corners (the inspector moves out of the box's way), resizes, deep rows
   with their k window.
@@ -464,18 +483,22 @@ Verified (by `cargo test` on Mesa lavapipe, and by the headless export):
   and the top edge inside row 30 — and vanish on 2 px cells; the SVG export's colors
   equal the GPU's for the residue, mask and valuation colorings on a fitted m = 3
   view whose rows past the export raise the max ν.
-* The app is idle when nothing moves (with the wave's drift at 0), and a redraw
+* The app is idle when nothing moves (with the wave's scroll at 0), and a redraw
   that changes no GPU input skips the triangle's passes; after a tween the canvas
   equals a fresh render pixel for pixel. The on-screen canvas equals the exported
   PNG byte for byte (checked under Xvfb with AFTERIMAGE on), and Save PNG leaves
   the screen unchanged.
-* Tetra stack: every cube's residue equals the additive rule for moduli 2–64, the
+* Tetra stack: the equilateral stack's edges are all equal (a regular tetrahedron),
+  every slice's centroid is on the axis, and each flush shape keeps its corner or
+  edge midpoint on the axis. Every cube's residue equals the additive rule for moduli 2–64, the
   prime / composite / Fibonacci / square selections, a strided 2–300 and the deep
   slices 2048, 2310, 3125, 3600, 4093, 4095 and 4096; every strided cell is written
   exactly once. The GPU pick equals the CPU ray cast on every decisive test ray
-  across four camera views (rays inside a face, clear of the next cube), and every
-  GPU hit on a CPU miss is a grazing ray. The wire, the brush and the ghosts change
-  the image as they should. Under Xvfb: the tile, opening, hover with the HUD and
+  across four camera views, for the equilateral (true and packed spacing, and
+  strided), apex-corner and left-face shapes (rays inside a face, clear of the next cube), and every
+  GPU hit on a CPU miss is a grazing ray. The wire, the highlight and the ghosts change
+  the image as they should, a full fill colors the stack, and a half fill colors its
+  top half. Under Xvfb: the tile, opening, hover with the HUD and
   brush, orbit, zoom, pan, **G**, a strided 2–400 stack and **Esc** back.
 
 Not verified here: behavior on a real GPU and display (only the software Vulkan

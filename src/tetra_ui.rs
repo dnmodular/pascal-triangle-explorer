@@ -6,7 +6,7 @@ use pascal::layers::Preset;
 use pascal::math::Modulus;
 use pascal::palette::Scheme;
 use pascal::sweep::{ModMode, PrimeOrder, Seq};
-use pascal::tetra::{describe, selected_moduli, stride_for, Camera, CubeId, Layout, SceneKey, Spacing, TetraConfig, BUDGETS, TETRA_MAX_M};
+use pascal::tetra::{describe, selected_moduli, stride_for, Shape, Camera, CubeId, Layout, SceneKey, Spacing, TetraConfig, BUDGETS, TETRA_MAX_M};
 use pascal::tetra_gpu::{outline_vertices, DrawOptions, TetraRenderer, BACKGROUND};
 use pascal::wave_overlay::Corner;
 
@@ -14,6 +14,8 @@ use super::{group, mono_drag, mono_drag_with, mono_line, note, Model};
 
 /// Preview spin, rad/s.
 const SPIN: f32 = 0.35;
+/// Seconds for the tile's color to run from the apex to the base (and back).
+const FILL_TIME: f32 = 0.35;
 
 /// The tetra stack's state besides its settings.
 #[derive(Default)]
@@ -34,6 +36,9 @@ pub struct TetraView {
     /// Target size wanted this frame (px), and where the tile was drawn.
     pub target_px: (u32, u32),
     pub tile_rect: Option<Rect>,
+    /// The pointer is over the tile; how far its color has run down (0 wire, 1 all).
+    pub tile_hot: bool,
+    fill: f32,
     /// Pointer and camera of the last pick, so an unchanged view is not picked again.
     last_pick: Option<((f32, f32), Camera)>,
     focus_last_frame: bool,
@@ -82,6 +87,32 @@ impl TetraView {
         if !self.open && self.config.spin && self.visible() {
             self.spin = (self.spin + dt * SPIN) % std::f32::consts::TAU;
         }
+        let want = if self.tile_hot && !self.open { 1.0 } else { 0.0 };
+        let step = dt.max(0.0) / FILL_TIME;
+        self.fill = if want > self.fill { (self.fill + step).min(1.0) } else { (self.fill - step).max(0.0) };
+    }
+
+    /// The tile's color is running down or back up.
+    pub fn filling(&self) -> bool {
+        let want = if self.tile_hot && !self.open { 1.0 } else { 0.0 };
+        self.visible() && self.fill != want
+    }
+
+    /// The fill height of the next draw: everything in the 3D space; in the tile, from
+    /// the apex down as far as the hover has run (an ease-out, so it snaps in).
+    fn fill_height(&self) -> f32 {
+        if self.open {
+            return f32::NEG_INFINITY;
+        }
+        let Some(l) = &self.layout else { return f32::INFINITY };
+        let (Some(first), Some(last)) = (l.slices.first(), l.slices.last()) else { return f32::INFINITY };
+        if self.fill <= 0.0 {
+            return f32::INFINITY;
+        }
+        let top = -first.height + 1.0;
+        let bottom = -last.height - 1.0;
+        let e = 1.0 - (1.0 - self.fill).powi(3);
+        top - e * (top - bottom)
     }
 
     /// The preview is turning: the app repaints it a few dozen times a second.
@@ -104,12 +135,12 @@ pub fn render(model: &mut Model, cache: &mut TetraCache, r: &mut TetraRenderer, 
     // (no layout: the model was reset to a config the cache still holds)
     if (cache.scene != Some(key) && !dragging) || t.layout.is_none() {
         let mods = selected_moduli(&t.config.sweep);
-        let layout = Layout::new(&mods, t.config.spacing, t.config.budget);
+        let layout = Layout::with_shape(&mods, t.config.spacing, t.config.shape, t.config.budget);
         let mds: Vec<Modulus> = mods.iter().map(|&m| Modulus::new(m)).collect();
         r.set_scene(&layout, &mds, &model.palette, model.style.offset);
         r.set_lines(&outline_vertices(&layout));
         t.counts = r.read_counts();
-        // a new range is framed anew; a new spacing or level of detail keeps the view
+        // a new range is framed anew; a new spacing, shape or level of detail keeps the view
         let reframe = cache.scene.is_none_or(|k| (k.0, k.1, k.2, k.3, k.4, k.5) != (key.0, key.1, key.2, key.3, key.4, key.5));
         if reframe {
             t.camera = None;
@@ -144,7 +175,7 @@ pub fn render(model: &mut Model, cache: &mut TetraCache, r: &mut TetraRenderer, 
     }
     let mask = model.layers.preset() == Some(Preset::Mask);
     let hover = if t.open { t.hover } else { None };
-    let opts = DrawOptions { camera, hover, brush: t.config.brush, color_slice: t.config.color_slice, ghosts: t.config.ghosts, mask };
+    let opts = DrawOptions { camera, fill: t.fill_height(), hover, brush: t.config.brush, color_slice: t.config.color_slice, ghosts: t.config.ghosts, mask };
     // an unchanged picture is not drawn again (hover, egui repaints)
     let drawn = (opts, t.target_px);
     if recreated || cache.drawn != Some(drawn) {
@@ -210,14 +241,22 @@ pub fn panel(ui: &mut egui::Ui, model: &mut Model) {
         }
     });
     ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("shape").color(ui.visuals().weak_text_color()));
+        egui::ComboBox::from_id_salt("tetra shape").width(150.0).selected_text(c.shape.label()).show_ui(ui, |ui| {
+            for sh in Shape::ALL {
+                ui.selectable_value(&mut c.shape, sh, sh.label()).on_hover_text(sh.note());
+            }
+        }).response.on_hover_text(c.shape.note());
+    });
+    ui.horizontal(|ui| {
         ui.label(egui::RichText::new("spacing").color(ui.visuals().weak_text_color()));
         ui.selectable_value(&mut c.spacing, Spacing::True, "true").on_hover_text("Slice height = m: skipped moduli leave gaps (dashed, with the gap size) and the edges stay straight (G)");
         ui.selectable_value(&mut c.spacing, Spacing::Packed, "packed").on_hover_text("Slice height = its index: no gaps, but the sides curve because slice size no longer tracks height (G)");
     });
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("brush").color(ui.visuals().weak_text_color()));
-        ui.add_enabled_ui(!c.color_slice, |ui| mono_drag(ui, &mut c.brush, 0.0..=64.0, 0.05).on_hover_text("Cells within this many cells of the hovered cube show their palette color"));
-        ui.checkbox(&mut c.color_slice, "whole slice").on_hover_text("Color the whole hovered slice instead of a brush");
+        ui.label(egui::RichText::new("highlight").color(ui.visuals().weak_text_color()));
+        ui.add_enabled_ui(!c.color_slice, |ui| mono_drag(ui, &mut c.brush, 0.0..=64.0, 0.05).on_hover_text("In the 3D space, cubes within this many cells of the hovered cube light up"));
+        ui.checkbox(&mut c.color_slice, "whole slice").on_hover_text("Light up the whole hovered slice instead");
     });
     ui.horizontal(|ui| {
         ui.checkbox(&mut c.ghosts, "ghost zeros").on_hover_text("Zero cells as faint ghost cubes: the tunnels glow through the wire");
@@ -266,6 +305,7 @@ fn tile_rect(model: &Model, rect: Rect) -> Rect {
 pub fn tile(ui: &mut egui::Ui, model: &mut Model, rect: Rect, ppp: f32, tex: Option<egui::TextureId>) {
     if !model.tetra.config.tile || rect.width() < 300.0 || rect.height() < 240.0 {
         model.tetra.tile_rect = None;
+        model.tetra.tile_hot = false;
         return;
     }
     let b = tile_rect(model, rect);
@@ -275,6 +315,7 @@ pub fn tile(ui: &mut egui::Ui, model: &mut Model, rect: Rect, ppp: f32, tex: Opt
     let resp = ui.interact(b, ui.id().with("tetra tile"), Sense::click()).on_hover_text("Open the tetra stack in its own 3D space");
     let painter = ui.painter_at(rect);
     let hot = resp.hovered();
+    model.tetra.tile_hot = hot;
     painter.rect_filled(b, CornerRadius::same(8), Color32::from_rgba_unmultiplied(0, 0, 0, 158));
     if let Some(id) = tex {
         painter.image(id, img, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
@@ -375,7 +416,9 @@ pub fn space(ui: &mut egui::Ui, model: &mut Model, ppp: f32, tex: Option<egui::T
             let mut last_y = f32::NEG_INFINITY;
             let mut drawn = 0;
             for (a, b) in l.gaps() {
-                let mid = [0.0, -((a + b) as f32) / 2.0, 0.0];
+                // between the two slices' apex corners
+                let (pa, pb) = (l.corners(a, l.height_of(a))[0], l.corners(b, l.height_of(b))[0]);
+                let mid = [(pa[0] + pb[0]) / 2.0, (pa[1] + pb[1]) / 2.0, (pa[2] + pb[2]) / 2.0];
                 let Some((x, y)) = cam.project(w, h, mid) else { continue };
                 let p = Pos2::new(rect.min.x + x / ppp, rect.min.y + y / ppp);
                 if !rect.contains(p) || (p.y - last_y).abs() < 12.0 || drawn > 400 {
@@ -400,8 +443,9 @@ pub fn space(ui: &mut egui::Ui, model: &mut Model, ppp: f32, tex: Option<egui::T
                 }
                 _ => lines.push("TETRA STACK · no moduli in the range".into()),
             }
+            lines.push(format!("shape: {}", l.shape.label()));
             lines.push(match l.spacing {
-                Spacing::True => "true spacing: height = m; gaps are skipped moduli (G)".into(),
+                Spacing::True => "true spacing: height follows m; gaps are skipped moduli (G)".into(),
                 Spacing::Packed => "packed: height = slice index, so the sides curve: slice size no longer tracks height (G)".into(),
             });
             let lens = match model.layers.preset() {
