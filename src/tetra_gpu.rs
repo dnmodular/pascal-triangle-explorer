@@ -51,13 +51,31 @@ fn cell_indices() -> Vec<u16> {
     v
 }
 
-/// (index count, first index) of a cell shape in [`cell_indices`].
-fn cell_range(cell: Cell) -> (u32, u32) {
+/// (index count, first index) of a cell shape in [`cell_indices`]. `flat`: a planar
+/// view, seen straight on along −z: only what faces the viewer can show, so only that
+/// is drawn. A box's +z face (6 indices of 36); a rhombic dodecahedron's three rhombi
+/// turned up in the top face (faces 9–11 of [`crate::tetra::rhombic_faces`], away from
+/// the step down: six more stand edge-on and three face away; 18 of 72); a sphere is a
+/// flat disk either way.
+fn cell_range(cell: Cell, flat: bool) -> (u32, u32) {
     match cell {
+        Cell::Cube if flat => (6, 6),
         Cell::Cube => (36, 0),
+        Cell::Rhombic if flat => (18, 36 + 6 * 9),
         Cell::Rhombic => (72, 36),
         Cell::Sphere => (6, 108),
     }
+}
+
+/// A planar view: the flat views' orthographic camera, which only pans and zooms and
+/// always looks straight along −z (the faces, the base, the diamond, the top face).
+/// There a cell is drawn as what of it can show from the front, a 2D shape: a box's
+/// front face, a rhombic dodecahedron's three upper rhombi, a sphere's disk at its
+/// centre's depth. Equal cells that do not overlap, seen along parallel rays, are in
+/// front of one another exactly as their centres are (the plane between two centres
+/// separates them), so the picture is the same as the solids'.
+fn flat_view(camera: &Camera) -> bool {
+    camera.ortho > 0.0 && camera.basis().0[2] < -0.9999
 }
 
 #[repr(C)]
@@ -686,8 +704,8 @@ impl TetraRenderer {
 
     /// Point both indirect draws (the nonzero cubes, the zeros) at `cell`'s indices; the
     /// instance counts the compute pass wrote stay.
-    fn use_cell(&self, s: &Scene, cell: Cell) {
-        let (count, first) = cell_range(s.layout.draws(cell));
+    fn use_cell(&self, s: &Scene, cell: Cell, camera: &Camera) {
+        let (count, first) = cell_range(s.layout.draws(cell), flat_view(camera));
         for base in [0u64, 20] {
             self.queue.write_buffer(&s.counters, base, bytemuck::bytes_of(&count));
             self.queue.write_buffer(&s.counters, base + 8, bytemuck::bytes_of(&first));
@@ -711,8 +729,9 @@ impl TetraRenderer {
         let Some(s) = &self.scene else { return };
         let p = self.params(o, vp, false);
         self.queue.write_buffer(&self.draw_ubuf, 0, bytemuck::bytes_of(&p));
-        self.use_cell(s, o.cell);
-        let sphere = s.layout.draws(o.cell) == Cell::Sphere;
+        self.use_cell(s, o.cell, &o.camera);
+        // (in a planar view a sphere is a flat disk at its centre's depth: no depth written)
+        let sphere = s.layout.draws(o.cell) == Cell::Sphere && !flat_view(&o.camera);
         pass.set_index_buffer(self.index_buf.slice(..), wgpu::IndexFormat::Uint16);
         // all filled: no wire to see through, so back faces can go
         let solid = o.fill == f32::NEG_INFINITY;
@@ -768,8 +787,8 @@ impl TetraRenderer {
         }
         let (Some(t), Some(s)) = (&self.target, &self.scene) else { return false };
         let o = DrawOptions { camera: *camera, fill: f32::INFINITY, hover: None, brush: 0.0, color_slice: false, ghosts: false, mask: false, flat: false, peel, solid_zeros: false, cell };
-        self.use_cell(s, cell);
-        let sphere = s.layout.draws(cell) == Cell::Sphere;
+        self.use_cell(s, cell, camera);
+        let sphere = s.layout.draws(cell) == Cell::Sphere && !flat_view(camera);
         let vp = camera.pick_view_proj(t.w, t.h, px, py);
         let p = self.params(&o, vp, false);
         self.queue.write_buffer(&self.pick_ubuf, 0, bytemuck::bytes_of(&p));

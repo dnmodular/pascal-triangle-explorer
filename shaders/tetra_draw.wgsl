@@ -234,13 +234,18 @@ fn cube_fs(in: CubeOut) -> @location(0) vec4<f32> {
   let edge = mid / fw;                       // px to the nearest edge of this face
   let lw = fwidth(in.local);
   let cube_px = 1.0 / max(max(lw.x, lw.y), max(lw.z, 1e-6));
-  let n = normalize(cross(dpdx(in.world), dpdy(in.world)));
   var ink = 1.0 - smoothstep(D.line_px - 0.5, D.line_px + 0.5, edge);
-  if ((D.flags & FLAG_SPHERE) != 0u) {
-    // (the ghosts of spheres: a faint ring, the disk beyond it dropped)
+  var n = normalize(cross(dpdx(in.world), dpdy(in.world)));
+  let sphere = (D.flags & FLAG_SPHERE) != 0u;
+  var facing = 1.0;
+  if (sphere) {
+    // a sphere's ghost ring, or a flat disk in a planar view: the quad beyond the disk
+    // dropped, the normal the sphere's, the rim darkened
     let hit = sphere_ray(in.world, in.center);
     if (hit.w < 0.0) { discard; }
-    ink = 1.0 - smoothstep(0.0, 0.3, hit.w);
+    facing = hit.w;
+    ink = 1.0 - smoothstep(0.0, 0.35, hit.w);
+    n = (hit.xyz - in.center) / D.half.x;
   }
 
   if ((D.flags & FLAG_GHOST) != 0u) {
@@ -255,11 +260,16 @@ fn cube_fs(in: CubeOut) -> @location(0) vec4<f32> {
     // (in the flat views a face turned to the viewer shows the palette color itself, as
     // in the 2D view; faces turned away, as the hinge swings, still shade)
     let lit_shade = 0.55 + 0.45 * abs(dot(n, l));
-    let shade = select(lit_shade, mix(lit_shade, 1.0, abs(n.z)), (D.flags & FLAG_FLAT) != 0u);
+    var shade = select(lit_shade, mix(lit_shade, 1.0, abs(n.z)), (D.flags & FLAG_FLAT) != 0u);
+    if (sphere) {
+      // (lit as sphere_fs lights a solid sphere)
+      shade = 0.5 + 0.5 * max(dot(n, l), 0.0) + 0.12 * facing;
+    }
     var col = in.color * shade;
     var edge_col = col * 0.35;
-    // the flat views tile cell against cell: no dark edges, only the highlight's
-    let edged = select(ink, 0.0, (D.flags & FLAG_FLAT) != 0u && in.lit != 2u);
+    // the flat views tile cell against cell: no dark edges, only the highlight's (a
+    // sphere keeps its rim)
+    let edged = select(ink, 0.0, (D.flags & FLAG_FLAT) != 0u && in.lit != 2u && !sphere);
     if (in.lit == 2u) {
       col = mix(col, vec3<f32>(1.0), 0.3);
       edge_col = vec3<f32>(1.0);
@@ -323,6 +333,8 @@ fn pick_vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> 
 
 @fragment
 fn pick_fs(in: PickOut) -> @location(0) vec2<u32> {
+  // (a sphere drawn as a flat disk: the quad's corners are not it)
+  if ((D.flags & FLAG_SPHERE) != 0u && sphere_ray(in.world, in.center).w < 0.0) { discard; }
   return in.id;
 }
 

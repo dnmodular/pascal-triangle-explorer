@@ -277,6 +277,13 @@ voids run through the solid as tunnels.
     shader finds the sphere with a ray test and writes its depth, in the colour pass
     and the pick pass. All faces alike, but a quarter of the pile is gaps, and small
     on screen they turn into dots.
+  In the planar views (the faces, the base, the diamond, the top face: the
+  orthographic camera, always straight on) a cell is drawn as the 2D shape of what
+  can show of it: a box's front face (6 of 36 indices), a rhombic dodecahedron's three
+  rhombi turned up (18 of 72; six more stand edge-on and three face away), a sphere's
+  disk at its centre's depth (no per-pixel depth, so the GPU's early depth test
+  stays on). Equal cells that do not overlap, seen along parallel rays, cover each
+  other exactly as their centres' depths say, so the picture is the solids'.
   The rhombic and sphere cells fit the equilateral shape in true spacing (elsewhere
   the slices don't sit in each other's hollows; the panel says so). The flat views
   keep their boxes, and the preview tile its wire cubes.
