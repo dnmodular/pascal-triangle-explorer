@@ -47,8 +47,8 @@ struct Slice {
 @group(0) @binding(1) var<storage, read> tables: array<u32>;
 @group(0) @binding(2) var<storage, read> slices: array<Slice>;
 @group(0) @binding(3) var<storage, read> factors: array<Factor>;
-@group(0) @binding(4) var<storage, read_write> nonzero: array<vec2<u32>>;
-@group(0) @binding(5) var<storage, read_write> zeros: array<vec2<u32>>;
+// one buffer of `total` cubes: nonzero cubes from the front, zeros from the back
+@group(0) @binding(4) var<storage, read_write> cubes: array<vec2<u32>>;
 // two DrawIndexedIndirect argument blocks: instance counts at words 1 and 6
 @group(0) @binding(6) var<storage, read_write> counters: array<atomic<u32>, 10>;
 
@@ -110,8 +110,8 @@ fn tetra_cells(@builtin(global_invocation_id) gid: vec3<u32>) {
   let r = slice_residue(n, k, s);
   let w = vec2<u32>(n | (k << 16u), lo | (r << 16u));
   if (r != 0u) {
-    nonzero[atomicAdd(&counters[1], 1u)] = w;
+    cubes[atomicAdd(&counters[1], 1u)] = w;
   } else {
-    zeros[atomicAdd(&counters[6], 1u)] = w;
+    cubes[C.total - 1u - atomicAdd(&counters[6], 1u)] = w;
   }
 }

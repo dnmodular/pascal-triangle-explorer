@@ -298,6 +298,9 @@ voids run through the solid as tunnels.
   uniforms: cubes whose centre lies at or above it are filled, the rest are wire.
   Faint green triangles outline every slice. *Ghost zeros* draws the zero cells as
   faint additive cubes that glow through the solid, which shows the tunnels.
+* **Solid zeros on the face and the diamond** (on by default): their zero cells are
+  drawn as dark cubes, so the flat shapes have no gaps (the first zeros are row 29
+  mod 30), and they can be hovered. The stack keeps its zeros as voids, its tunnels.
 * **Hover.** An ID pass renders the nonzero cubes into a 1 × 1 `Rg32Uint` target
   through a projection that maps the pointer's pixel onto it. It returns the
   frontmost cube's packed (n, k, slice, residue) words, read back asynchronously.
@@ -335,8 +338,14 @@ voids run through the solid as tunnels.
   ("+4" between 7 and 11), so prime gaps read as spacing. The tetrahedron's edges stay
   straight. *Packed*: slice height follows the slice index, no gaps. The HUD notes that the sides
   now curve, because slice size no longer tracks height.
-* **Level of detail, as cubes.** The stack has about M³/6 cells. A cube budget
-  (250K–8M, default 1M) picks the smallest stride s that fits: every s-th row and
+* **Every cell, by default.** The cube budget defaults to *all*: every cell of the
+  range is drawn, up to what one scene holds on the GPU (48M cubes, or less when the
+  device's largest buffer is smaller: 2–500 is 20.8M, 2–660 about 48M). Cubes live
+  in one buffer, nonzero ones from the front and zeros from the back, 8 bytes each;
+  when every cube is filled their back faces are culled; and the preview tile draws
+  a light stack of its own (1M cubes), so the full one is only drawn in the 3D space.
+* **Level of detail, as cubes** (a range past the GPU's limit, or a smaller budget,
+  1M–32M, for speed): the smallest stride s that fits: every s-th row and
   cell of a slice, and, walking down from the apex, only the slices at least one cube
   (s cells) below the last one kept; the base is always drawn too (it takes the last
   kept slice's place when they would touch). Anchored at the apex, the top of the stack

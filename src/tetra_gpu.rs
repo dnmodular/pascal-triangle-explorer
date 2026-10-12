@@ -97,6 +97,9 @@ const FLAG_SLICE: u32 = 1;
 const FLAG_MASK: u32 = 2;
 const FLAG_GHOST: u32 = 4;
 const FLAG_FLAT: u32 = 8;
+const FLAG_ZERO: u32 = 16;
+/// Most cubes a scene holds, whatever the budget (8 bytes each, one buffer).
+pub const MAX_CELLS: u32 = 48_000_000;
 
 /// One line vertex: position, premultiplied-later RGBA, dash coordinate (< 0 solid).
 #[repr(C)]
@@ -223,6 +226,8 @@ pub struct DrawOptions {
     pub flat: bool,
     /// Layers peeled off each [`crate::tetra::Side`] (the stack only; 0 = none).
     pub peel: [u32; 5],
+    /// The zeros as solid dark cubes instead of holes (the flat views).
+    pub solid_zeros: bool,
 }
 
 struct Target {
@@ -249,12 +254,12 @@ struct Scene {
     spectral: bool,
     levels: wgpu::Buffer,
     colors: wgpu::Buffer,
-    nonzero: wgpu::Buffer,
-    zeros: wgpu::Buffer,
+    cubes: wgpu::Buffer,
     counters: wgpu::Buffer,
     draw_nz: wgpu::BindGroup,
     draw_z: wgpu::BindGroup,
     pick_nz: wgpu::BindGroup,
+    pick_z: wgpu::BindGroup,
 }
 
 pub struct TetraRenderer {
@@ -264,6 +269,7 @@ pub struct TetraRenderer {
     draw_layout: wgpu::BindGroupLayout,
     cells_pipe: wgpu::ComputePipeline,
     cube_pipe: wgpu::RenderPipeline,
+    solid_pipe: wgpu::RenderPipeline,
     ghost_pipe: wgpu::RenderPipeline,
     pick_pipe: wgpu::RenderPipeline,
     line_pipe: wgpu::RenderPipeline,
@@ -271,6 +277,7 @@ pub struct TetraRenderer {
     draw_ubuf: wgpu::Buffer,
     ghost_ubuf: wgpu::Buffer,
     pick_ubuf: wgpu::Buffer,
+    pick_z_ubuf: wgpu::Buffer,
     lines: Option<(wgpu::Buffer, u32)>,
     scene: Option<Scene>,
     target: Option<Target>,
@@ -299,7 +306,7 @@ fn layouts(device: &wgpu::Device) -> (wgpu::BindGroupLayout, wgpu::BindGroupLayo
     let c = wgpu::ShaderStages::COMPUTE;
     let cells = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("tetra cells"),
-        entries: &[uniform(0, c), storage(1, true, c), storage(2, true, c), storage(3, true, c), storage(4, false, c), storage(5, false, c), storage(6, false, c)],
+        entries: &[uniform(0, c), storage(1, true, c), storage(2, true, c), storage(3, true, c), storage(4, false, c), storage(6, false, c)],
     });
     let v = wgpu::ShaderStages::VERTEX_FRAGMENT;
     let draw = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -315,11 +322,13 @@ pub fn module_sources() -> [(&'static str, String); 2] {
 }
 
 /// Pipelines by name, for `--check-shaders`.
-pub const PIPELINES: [&str; 5] = ["tetra_cells", "cube", "ghost", "pick", "line"];
+pub const PIPELINES: [&str; 6] = ["tetra_cells", "cube", "solid", "ghost", "pick", "line"];
 
 struct Pipes {
     cells: wgpu::ComputePipeline,
     cube: wgpu::RenderPipeline,
+    /// The cubes when every one is filled: back faces culled (half the raster work).
+    solid: wgpu::RenderPipeline,
     ghost: wgpu::RenderPipeline,
     pick: wgpu::RenderPipeline,
     line: wgpu::RenderPipeline,
@@ -356,7 +365,7 @@ fn build_pipes(device: &wgpu::Device, cells_layout: &wgpu::BindGroupLayout, draw
         let m = module(cells_src.0, &cells_src.1);
         device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: Some("tetra_cells"), layout: Some(&cells_layout_p), module: &m, entry_point: Some("tetra_cells"), compilation_options: Default::default(), cache: None })
     });
-    let draw_m = (want("cube") || want("ghost") || want("pick") || want("line")).then(|| module(draw_src.0, &draw_src.1));
+    let draw_m = (want("cube") || want("solid") || want("ghost") || want("pick") || want("line")).then(|| module(draw_src.0, &draw_src.1));
     let render = |label: &str, vs: &str, fs: &str, format: wgpu::TextureFormat, blend: Option<wgpu::BlendState>, depth: wgpu::DepthStencilState, topology: wgpu::PrimitiveTopology, cull: Option<wgpu::Face>, buffers: &[Option<wgpu::VertexBufferLayout>]| {
         let m = draw_m.as_ref().expect("draw module");
         device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -373,12 +382,13 @@ fn build_pipes(device: &wgpu::Device, cells_layout: &wgpu::BindGroupLayout, draw
     };
     let tri = wgpu::PrimitiveTopology::TriangleList;
     let cube = want("cube").then(|| render("cube", "cube_vs", "cube_fs", COLOR_FORMAT, Some(PREMULTIPLIED), depth_state(true, wgpu::CompareFunction::Less), tri, None, &[]));
+    let solid = want("solid").then(|| render("solid", "cube_vs", "cube_fs", COLOR_FORMAT, Some(PREMULTIPLIED), depth_state(true, wgpu::CompareFunction::Less), tri, Some(wgpu::Face::Back), &[]));
     let ghost = want("ghost").then(|| render("ghost", "cube_vs", "cube_fs", COLOR_FORMAT, Some(ADDITIVE), depth_state(false, wgpu::CompareFunction::Always), tri, None, &[]));
     let pick = want("pick").then(|| render("pick", "pick_vs", "pick_fs", PICK_FORMAT, None, depth_state(true, wgpu::CompareFunction::Less), tri, Some(wgpu::Face::Back), &[]));
     let line_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4, 2 => Float32];
     let line_buf = wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<LineVertex>() as u64, step_mode: wgpu::VertexStepMode::Vertex, attributes: &line_attrs };
     let line = want("line").then(|| render("line", "line_vs", "line_fs", COLOR_FORMAT, Some(PREMULTIPLIED), depth_state(false, wgpu::CompareFunction::LessEqual), wgpu::PrimitiveTopology::LineList, None, &[Some(line_buf.clone())]));
-    Some(Pipes { cells: cells?, cube: cube?, ghost: ghost?, pick: pick?, line: line? })
+    Some(Pipes { cells: cells?, cube: cube?, solid: solid?, ghost: ghost?, pick: pick?, line: line? })
 }
 
 /// Compile one tetra pipeline on its own (for `--check-shaders`).
@@ -397,6 +407,7 @@ impl TetraRenderer {
         let draw_ubuf = ubuf("tetra draw params");
         let ghost_ubuf = ubuf("tetra ghost params");
         let pick_ubuf = ubuf("tetra pick params");
+        let pick_z_ubuf = ubuf("tetra zero pick params");
         let tex = |label, format, usage| {
             device.create_texture(&wgpu::TextureDescriptor { label: Some(label), size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 }, mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format, usage, view_formats: &[] })
         };
@@ -413,6 +424,7 @@ impl TetraRenderer {
             draw_layout,
             cells_pipe: p.cells,
             cube_pipe: p.cube,
+            solid_pipe: p.solid,
             ghost_pipe: p.ghost,
             pick_pipe: p.pick,
             line_pipe: p.line,
@@ -420,6 +432,7 @@ impl TetraRenderer {
             draw_ubuf,
             ghost_ubuf,
             pick_ubuf,
+            pick_z_ubuf,
             lines: None,
             scene: None,
             target: None,
@@ -430,6 +443,14 @@ impl TetraRenderer {
             device,
             queue,
         }
+    }
+
+    /// Most cubes one scene can hold here: [`MAX_CELLS`], or less when the device's
+    /// largest storage binding or buffer (8 bytes a cube) is smaller.
+    pub fn max_cells(&self) -> u32 {
+        let l = self.device.limits();
+        let by_dev = l.max_storage_buffer_binding_size.min(l.max_buffer_size) / 8;
+        (MAX_CELLS as u64).min(by_dev) as u32
     }
 
     /// Upload a new selection and run the residue pass over it. `mods[i]` is the modulus
@@ -445,8 +466,8 @@ impl TetraRenderer {
         let colors = init(d, "tetra colors", bytemuck::cast_slice(&color_words(layout, palette, offset)), st);
         let cap = (layout.total.max(1) as u64) * 8;
         let out = |label| d.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size: cap, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
-        let nonzero = out("tetra nonzero cubes");
-        let zeros = out("tetra zero cubes");
+        // one buffer: nonzero cubes from the front, zeros from the back
+        let cubes = out("tetra cubes");
         let counters = init(d, "tetra draw args", bytemuck::cast_slice(&[36u32, 0, 0, 0, 0, 36, 0, 0, 0, 0]), wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST);
         let groups = layout.total.div_ceil(WG);
         let gx = groups.clamp(1, MAX_GROUPS_X);
@@ -461,8 +482,7 @@ impl TetraRenderer {
                 wgpu::BindGroupEntry { binding: 1, resource: tables.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 2, resource: slices.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 3, resource: factors.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 4, resource: nonzero.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 5, resource: zeros.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: cubes.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 6, resource: counters.as_entire_binding() },
             ],
         });
@@ -489,10 +509,11 @@ impl TetraRenderer {
                 ],
             })
         };
-        let draw_nz = draw_bg(&self.draw_ubuf, &nonzero);
-        let draw_z = draw_bg(&self.ghost_ubuf, &zeros);
-        let pick_nz = draw_bg(&self.pick_ubuf, &nonzero);
-        self.scene = Some(Scene { layout: layout.clone(), gpu_slices: data.slices.clone(), slices, spectral: palette.scheme == Scheme::Spectral, levels, colors, nonzero, zeros, counters, draw_nz, draw_z, pick_nz });
+        let draw_nz = draw_bg(&self.draw_ubuf, &cubes);
+        let draw_z = draw_bg(&self.ghost_ubuf, &cubes);
+        let pick_nz = draw_bg(&self.pick_ubuf, &cubes);
+        let pick_z = draw_bg(&self.pick_z_ubuf, &cubes);
+        self.scene = Some(Scene { layout: layout.clone(), gpu_slices: data.slices.clone(), slices, spectral: palette.scheme == Scheme::Spectral, levels, colors, cubes, counters, draw_nz, draw_z, pick_nz, pick_z });
     }
 
     /// Move the slices of the same scene (the diamond's hinge swinging): only their
@@ -558,6 +579,11 @@ impl TetraRenderer {
     }
 
     fn params(&self, o: &DrawOptions, view_proj: Mat4, ghost: bool) -> DrawParams {
+        self.params_for(o, view_proj, ghost, false)
+    }
+
+    /// `zero`: the solid zeros pass (the zeros, drawn as dark cubes).
+    fn params_for(&self, o: &DrawOptions, view_proj: Mat4, ghost: bool, zero: bool) -> DrawParams {
         let s = self.scene.as_ref().expect("scene");
         let he = s.layout.half_extents();
         let (hover, hover_slice) = match o.hover {
@@ -580,12 +606,16 @@ impl TetraRenderer {
         if o.flat {
             flags |= FLAG_FLAT;
         }
+        if zero {
+            flags |= FLAG_ZERO;
+        }
         let brush = o.brush.max(0.0) * s.layout.stride as f32;
         let (st, d) = (s.layout.stride, o.peel);
+        let last = s.layout.total.saturating_sub(1);
         let (peel_a, peel_b) = if s.layout.view == View::Stack {
-            ([d[0] * st, d[1] * st, d[2] * st, d[3]], [d[4], s.layout.slices.len() as u32, st, 0])
+            ([d[0] * st, d[1] * st, d[2] * st, d[3]], [d[4], s.layout.slices.len() as u32, st, last])
         } else {
-            ([0; 4], [0, 0, st, 0])
+            ([0; 4], [0, 0, st, last])
         };
         DrawParams { view_proj, hover, half: [he[0], he[1], he[2], brush], wire: if ghost { [0.55, 0.75, 0.6, 1.0] } else { WIRE }, hover_slice, flags, line_px: 0.75, ghost_alpha: 0.07, fill: [o.fill.clamp(-1e30, 1e30), 0.0, 0.0, 0.0], peel_a, peel_b }
     }
@@ -608,16 +638,26 @@ impl TetraRenderer {
         let p = self.params(o, vp, false);
         self.queue.write_buffer(&self.draw_ubuf, 0, bytemuck::bytes_of(&p));
         pass.set_index_buffer(self.index_buf.slice(..), wgpu::IndexFormat::Uint16);
-        pass.set_pipeline(&self.cube_pipe);
+        // all filled: no wire to see through, so back faces can go
+        let solid = o.fill == f32::NEG_INFINITY;
+        pass.set_pipeline(if solid { &self.solid_pipe } else { &self.cube_pipe });
         pass.set_bind_group(0, &s.draw_nz, &[]);
         pass.draw_indexed_indirect(&s.counters, 0);
+        if o.solid_zeros {
+            // the zeros as dark cubes (the ghosts' uniforms are free: they are not drawn)
+            let pz = self.params_for(o, vp, false, true);
+            self.queue.write_buffer(&self.ghost_ubuf, 0, bytemuck::bytes_of(&pz));
+            pass.set_pipeline(&self.solid_pipe);
+            pass.set_bind_group(0, &s.draw_z, &[]);
+            pass.draw_indexed_indirect(&s.counters, 20);
+        }
         if let Some((buf, n)) = &self.lines {
             pass.set_pipeline(&self.line_pipe);
             pass.set_vertex_buffer(0, buf.slice(..));
             pass.draw(0..*n, 0..1);
         }
         drop(pass);
-        if o.ghosts {
+        if o.ghosts && !o.solid_zeros {
             self.draw_ghosts(enc, o, vp);
         }
     }
@@ -645,14 +685,19 @@ impl TetraRenderer {
 
     /// Encode the ID pass for pixel (px, py) of the target and copy its result out, unless
     /// a pick is still in flight. Call [`Self::start_pick_map`] after submitting.
-    pub fn encode_pick(&mut self, enc: &mut wgpu::CommandEncoder, camera: &Camera, px: f32, py: f32, peel: [u32; 5]) -> bool {
+    pub fn encode_pick(&mut self, enc: &mut wgpu::CommandEncoder, camera: &Camera, px: f32, py: f32, peel: [u32; 5], zeros: bool) -> bool {
         if self.pick_pending.is_some() {
             return false;
         }
         let (Some(t), Some(s)) = (&self.target, &self.scene) else { return false };
-        let o = DrawOptions { camera: *camera, fill: f32::INFINITY, hover: None, brush: 0.0, color_slice: false, ghosts: false, mask: false, flat: false, peel };
-        let p = self.params(&o, camera.pick_view_proj(t.w, t.h, px, py), false);
+        let o = DrawOptions { camera: *camera, fill: f32::INFINITY, hover: None, brush: 0.0, color_slice: false, ghosts: false, mask: false, flat: false, peel, solid_zeros: false };
+        let vp = camera.pick_view_proj(t.w, t.h, px, py);
+        let p = self.params(&o, vp, false);
         self.queue.write_buffer(&self.pick_ubuf, 0, bytemuck::bytes_of(&p));
+        if zeros {
+            let pz = self.params_for(&o, vp, false, true);
+            self.queue.write_buffer(&self.pick_z_ubuf, 0, bytemuck::bytes_of(&pz));
+        }
         {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("tetra pick"),
@@ -666,6 +711,10 @@ impl TetraRenderer {
             pass.set_pipeline(&self.pick_pipe);
             pass.set_bind_group(0, &s.pick_nz, &[]);
             pass.draw_indexed_indirect(&s.counters, 0);
+            if zeros {
+                pass.set_bind_group(0, &s.pick_z, &[]);
+                pass.draw_indexed_indirect(&s.counters, 20);
+            }
         }
         enc.copy_texture_to_buffer(
             self.pick.color.as_image_copy(),
@@ -725,8 +774,13 @@ impl TetraRenderer {
 
     /// Pick synchronously through a peel (tests).
     pub fn pick_blocking_peeled(&mut self, camera: &Camera, px: f32, py: f32, peel: [u32; 5]) -> Option<CubeId> {
+        self.pick_blocking_with(camera, px, py, peel, false)
+    }
+
+    /// Pick synchronously, the zeros too when `zeros` (the solid zeros of the flat views).
+    pub fn pick_blocking_with(&mut self, camera: &Camera, px: f32, py: f32, peel: [u32; 5], zeros: bool) -> Option<CubeId> {
         let mut enc = self.device.create_command_encoder(&Default::default());
-        assert!(self.encode_pick(&mut enc, camera, px, py, peel), "no pick in flight");
+        assert!(self.encode_pick(&mut enc, camera, px, py, peel, zeros), "no pick in flight");
         self.queue.submit(Some(enc.finish()));
         self.start_pick_map();
         loop {
@@ -738,12 +792,16 @@ impl TetraRenderer {
     }
 
     fn read(&self, buf: &wgpu::Buffer, size: u64) -> Vec<u8> {
+        self.read_at(buf, 0, size)
+    }
+
+    fn read_at(&self, buf: &wgpu::Buffer, offset: u64, size: u64) -> Vec<u8> {
         if size == 0 {
             return Vec::new();
         }
         let staging = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("tetra readback"), size, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let mut enc = self.device.create_command_encoder(&Default::default());
-        enc.copy_buffer_to_buffer(buf, 0, &staging, 0, size);
+        enc.copy_buffer_to_buffer(buf, offset, &staging, 0, size);
         self.queue.submit(Some(enc.finish()));
         staging.slice(..).map_async(wgpu::MapMode::Read, |_| {});
         let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
@@ -763,8 +821,12 @@ impl TetraRenderer {
     pub fn read_cubes(&self) -> (Vec<[u32; 2]>, Vec<[u32; 2]>) {
         let Some(s) = &self.scene else { return (Vec::new(), Vec::new()) };
         let (nz, z) = self.read_counts();
-        let get = |b: &wgpu::Buffer, n: u32| bytemuck::pod_collect_to_vec::<u8, [u32; 2]>(&self.read(b, n as u64 * 8));
-        (get(&s.nonzero, nz), get(&s.zeros, z))
+        let total = s.layout.total as u64;
+        let front = bytemuck::pod_collect_to_vec::<u8, [u32; 2]>(&self.read_at(&s.cubes, 0, nz as u64 * 8));
+        // the zeros sit at the back, the first one written last of all
+        let mut back = bytemuck::pod_collect_to_vec::<u8, [u32; 2]>(&self.read_at(&s.cubes, (total - z as u64) * 8, z as u64 * 8));
+        back.reverse();
+        (front, back)
     }
 
     /// The target as tightly packed RGBA8 (tests).

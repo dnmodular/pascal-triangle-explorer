@@ -8,7 +8,7 @@ use pascal::layers::Preset;
 use pascal::math::Modulus;
 use pascal::palette::Scheme;
 use pascal::sweep::{ModMode, PrimeOrder, Seq};
-use pascal::tetra::{describe, PeelMode, Side, Snap, face_row_alternates, face_row_zeros, selected_moduli, view_stride, Camera, CubeId, Layout, SceneKey, Shape, SliceKind, Spacing, TetraConfig, View, BUDGETS, FOLD, TETRA_MAX_M};
+use pascal::tetra::{describe, TILE_BUDGET, PeelMode, Side, Snap, face_row_alternates, face_row_zeros, selected_moduli, view_stride, Camera, CubeId, Layout, SceneKey, Shape, SliceKind, Spacing, TetraConfig, View, BUDGETS, FOLD, TETRA_MAX_M};
 use pascal::tetra_gpu::{outline_vertices, DrawOptions, TetraRenderer, BACKGROUND};
 use pascal::wave_overlay::Corner;
 
@@ -65,6 +65,8 @@ pub struct TetraView {
     /// (packed spacing, another range) re-snaps to the same face.
     snapped: Option<Snap>,
     focus_last_frame: bool,
+    /// Most cubes one scene can hold on this GPU.
+    max_cells: u32,
     /// The space laid itself out this frame (its target size is real, not the tile's).
     sized: bool,
     /// Pixels the flat views leave free above (the HUD) and below (the 2D thumbnail).
@@ -164,6 +166,26 @@ impl TetraView {
                 self.peel_extent = Some((key, e));
                 e
             }
+        }
+    }
+
+    /// The cube budget of `view`'s scene: the setting within what the GPU holds, and a
+    /// light one for the tile.
+    fn budget_for(&self) -> u32 {
+        let b = self.config.budget.min(self.cell_cap());
+        if self.open {
+            b
+        } else {
+            b.min(TILE_BUDGET)
+        }
+    }
+
+    /// Most cubes one scene holds here (before the first render: the renderer's ceiling).
+    fn cell_cap(&self) -> u32 {
+        if self.max_cells == 0 {
+            pascal::tetra_gpu::MAX_CELLS
+        } else {
+            self.max_cells
         }
     }
 
@@ -289,11 +311,16 @@ pub fn render(model: &mut Model, cache: &mut TetraCache, r: &mut TetraRenderer, 
     }
     let t = &mut model.tetra;
     let view = t.view();
-    let key = t.config.scene_key(view);
+    // the budget this scene gets: the setting, within what the GPU holds; the tile turns
+    // all the time, so it draws a light stack
+    t.max_cells = r.max_cells();
+    let budget = t.budget_for();
+    let mut key = t.config.scene_key(view);
+    key.7 = budget;
     // (no layout: the model was reset to a config the cache still holds)
     if (cache.scene != Some(key) && !dragging) || t.layout.is_none() {
         let mods = selected_moduli(&t.config.sweep);
-        let mut layout = Layout::build(view, &mods, t.config.spacing, t.config.shape, t.config.budget);
+        let mut layout = Layout::build(view, &mods, t.config.spacing, t.config.shape, budget);
         if view == View::Diamond {
             layout.set_fold(t.fold_angle());
         }
@@ -382,7 +409,8 @@ pub fn render(model: &mut Model, cache: &mut TetraCache, r: &mut TetraRenderer, 
     let mask = model.layers.preset() == Some(Preset::Mask);
     let hover = if t.open { t.hover } else { None };
     let peel = t.peel_depths();
-    let opts = DrawOptions { camera, fill: t.fill_height(), hover, brush: t.config.brush, color_slice: t.config.color_slice, ghosts: t.config.ghosts, mask, flat: t.open && view.flat(), peel };
+    let solid_zeros = t.open && view.flat() && t.config.solid_zeros;
+    let opts = DrawOptions { camera, fill: t.fill_height(), hover, brush: t.config.brush, color_slice: t.config.color_slice, ghosts: t.config.ghosts, mask, flat: t.open && view.flat(), peel, solid_zeros };
     // an unchanged picture is not drawn again (hover, egui repaints)
     let drawn = (opts, t.target_px);
     if recreated || cache.drawn != Some(drawn) {
@@ -391,7 +419,7 @@ pub fn render(model: &mut Model, cache: &mut TetraCache, r: &mut TetraRenderer, 
     }
     if t.open {
         if let Some(p) = t.pointer {
-            if t.last_pick != Some((p, camera, peel)) && r.encode_pick(enc, &camera, p.0, p.1, peel) {
+            if t.last_pick != Some((p, camera, peel)) && r.encode_pick(enc, &camera, p.0, p.1, peel, solid_zeros) {
                 t.last_pick = Some((p, camera, peel));
             }
         }
@@ -463,6 +491,7 @@ fn options(ui: &mut egui::Ui, t: &mut TetraView) {
         peel_controls(ui, t);
     }
     ui.separator();
+    let max_cells = t.cell_cap();
     let c = &mut t.config;
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("moduli").color(ui.visuals().weak_text_color()));
@@ -528,12 +557,13 @@ fn options(ui: &mut egui::Ui, t: &mut TetraView) {
             for b in BUDGETS {
                 ui.selectable_value(&mut c.budget, b, short(b));
             }
-        }).response.on_hover_text("Most cubes drawn. A larger selection draws every s-th slice, row and cell, as cubes s cells wide (the HUD says so), instead of freezing");
+        }).response.on_hover_text(format!("Most cubes drawn. \"all\" draws every cell of the range, up to {} cubes (what one scene holds here); past that, or under a smaller budget, every s-th slice, row and cell is drawn, as cubes s cells wide (the HUD says so). Fewer cubes turn faster", group(max_cells as u64)));
     });
+    ui.checkbox(&mut c.solid_zeros, "solid zeros on the face / diamond").on_hover_text("Draw the zeros of the flat views as dark cubes, so the shapes have no gaps (the stack keeps its zeros as tunnels)");
     let mods = selected_moduli(&c.sweep);
     let text = match (mods.first(), mods.last()) {
         (Some(a), Some(b)) => {
-            let s = view_stride(c.view, &mods, c.spacing, c.budget);
+            let s = view_stride(c.view, &mods, c.spacing, c.budget.min(max_cells));
             let lod = if s > 1 { format!(" · stride {s}") } else { String::new() };
             format!("{} moduli, {a}–{b}{lod}", mods.len())
         }
@@ -589,7 +619,9 @@ fn peel_controls(ui: &mut egui::Ui, t: &mut TetraView) {
 }
 
 fn short(n: u32) -> String {
-    if n >= 1_000_000 {
+    if n == u32::MAX {
+        "all".into()
+    } else if n >= 1_000_000 {
         format!("{}M", n as f64 / 1e6)
     } else {
         format!("{}K", n / 1000)

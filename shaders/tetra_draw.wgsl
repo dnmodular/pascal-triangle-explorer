@@ -31,7 +31,7 @@ struct DrawParams {
   ghost_alpha: f32,
   fill: vec4<f32>,      // x: cubes whose centre is at or above this height are filled in color
   peel_a: vec4<u32>,    // peeled away: k < x, n − k < y, last row − n < z (cells), slice < w
-  peel_b: vec4<u32>,    // x: slices from the base, y: slices in the stack; 0 = none
+  peel_b: vec4<u32>,    // x: slices from the base, y: slices in the stack (0 = none), z: stride, w: last cube index
 };
 
 struct Slice {
@@ -63,7 +63,8 @@ const SQRT3_2: f32 = 0.8660254;
 const FLAG_SLICE: u32 = 1u;
 const FLAG_MASK: u32 = 2u;
 const FLAG_GHOST: u32 = 4u;
-const FLAG_FLAT: u32 = 8u;   // a flat view: faces toward the viewer keep their true color
+const FLAG_FLAT: u32 = 8u;
+const FLAG_ZERO: u32 = 16u;  // the zeros drawn solid (the flat views: no gaps)   // a flat view: faces toward the viewer keep their true color
 const LIGHT: vec3<f32> = vec3<f32>(236.0 / 255.0, 236.0 / 255.0, 226.0 / 255.0);
 
 fn unpack_rgb(c: u32) -> vec3<f32> {
@@ -94,6 +95,14 @@ fn peeled(c: vec2<u32>, si: u32, s: Slice) -> bool {
 // Outside the clip volume: a peeled cube's triangles collapse and are clipped.
 const NOWHERE: vec4<f32> = vec4<f32>(0.0, 0.0, -2.0, 1.0);
 
+// The zero passes (ghosts, solid zeros) read the zeros, stored from the back of the
+// cube buffer.
+fn cube_index(ii: u32) -> u32 {
+  return select(ii, D.peel_b.w - ii, (D.flags & (FLAG_GHOST | FLAG_ZERO)) != 0u);
+}
+
+const ZERO_RGB: vec3<f32> = vec3<f32>(0.16, 0.16, 0.18);
+
 fn corner_of(vi: u32) -> vec3<f32> {
   return vec3<f32>(f32(vi & 1u), f32((vi >> 1u) & 1u), f32((vi >> 2u) & 1u));
 }
@@ -120,7 +129,7 @@ struct CubeOut {
 
 @vertex
 fn cube_vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> CubeOut {
-  let c = cubes[ii];
+  let c = cubes[cube_index(ii)];
   let si = c.y & 0xffffu;
   let s = slices[si];
   let center = cube_center(c, s);
@@ -139,11 +148,14 @@ fn cube_vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> 
   out.pos = select(D.view_proj * vec4<f32>(world, 1.0), NOWHERE, peeled(c, si, s));
   out.local = corner;
   out.world = world;
-  let filled = center.y >= D.fill.x || lit;
+  let filled = center.y >= D.fill.x || lit || (D.flags & FLAG_ZERO) != 0u;
   out.lit = select(select(0u, 1u, filled), 2u, lit);
   out.color = D.wire.rgb;
   if (filled && (D.flags & FLAG_GHOST) == 0u) {
     out.color = residue_rgb(si, s, c.y >> 16u);
+  }
+  if ((D.flags & FLAG_ZERO) != 0u) {
+    out.color = ZERO_RGB;
   }
   return out;
 }
@@ -196,7 +208,7 @@ struct PickOut {
 
 @vertex
 fn pick_vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> PickOut {
-  let c = cubes[ii];
+  let c = cubes[cube_index(ii)];
   let si = c.y & 0xffffu;
   let s = slices[si];
   let world = cube_center(c, s) + (corner_of(vi) * 2.0 - 1.0) * D.half.xyz;

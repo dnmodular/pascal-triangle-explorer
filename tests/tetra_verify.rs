@@ -161,6 +161,62 @@ fn the_pick_sees_through_the_peel() {
 }
 
 #[test]
+fn the_flat_views_draw_their_zeros_solid() {
+    let (_gpu, mut r) = device();
+    // rows m − 1 of m = 30, 60, … hold zeros: the face is full of holes without them
+    let mods: Vec<u32> = (2..=64).collect();
+    let (layout, _) = scene_of(&mut r, View::Face, &mods, Spacing::True, Shape::Regular, u32::MAX);
+    let (_, zeros) = r.read_cubes();
+    assert!(!zeros.is_empty());
+    let (w, h) = (640u32, 480u32);
+    r.ensure_target(w, h);
+    let cam = Camera::flat(layout.bounds(), w as f32, h as f32, 0.0, 0.0);
+    let mut o = DrawOptions { camera: cam, fill: f32::NEG_INFINITY, hover: None, brush: 0.0, color_slice: false, ghosts: false, mask: false, flat: true, peel: [0; 5], solid_zeros: false };
+    r.draw_blocking(&o);
+    let (_, _, holes) = r.read_target_rgba();
+    o.solid_zeros = true;
+    r.draw_blocking(&o);
+    let (_, _, solid) = r.read_target_rgba();
+    let changed = (0..(w * h) as usize).filter(|&i| holes[i * 4..i * 4 + 3] != solid[i * 4..i * 4 + 3]).count();
+    assert!(changed > 20 * zeros.len(), "the zeros filled {changed} pixels");
+    // and each zero is pickable where it sits
+    for w0 in zeros.iter().step_by(7) {
+        let c = CubeId::unpack(*w0);
+        let p = layout.center(c.slice as usize, c.n, c.k);
+        let (px, py) = cam.project(w, h, p).unwrap();
+        let hit = r.pick_blocking_with(&cam, px - 0.5, py - 0.5, [0; 5], true);
+        assert_eq!(hit, Some(c), "zero cube {c:?}");
+        assert_eq!(r.pick_blocking(&cam, px - 0.5, py - 0.5), None, "without the zeros the pick sees the gap");
+    }
+}
+
+#[test]
+fn a_wide_range_draws_every_cell() {
+    // the reported trouble: 2–500 drew every third slice, row and cell under the old
+    // 1M budget. "all" (the default) now draws all 20.8M cells when the GPU holds them.
+    let (_gpu, mut r) = device();
+    // 2–500 where the device holds its 20.8M cubes (a desktop GPU), else the widest
+    // range that fits (a software device caps a buffer at 128 MB)
+    let cap = r.max_cells() as u64;
+    let hi = (100..=500u32).rev().find(|&hi| (2..=hi).map(|m| (m as u64) * (m as u64 + 1) / 2).sum::<u64>() <= cap).unwrap();
+    let mods: Vec<u32> = (2..=hi).collect();
+    let budget = TetraConfig::default().budget.min(r.max_cells());
+    let layout = Layout::build(View::Stack, &mods, Spacing::True, Shape::Regular, budget);
+    eprintln!("max cells here {cap}: 2–{hi}, {} cells, stride {}", layout.total, layout.stride);
+    assert!(hi >= 400, "the range should reach 400 at least");
+    assert_eq!(layout.stride, 1, "every cell");
+    assert_eq!(layout.slices.len(), mods.len(), "every slice");
+    let mds: Vec<Modulus> = layout.slices.iter().map(|s| Modulus::new(s.m)).collect();
+    r.set_scene(&layout, &mds, &Palette::new(Scheme::Spectral), 0.0);
+    let (nz, z) = r.read_cubes();
+    assert_eq!((nz.len() + z.len()) as u32, layout.total);
+    for w in nz.iter().step_by(997).chain(z.iter().step_by(97)) {
+        let c = CubeId::unpack(*w);
+        assert_eq!(c.residue, mds[c.slice as usize].binom(c.n, c.k), "{c:?}");
+    }
+}
+
+#[test]
 fn strided_and_deep_slices_match_too() {
     let (_gpu, mut r) = device();
     // a wide range under a small budget: a stride on slices, rows and cells
@@ -289,7 +345,7 @@ fn the_stack_draws_green_wire_and_lit_brush_cells() {
     let (w, h) = (400u32, 300u32);
     r.ensure_target(w, h);
     let cam = Camera::framing(layout.bounds());
-    let mut o = DrawOptions { camera: cam, fill: f32::INFINITY, hover: None, brush: 3.0, color_slice: false, ghosts: false, mask: false, flat: false, peel: [0; 5] };
+    let mut o = DrawOptions { camera: cam, fill: f32::INFINITY, hover: None, brush: 3.0, color_slice: false, ghosts: false, mask: false, flat: false, peel: [0; 5], solid_zeros: false };
     r.draw_blocking(&o);
     let (_, _, plain) = r.read_target_rgba();
     let bg = BACKGROUND.map(|c| (c * 255.0).round() as u8);

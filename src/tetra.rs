@@ -29,8 +29,11 @@ pub const CUBE_HALF: f32 = 0.39;
 /// √(2/3): the height of a regular tetrahedron per unit of edge, so the vertical step
 /// from one modulus to the next.
 pub const LEVEL: f32 = 0.816_496_6;
-/// Cube-count budgets offered in the panel.
-pub const BUDGETS: [u32; 6] = [250_000, 500_000, 1_000_000, 2_000_000, 4_000_000, 8_000_000];
+/// Cube-count budgets offered in the panel; `u32::MAX` = every cell, up to what the GPU
+/// holds (the default: nothing is left out unless the range is too big for it).
+pub const BUDGETS: [u32; 5] = [1_000_000, 4_000_000, 16_000_000, 32_000_000, u32::MAX];
+/// The preview tile's budget: it turns all the time, so it draws a light stack.
+pub const TILE_BUDGET: u32 = 1_000_000;
 
 /// How the slices line up: their centroids (a regular tetrahedron), one corner (two
 /// faces vertical, meeting in a vertical edge) or the middle of one edge (one face
@@ -140,8 +143,10 @@ pub struct TetraConfig {
     pub brush: f32,
     /// Highlight the whole hovered slice instead of a brush.
     pub color_slice: bool,
-    /// Most cubes drawn; a larger selection gets a cell stride.
+    /// Most cubes drawn (u32::MAX = all the GPU holds); a larger selection gets a stride.
     pub budget: u32,
+    /// The face and the diamond draw their zeros as dark cubes: no gaps.
+    pub solid_zeros: bool,
     /// The preview tile turns slowly.
     pub spin: bool,
     /// Show the preview tile on the 2D canvas.
@@ -152,7 +157,7 @@ impl Default for TetraConfig {
     fn default() -> Self {
         let mut sweep = Sweep::default();
         sweep.end = 48;
-        TetraConfig { sweep, spacing: Spacing::True, shape: Shape::Regular, view: View::Stack, peel: Peel::default(), options: true, ghosts: false, brush: 2.0, color_slice: false, budget: 1_000_000, spin: true, tile: true }
+        TetraConfig { sweep, spacing: Spacing::True, shape: Shape::Regular, view: View::Stack, peel: Peel::default(), options: true, ghosts: false, brush: 2.0, color_slice: false, budget: u32::MAX, solid_zeros: true, spin: true, tile: true }
     }
 }
 
