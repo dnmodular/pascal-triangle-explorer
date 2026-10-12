@@ -44,6 +44,9 @@ pub const TILE_BUDGET: u32 = 1_000_000;
 pub enum Shape {
     #[default]
     Regular,
+    /// Equilateral to within a third of a cell, growing one whole row on one face per
+    /// slice in turn: every step on every face is a whole cell (and the top view too).
+    Terraced,
     CornerApex,
     CornerLeft,
     CornerRight,
@@ -53,11 +56,12 @@ pub enum Shape {
 }
 
 impl Shape {
-    pub const ALL: [Shape; 7] = [Shape::Regular, Shape::CornerApex, Shape::CornerLeft, Shape::CornerRight, Shape::FaceFront, Shape::FaceLeft, Shape::FaceRight];
+    pub const ALL: [Shape; 8] = [Shape::Regular, Shape::Terraced, Shape::CornerApex, Shape::CornerLeft, Shape::CornerRight, Shape::FaceFront, Shape::FaceLeft, Shape::FaceRight];
 
     pub fn label(self) -> &'static str {
         match self {
             Shape::Regular => "equilateral",
+            Shape::Terraced => "equilateral, terraced",
             Shape::CornerApex => "flush corner: apex",
             Shape::CornerLeft => "flush corner: left",
             Shape::CornerRight => "flush corner: right",
@@ -69,7 +73,8 @@ impl Shape {
 
     pub fn note(self) -> &'static str {
         match self {
-            Shape::Regular => "A regular tetrahedron: every slice centred on one vertical axis, all four faces equilateral and equally tilted.",
+            Shape::Regular => "A regular tetrahedron: every slice centred on one vertical axis, all four faces equilateral and equally tilted. Each slice grows a third of a row on every face, so the steep faces step in thirds (from the top: thin bars at the front, half-cell steps at the sides).",
+            Shape::Terraced => "A regular tetrahedron to within a third of a cell, built so each slice grows one whole row on one face in turn (front, right, left): the faces step in whole cells, three slices to a terrace, and from the top every cell shows whole.",
             Shape::CornerApex => "The row-0 corners of all slices on one vertical line: the left and right faces stand vertical and meet in a vertical edge.",
             Shape::CornerLeft => "The left ends of the last rows on one vertical line: the left and front faces stand vertical.",
             Shape::CornerRight => "The right ends of the last rows on one vertical line: the right and front faces stand vertical.",
@@ -83,11 +88,24 @@ impl Shape {
     /// its apex is at the origin and that row at z = side·√3/2): the anchored point moves
     /// to the axis. `side` is m − 1, or the last strided row under a cell stride, so the
     /// drawn corner cubes are the ones on the axis.
-    pub fn offset(self, side: u32) -> (f32, f32) {
+    pub fn offset(self, side: u32, stride: u32) -> (f32, f32) {
         let s = side as f32;
         let back = s * SQRT3_2;
         match self {
             Shape::Regular => (0.0, -back * 2.0 / 3.0),
+            Shape::Terraced => {
+                // t steps of a stride each, in turn: the apex corner stays (a row more at
+                // the front), the left corner stays (the right side grows: half a cell
+                // right, a row back), the right corner stays (the left side grows). All
+                // are lattice moves, so each slice's cells sit exactly over the next
+                // one's; a cycle moves √3 rows back, the regular stack's pace, and the
+                // mean third of a cell the cycle runs ahead is taken off
+                let st = stride.max(1) as f32;
+                let t = side / stride.max(1);
+                let (q, r) = ((t / 3) as f32, t % 3);
+                let (x, z) = if r == 2 { (0.5, -SQRT3_2) } else { (0.0, 0.0) };
+                ((x - 1.0 / 6.0) * st, (z - q * 2.0 * SQRT3_2 - SQRT3_2 / 3.0) * st)
+            }
             Shape::CornerApex => (0.0, 0.0),
             Shape::CornerLeft => (s / 2.0, -back),
             Shape::CornerRight => (-s / 2.0, -back),
@@ -344,12 +362,15 @@ pub struct Peel {
     /// The animation: a layer comes off every 1/speed s while playing, and when the
     /// last cube is gone it starts again from nothing peeled.
     pub playing: bool,
+    /// Playing backward (rewinding): a layer goes back on every 1/speed s, and from
+    /// nothing peeled it starts again from everything peeled.
+    pub backward: bool,
     pub speed: f32,
 }
 
 impl Default for Peel {
     fn default() -> Self {
-        Peel { sides: [false; 5], layers: 0, playing: false, speed: 6.0 }
+        Peel { sides: [false; 5], layers: 0, playing: false, backward: false, speed: 6.0 }
     }
 }
 
@@ -620,7 +641,7 @@ impl Layout {
             let (kind, rows, cells, origin, nvec) = match view {
                 View::Stack => {
                     let h = l.stack_height(i, m);
-                    let (ox, oz) = shape.offset(strided_side(m, stride));
+                    let (ox, oz) = shape.offset(strided_side(m, stride), stride);
                     (SliceKind::Triangle, strided_rows(m, stride), strided_cells(m, stride), [ox, -h, oz], STACK_N)
                 }
                 View::Diamond if i + 1 == len => (SliceKind::Triangle, strided_rows(m, stride), strided_cells(m, stride), [0.0; 3], [0.0; 3]),
@@ -959,7 +980,7 @@ impl Layout {
     /// skipped): the apex, the left and the right end of its last (strided) row.
     pub fn corners(&self, m: u32, h: f32) -> [[f32; 3]; 3] {
         let n_last = strided_side(m, self.stride);
-        let (ox, oz) = self.shape.offset(n_last);
+        let (ox, oz) = self.shape.offset(n_last, self.stride);
         [cell_center(h, ox, oz, 0, 0), cell_center(h, ox, oz, n_last, 0), cell_center(h, ox, oz, n_last, n_last)]
     }
 
@@ -1427,6 +1448,34 @@ mod tests {
         assert!(on_axis(Shape::FaceLeft, &|c| mid(c[0], c[1])));
         assert!(on_axis(Shape::FaceRight, &|c| mid(c[0], c[2])));
         assert!(!on_axis(Shape::Regular, &|c| c[0]));
+    }
+
+    #[test]
+    fn terraced_slices_sit_whole_cell_over_whole_cell() {
+        let mods: Vec<u32> = (2..=60).collect();
+        let odd: Vec<u32> = (3..=61).step_by(2).collect();
+        for (mods, budget) in [(&mods, u32::MAX), (&mods, 4_000), (&odd, u32::MAX)] {
+            let l = Layout::build(View::Stack, mods, Spacing::True, Shape::Terraced, budget);
+            let st = l.stride as f32;
+            let key = |p: [f32; 3]| ((p[0] * 2.0).round() as i64, (p[2] / SQRT3_2).round() as i64);
+            for si in 0..l.slices.len() {
+                // on one brick lattice (the apex cube's, shifted), and near the axis
+                let o = l.center(0, 0, 0);
+                let cells = l.slice_cells(si);
+                let pts: Vec<[f32; 3]> = cells.iter().map(|&(n, k)| sub(l.center(si, n, k), [o[0], 0.0, o[2]])).collect();
+                for p in &pts {
+                    assert!((p[0] * 2.0 - (p[0] * 2.0).round()).abs() < 1e-3 && (p[2] / SQRT3_2 - (p[2] / SQRT3_2).round()).abs() < 1e-3, "{p:?}");
+                }
+                let c = pts.iter().fold([0.0; 3], |a, p| add(a, add(*p, [o[0], 0.0, o[2]])));
+                let (cx, cz) = (c[0] / pts.len() as f32, c[2] / pts.len() as f32);
+                assert!(cx.abs() <= 0.35 * st && cz.abs() <= 0.35 * st, "m {}: centroid ({cx}, {cz})", l.slices[si].m);
+                // every cell of a slice sits right over a cell of the next one down
+                if si + 1 < l.slices.len() {
+                    let below: std::collections::HashSet<_> = l.slice_cells(si + 1).into_iter().map(|(n, k)| key(l.center(si + 1, n, k))).collect();
+                    assert!(pts.iter().all(|p| below.contains(&key(add(*p, [o[0], 0.0, o[2]])))), "slice {} is not over slice {}", l.slices[si].m, l.slices[si + 1].m);
+                }
+            }
+        }
     }
 
     #[test]

@@ -214,6 +214,38 @@ impl TetraView {
         }
     }
 
+    /// Check a side to peel when none is: the face being looked at (the top's own side
+    /// for the top), else the left.
+    fn peel_something(&mut self) {
+        let p = &mut self.config.peel;
+        if !p.active() {
+            let i = match self.config.view {
+                View::Face => self.config.face.side().unwrap_or(3),
+                _ => 0,
+            };
+            p.sides[i] = true;
+        }
+    }
+
+    /// Step the peel by `d` layers by hand (it stops playing): clamped at nothing
+    /// peeled and everything peeled, not wrapped.
+    pub fn step_peel(&mut self, d: i32) {
+        self.peel_something();
+        let extent = self.peel_extent();
+        let p = &mut self.config.peel;
+        p.playing = false;
+        p.layers = (p.layers as i64 + d as i64).clamp(0, extent as i64) as u32;
+    }
+
+    /// Play the peel forward or backward; the same direction again pauses it.
+    pub fn play_peel(&mut self, backward: bool) {
+        self.peel_something();
+        let p = &mut self.config.peel;
+        p.playing = !(p.playing && p.backward == backward);
+        p.backward = backward;
+        self.peel_clock = 0.0;
+    }
+
     /// Glide the space's camera square onto a side (or straight down / up).
     pub fn start_snap(&mut self, snap: Snap) {
         let (Some(l), Some(from)) = (&self.layout, self.camera) else { return };
@@ -259,7 +291,8 @@ impl TetraView {
                 self.peel_clock -= steps;
                 let extent = self.peel_extent().max(1);
                 let p = &mut self.config.peel;
-                p.layers = (p.layers + steps as u32) % (extent + 1);
+                let (period, steps) = (extent + 1, steps as u32 % (extent + 1));
+                p.layers = if p.backward { (p.layers.min(extent) + period - steps) % period } else { (p.layers + steps) % period };
             }
         }
         if !self.open && self.config.spin && self.visible() {
@@ -603,7 +636,7 @@ fn options(ui: &mut egui::Ui, t: &mut TetraView) {
     };
     mono_line(ui, &text);
     ui.separator();
-    note(ui, "Keys: V next view · F next face · 1–5 snap the stack's camera · P play the peel · U unfold again · G spacing · O options · Esc back. Stack: drag orbit, right / shift-drag pan, wheel zoom. Faces and diamond: drag pan, wheel zoom. Double-click reframes.");
+    note(ui, "Keys: V next view · F next face · 1–5 snap the stack's camera · ← → step the peel a layer (Shift: ten) · Home / End none / all · P play it, R rewind · U unfold again · G spacing · O options · Esc back. Stack: drag orbit, right / shift-drag pan, wheel zoom. Faces and diamond: drag pan, wheel zoom. Double-click reframes.");
 }
 
 /// The peel: which sides, how many layers, and the animation that takes them off one by
@@ -624,13 +657,33 @@ fn peel_controls(ui: &mut egui::Ui, t: &mut TetraView) {
     if !p.active() {
         return;
     }
+    let (playing, backward) = (p.playing, p.backward);
+    let mut act: Option<i32> = None;
+    let mut play: Option<bool> = None;
     ui.horizontal(|ui| {
-        let playing = p.playing;
-        if ui.add(egui::Button::new(if playing { "❚❚" } else { "▶" }).small().selected(playing)).on_hover_text(if playing { "Stop peeling (P)" } else { "Peel a layer at a time, and start over when nothing is left (P)" }).clicked() {
-            p.playing = !playing;
+        let small = |ui: &mut egui::Ui, text: &str, on: bool, tip: &str| ui.add(egui::Button::new(egui::RichText::new(text).monospace()).small().selected(on)).on_hover_text(tip).clicked();
+        if small(ui, "|◀", false, "Back to nothing peeled (Home)") {
+            act = Some(i32::MIN / 2);
         }
-        ui.spacing_mut().slider_width = 110.0;
-        ui.add(egui::Slider::new(&mut p.layers, 0..=extent.max(1)).show_value(false)).on_hover_text("Layers peeled");
+        if small(ui, if playing && backward { "❚❚" } else { "◀" }, playing && backward, "Rewind: put the layers back one by one, and from nothing peeled start again from everything peeled (R)") {
+            play = Some(true);
+        }
+        if small(ui, "◀|", false, "One layer back (←; Shift+← ten)") {
+            act = Some(-1);
+        }
+        if small(ui, "|▶", false, "One layer more (→; Shift+→ ten)") {
+            act = Some(1);
+        }
+        if small(ui, if playing && !backward { "❚❚" } else { "▶" }, playing && !backward, "Peel a layer at a time, and start over when nothing is left (P)") {
+            play = Some(false);
+        }
+        if small(ui, "▶|", false, "Everything peeled (End)") {
+            act = Some(i32::MAX / 2);
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.spacing_mut().slider_width = 150.0;
+        ui.add(egui::Slider::new(&mut p.layers, 0..=extent.max(1)).show_value(false)).on_hover_text("Layers peeled (← → step)");
         mono_line(ui, &format!("{} / {}", p.layers, extent));
     });
     ui.horizontal(|ui| {
@@ -638,6 +691,12 @@ fn peel_controls(ui: &mut egui::Ui, t: &mut TetraView) {
         mono_drag(ui, &mut p.speed, 0.1..=120.0, 0.05).on_hover_text("Layers a second while it plays");
         ui.label(egui::RichText::new("layers / s").color(ui.visuals().weak_text_color()));
     });
+    if let Some(d) = act {
+        t.step_peel(d);
+    }
+    if let Some(b) = play {
+        t.play_peel(b);
+    }
 }
 
 fn short(n: u32) -> String {
@@ -798,17 +857,27 @@ pub fn space(ui: &mut egui::Ui, model: &mut Model, ppp: f32, tex: Option<egui::T
             }
             if !ui.ctx().egui_wants_keyboard_input() {
                 let (esc, g, v, u, o, pk) = ui.input(|i| (i.key_pressed(egui::Key::Escape), i.key_pressed(egui::Key::G), i.key_pressed(egui::Key::V), i.key_pressed(egui::Key::U), i.key_pressed(egui::Key::O), i.key_pressed(egui::Key::P)));
-                if pk {
-                    let p = &mut t.config.peel;
-                    if !p.active() {
-                        // the face being looked at (the top's own side), else the left
-                        let i = match t.config.view {
-                            View::Face => t.config.face.side().unwrap_or(3),
-                            _ => 0,
-                        };
-                        p.sides[i] = true;
+                if t.config.view != View::Diamond {
+                    let (rk, left, right, home, end, shift) = ui.input(|i| (i.key_pressed(egui::Key::R), i.key_pressed(egui::Key::ArrowLeft), i.key_pressed(egui::Key::ArrowRight), i.key_pressed(egui::Key::Home), i.key_pressed(egui::Key::End), i.modifiers.shift));
+                    let n = if shift { 10 } else { 1 };
+                    if pk {
+                        t.play_peel(false);
                     }
-                    p.playing = !p.playing;
+                    if rk {
+                        t.play_peel(true);
+                    }
+                    if left {
+                        t.step_peel(-n);
+                    }
+                    if right {
+                        t.step_peel(n);
+                    }
+                    if home {
+                        t.step_peel(i32::MIN / 2);
+                    }
+                    if end {
+                        t.step_peel(i32::MAX / 2);
+                    }
                 }
                 if t.config.view == View::Stack {
                     let keys = [egui::Key::Num1, egui::Key::Num2, egui::Key::Num3, egui::Key::Num4, egui::Key::Num5];
@@ -970,7 +1039,7 @@ pub fn space(ui: &mut egui::Ui, model: &mut Model, ppp: f32, tex: Option<egui::T
             if l.view != View::Diamond && p.active() && (p.layers > 0 || p.playing) {
                 let names: Vec<&str> = p.checked().map(Side::name).collect();
                 let how = if names.len() == Side::ALL.len() { "every side".to_string() } else { names.join(", ") };
-                lines.push(format!("peeled: {} layer{} off {how}{} (P)", p.layers, if p.layers == 1 { "" } else { "s" }, if p.playing { ", playing" } else { "" }));
+                lines.push(format!("peeled: {} layer{} off {how}{} (← → step · P play · R rewind)", p.layers, if p.layers == 1 { "" } else { "s" }, if !p.playing { "" } else if p.backward { ", rewinding" } else { ", playing" }));
             }
             let lens = match model.layers.preset() {
                 Some(Preset::Mask) => "mask",

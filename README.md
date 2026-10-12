@@ -244,7 +244,14 @@ voids run through the solid as tunnels.
 * **Shape.** A slice of side s = m − 1 sits s·√(2/3) below the apex: the height of a
   regular tetrahedron of edge s. The default, **equilateral**, centres every slice on
   one vertical axis, so the stack is a regular tetrahedron: four equilateral faces,
-  all equally tilted. The flush variants anchor something else on the axis:
+  all equally tilted. Each slice grows a third of a row on every face, and the faces
+  are steep (70.5°), so they step in thirds: from the top that shows as thin bars at
+  the front and half-cell steps at the sides. **Equilateral, terraced** is the same
+  tetrahedron to within a third of a cell, grown one whole row on one face per slice
+  in turn (front, right, left; the apex, left or right corner stays put, a lattice
+  move each time). Every slice's cells then sit exactly over the next one's, the faces
+  step in whole cells, three slices to a terrace, and the top view shows every cell
+  whole. The flush variants anchor something else on the axis:
   * a **corner** (apex, left or right end of the last row): the two faces that meet
     there stand vertical, along a vertical edge. The apex corner is the first
     version's right-angled shape.
@@ -330,9 +337,12 @@ voids run through the solid as tunnels.
   together, the same number of layers each, and the unchecked ones stay (check one
   side to peel just it, or all but one to keep that one). **P** checks the left side
   (in a face view, that face's own side) if none is checked. A layer is a row or cell of the stride
-  on the sides and a drawn slice at the top and the base. The ▶ button (or **P**)
-  plays it, a layer every 1/speed s, starting over once nothing is left; the slider
-  sets the layers by hand. The first layer off the left and right sides is the white
+  on the sides and a drawn slice at the top and the base. **←** / **→** step it a
+  layer back or on (**Shift** ten), **Home** / **End** go to nothing / everything
+  peeled, and the buttons do the same (|◀ ◀| |▶ ▶|). ▶ (or **P**) plays it, a layer
+  every 1/speed s, starting over once nothing is left; ◀ (or **R**) rewinds, putting
+  the layers back one by one and starting again from everything peeled. Stepping
+  stops the playing; the slider sets the layers by hand. The first layer off the left and right sides is the white
   skin of 1s, and the layer under it is n mod m. Peeling is done while drawing (the
   vertex shader sends peeled cubes out of the clip volume, the pick pass too), so a
   layer costs nothing to take off or put back.
