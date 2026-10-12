@@ -33,8 +33,42 @@ const NUMBERS_MAX_CELLS: u64 = 9000;
 /// Largest in-cell number, in points (egui's glyph atlas grows with every size drawn).
 const NUMBERS_MAX_PT: f64 = 96.0;
 
-/// Picking a block of cells whose average wave the overlay plays (like the pin, but
-/// for a rectangle of cells between a red start mark and a blue end mark).
+/// The ghost wave's settings (see [`WaveOverlay::set_ghost`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct GhostWave {
+    on: bool,
+    modulus: u32,
+    /// Rows follow the main wave's (its selection, else its row), shifted by `offset`.
+    follow: bool,
+    offset: i32,
+    /// The ghost's own rows when not following.
+    rows: (u32, u32),
+}
+
+impl Default for GhostWave {
+    fn default() -> Self {
+        GhostWave { on: false, modulus: 2, follow: true, offset: 0, rows: (0, 10) }
+    }
+}
+
+impl GhostWave {
+    /// The ghost's (modulus, rows) given the main wave's rows, or None when it is off.
+    fn source(&self, main: (u32, u32)) -> Option<(u64, (u64, u64))> {
+        if !self.on {
+            return None;
+        }
+        let rows = if self.follow {
+            let shift = |r: u32| (r as i64 + self.offset as i64).max(0) as u64;
+            (shift(main.0), shift(main.1))
+        } else {
+            (self.rows.0 as u64, self.rows.1 as u64)
+        };
+        Some((self.modulus.max(2) as u64, rows))
+    }
+}
+
+/// Picking rows whose average wave the overlay plays (like the pin, but for every cell
+/// of the rows from a red start mark's to a blue end mark's).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 enum WaveSelect {
     #[default]
@@ -95,6 +129,9 @@ struct Model {
     pinned_row: Option<u32>,
     wave_select: WaveSelect,
     wave_row: u32,
+    /// The ghost wave: shown, its modulus, and its rows: following the main wave's rows
+    /// shifted by `offset`, or its own `rows` (first, last).
+    ghost: GhostWave,
     /// The pointer is over the overlay box: the canvas under it gets no hover.
     over_wave: bool,
     /// The pin and selection before the latest click (a double click undoes its first
@@ -145,6 +182,7 @@ impl Model {
             pinned_row: None,
             wave_select: WaveSelect::Off,
             wave_row: 0,
+            ghost: GhostWave::default(),
             over_wave: false,
             pin_before_click: None,
             select_before_click: WaveSelect::Off,
@@ -1184,6 +1222,7 @@ fn panel_ui(ui: &mut egui::Ui, model: &mut Model, canvas_px: (u32, u32), _frame_
             }
         };
         mono_line(ui, &status);
+        ghost_controls(ui, model);
         note(ui, "Plays one row as w(θ) = Σ (C(n,k) mod m)·cos((n−2k)θ + φ): the row under the pointer, else the last visible row. Click a cell to pin its row; a selection plays the average of every cell of its rows instead.");
     });
 
@@ -1371,6 +1410,54 @@ fn bar_drag<N: egui::emath::Numeric>(ui: &mut egui::Ui, w: f32, v: &mut N, range
 fn bar_button(ui: &mut egui::Ui, label: &str, selected: bool, tip: &str) -> bool {
     let h = ui.spacing().interact_size.y;
     ui.add_sized([30.0, h], egui::Button::new(egui::RichText::new(label).font(FontId::monospace(12.0))).selected(selected)).on_hover_text(tip).clicked()
+}
+
+/// The ghost wave's controls: on, its modulus, and its rows (following the main wave's
+/// with an offset, or its own).
+fn ghost_controls(ui: &mut egui::Ui, model: &mut Model) {
+    let main = match model.wave_select {
+        WaveSelect::Active(a, b) => (a.0.min(b.0), a.0.max(b.0)),
+        _ => (model.wave_row, model.wave_row),
+    };
+    let g = &mut model.ghost;
+    ui.horizontal(|ui| {
+        let was = g.on;
+        ui.checkbox(&mut g.on, "ghost wave").on_hover_text("A second wave, drawn faintly (violet) behind the green one in the same box and scroll: the same or other rows in another modulus, to compare their shapes. Each wave is scaled to the box on its own.");
+        if g.on && !was {
+            // start from what plays now, in this modulus: then pin another one
+            g.modulus = model.m;
+            g.rows = main;
+        }
+        if g.on {
+            ui.label(egui::RichText::new("mod").color(ui.visuals().weak_text_color()));
+            mono_drag_with(ui, &mut g.modulus, 2..=MOD_CAP, 0.1, false).on_hover_text("The ghost's modulus: it stays here while the main wave's modulus moves");
+            if ui.small_button("= m").on_hover_text("The current modulus").clicked() {
+                g.modulus = model.m;
+            }
+        }
+    });
+    if !g.on {
+        return;
+    }
+    ui.horizontal(|ui| {
+        ui.checkbox(&mut g.follow, "follow").on_hover_text("Rows follow the main wave's (its selection, or the row it plays), shifted by the offset; off, the ghost keeps rows of its own");
+        if g.follow {
+            ui.label(egui::RichText::new("offset").color(ui.visuals().weak_text_color()));
+            mono_drag_with(ui, &mut g.offset, -100_000..=100_000, 0.1, false).on_hover_text("Rows below (+) or above (−) the main wave's");
+        } else {
+            ui.label(egui::RichText::new("rows").color(ui.visuals().weak_text_color()));
+            mono_drag_with(ui, &mut g.rows.0, 0..=u32::MAX - 1, 0.1, false).on_hover_text("First row");
+            ui.label(egui::RichText::new("to").color(ui.visuals().weak_text_color()));
+            mono_drag_with(ui, &mut g.rows.1, 0..=u32::MAX - 1, 0.1, false).on_hover_text("Last row");
+            if ui.small_button("← main").on_hover_text("Take the main wave's rows").clicked() {
+                g.rows = main;
+            }
+        }
+    });
+    if let Some((m, (a, b))) = g.source(main) {
+        let rows = if a == b { format!("row {a}") } else { format!("rows {}–{}", a.min(b), a.max(b)) };
+        mono_line(ui, &format!("ghost: {rows} · mod {m}"));
+    }
 }
 
 /// The interval sequence picker: the presets in a list (picking the current one again
@@ -1818,6 +1905,11 @@ fn wave_overlay(ui: &mut egui::Ui, model: &mut Model, rect: Rect, ppp: f32, dt: 
         };
         model.wave_row = row;
         model.wave.share_closed_form(&model.modulus);
+        let main_rows = match model.wave_select {
+            WaveSelect::Active(a, b) => (a.0.min(b.0), a.0.max(b.0)),
+            _ => (row, row),
+        };
+        model.wave.set_ghost(model.ghost.source(main_rows));
         if let WaveSelect::Active(a, b) = model.wave_select {
             // (whole rows for now: the marked cells pick the rows, every cell of them counts)
             model.wave.set_rows(model.m as u64, a.0 as u64, b.0 as u64);
@@ -2127,6 +2219,21 @@ mod tests {
         md.offset_playing = false;
         md.advance_offset(1.0);
         assert!((md.style.offset - 0.2).abs() < 1e-5);
+    }
+
+    #[test]
+    fn the_ghost_follows_or_keeps_its_own_rows() {
+        let mut g = GhostWave { on: true, modulus: 5, ..GhostWave::default() };
+        // following: the main wave's rows, shifted (never above row 0)
+        assert_eq!(g.source((1, 10)), Some((5, (1, 10))));
+        g.offset = -3;
+        assert_eq!(g.source((1, 10)), Some((5, (0, 7))));
+        // its own rows: rows 1–5 mod 5 against a main wave of rows 1–10
+        g.follow = false;
+        g.rows = (1, 5);
+        assert_eq!(g.source((1, 10)), Some((5, (1, 5))));
+        g.on = false;
+        assert_eq!(g.source((1, 10)), None);
     }
 
     #[test]

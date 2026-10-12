@@ -240,7 +240,15 @@ visible row; small ticks at the canvas edges mark it. **Select cells** (next to
 one in the last (blue mark); the overlay plays the average of every cell of those
 rows and the rows between, (1/N) Σ r_{n,k} cos((n − 2k)(θ − s)), binned by frequency
 like a row (the outline marks the rows). The top 1 and the row under it, mod 10, are
-three 1s, at frequencies 0 and ±1.
+three 1s, at frequencies 0 and ±1. **Ghost wave** draws a second wave faintly (violet) behind
+the green one, in the same box and scroll, to compare shapes: it starts as what plays
+now in the current modulus; give it another modulus and it stays pinned there while
+the main one sweeps. With *follow* its rows are the main wave's (the selection, or
+the row playing) shifted by an *offset*; without, it keeps rows of its own (rows
+1–10 mod 2 against rows 1–5 mod 5, say; *← main* copies the main rows). It is the
+same engine as the main wave (whole rows, summed or sampled the same way), and each
+wave is scaled to the box on its own, so their shapes are compared, not their
+sizes.
 It is exact for any selection Pascal's rule can step through in about 24 million
 additions — rows up to 2048 directly, deeper ones from their first row (closed form)
 down the selection's light cone. Larger selections are summed in 16 exact bands of

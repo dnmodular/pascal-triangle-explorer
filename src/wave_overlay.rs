@@ -80,6 +80,8 @@ const MIN_DRAW_SIDE: f32 = 2.0 * PAD + LABEL_H + 32.0;
 
 /// The tetra stack's wire green.
 const WAVE_RGB: [u8; 3] = [82, 242, 122];
+/// The ghost wave's color: a faint violet line behind the green one.
+const GHOST_RGB: [u8; 3] = [196, 150, 255];
 const FORMULA: &str = "C(n,k) mod m → Σ r_k cos((n−2k)θ)";
 
 /// Which corner of the canvas the overlay sits in.
@@ -311,6 +313,11 @@ pub struct WaveOverlay {
     /// The formula fit the box when it was last laid out (decided in `draw`).
     formula_fits: bool,
     settled: bool,
+    /// A ghost wave (see [`WaveOverlay::set_ghost`]): a second overlay that only computes
+    /// and holds its curve, drawn faintly behind this one in the same box and scroll.
+    ghost: Option<Box<WaveOverlay>>,
+    /// This overlay is someone's ghost (violet line, no fill, its own label text).
+    is_ghost: bool,
 }
 
 impl Default for WaveOverlay {
@@ -356,6 +363,8 @@ impl WaveOverlay {
             note: String::new(),
             formula_fits: true,
             settled: false,
+            ghost: None,
+            is_ghost: false,
         }
     }
 
@@ -376,6 +385,9 @@ impl WaveOverlay {
     pub fn is_animating(&self) -> bool {
         if self.layout().is_none() {
             return false; // nothing to show (no viewport, or one too small for the box)
+        }
+        if self.ghost.as_ref().is_some_and(|g| g.is_animating()) {
+            return true;
         }
         if self.visible {
             self.fade < 1.0 || self.dirty || self.texts_dirty || !self.settled || self.config.scroll != 0.0
@@ -451,6 +463,35 @@ impl WaveOverlay {
         }
     }
 
+    /// Show a ghost wave: every cell of rows `rows.0..=rows.1` mod `modulus` (as
+    /// [`WaveOverlay::set_rows`]), drawn faintly behind the main wave in the same box,
+    /// scrolling with it, so two waves can be compared: other rows, another modulus.
+    /// Each is normalized on its own (their shapes are compared, not their sizes).
+    /// None removes it. Cheap and idempotent; call every frame.
+    pub fn set_ghost(&mut self, ghost: Option<(u64, (u64, u64))>) {
+        match ghost {
+            None => self.ghost = None,
+            Some((m, (a, b))) => {
+                let g = self.ghost.get_or_insert_with(|| {
+                    let mut g = Box::new(WaveOverlay::new());
+                    g.is_ghost = true;
+                    g
+                });
+                g.set_rows(m, a, b);
+            }
+        }
+    }
+
+    /// The ghost's label ("ghost: rows 1–5 · mod 5"), when there is one.
+    pub fn ghost_label(&self) -> Option<&str> {
+        self.ghost.as_ref().map(|g| g.label.as_str())
+    }
+
+    /// The ghost's samples (tests).
+    pub fn ghost_samples(&self) -> Option<&[f32]> {
+        self.ghost.as_ref().map(|g| g.samples.as_slice())
+    }
+
     /// Lend the overlay the app's closed form for the current modulus, so long rows do not
     /// build a second copy of its tables. Cheap (an Arc clone when it changed).
     pub fn share_closed_form(&mut self, md: &Arc<Modulus>) {
@@ -482,7 +523,11 @@ impl WaveOverlay {
         if let Source::Region { modulus: m, n_lo, n_hi, .. } = src {
             self.label.clear();
             let rows = if n_lo == n_hi { format!("row {}", group(n_lo)) } else { format!("rows {}–{}", group(n_lo), group(n_hi)) };
-            let _ = write!(self.label, "{rows} · mod {} · selection", group(m));
+            if self.is_ghost {
+                let _ = write!(self.label, "ghost: {rows} · mod {}", group(m));
+            } else {
+                let _ = write!(self.label, "{rows} · mod {} · selection", group(m));
+            }
             self.note.clear();
             let st = self.region_stats;
             if !self.in_range {
@@ -827,6 +872,18 @@ impl WaveOverlay {
         }
         let speed = if self.config.scroll.is_finite() { self.config.scroll as f64 } else { 0.0 };
         self.shift = (self.shift + speed * dt as f64).rem_euclid(std::f64::consts::TAU);
+        // the ghost: the same box, visibility and smoothing, and this wave's scroll
+        if let Some(g) = self.ghost.as_mut() {
+            g.config = self.config;
+            g.config.scroll = 0.0;
+            g.visible = self.visible;
+            g.shift = self.shift;
+            g.viewport = self.viewport;
+            g.window = self.window;
+            g.pixels_per_point = self.pixels_per_point;
+            g.formula_fits = self.formula_fits;
+            g.update(dt);
+        }
         if !self.visible && self.fade <= FADE_EPS {
             return; // hidden: nothing to compute
         }
@@ -1010,10 +1067,10 @@ impl WaveOverlay {
             let y = (cy - s * inv * half).clamp(plot.min.y, plot.max.y);
             self.points.push(Pos2::new(x, y));
         }
-        let [r, g, b] = WAVE_RGB;
+        let [r, g, b] = if self.is_ghost { GHOST_RGB } else { WAVE_RGB };
         let fill = Arc::make_mut(&mut self.fill_mesh);
         fill.clear();
-        if self.config.fill {
+        if self.config.fill && !self.is_ghost {
             let fill_col = Color32::from_rgba_unmultiplied(r, g, b, (0.15 * 255.0 * fade).round() as u8);
             for (j, p) in self.points.iter().enumerate() {
                 fill.colored_vertex(*p, fill_col);
@@ -1030,7 +1087,8 @@ impl WaveOverlay {
         if self.points.len() >= 2 {
             self.path.clear();
             self.path.add_open_points(&self.points);
-            let stroke = PathStroke::from(Stroke::new(2.0, Color32::from_rgba_unmultiplied(r, g, b, (255.0 * fade).round() as u8)));
+            let (width, alpha) = if self.is_ghost { (1.5, 0.8) } else { (2.0, 1.0) };
+            let stroke = PathStroke::from(Stroke::new(width, Color32::from_rgba_unmultiplied(r, g, b, (255.0 * alpha * fade).round() as u8)));
             self.path.stroke_open(1.0 / self.pixels_per_point, &stroke, line);
         }
     }
@@ -1047,6 +1105,11 @@ impl WaveOverlay {
         painter.rect_stroke(bx, CornerRadius::same(8), Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, a(0.15))), StrokeKind::Inside);
         let zero = Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, a(0.18)));
         painter.line_segment([Pos2::new(plot.min.x, plot.center().y), Pos2::new(plot.max.x, plot.center().y)], zero);
+        if let Some(g) = &self.ghost {
+            if g.fade > FADE_EPS {
+                painter.add(Shape::mesh(g.line_mesh.clone()));
+            }
+        }
         painter.add(Shape::mesh(self.fill_mesh.clone()));
         painter.add(Shape::mesh(self.line_mesh.clone()));
 
@@ -1062,6 +1125,13 @@ impl WaveOverlay {
         painter.galley_with_override_text_color(label_rect.min, line(&self.label, 11.0), Color32::from_rgba_unmultiplied(221, 221, 221, a(0.9)));
         if let Some(nr) = note_rect {
             painter.galley_with_override_text_color(nr.min, line(&self.note, 10.0), Color32::from_rgba_unmultiplied(187, 187, 187, a(0.7)));
+        }
+        // a ghost's label takes the formula's line, in its color
+        if let (Some(g), Some(fr)) = (&self.ghost, formula_rect) {
+            let [r, gg, b] = GHOST_RGB;
+            let text = line(&g.label, 10.0);
+            painter.galley_with_override_text_color(Pos2::new(fr.min.x, fr.max.y - text.size().y), text, Color32::from_rgba_unmultiplied(r, gg, b, a(0.9)));
+            return;
         }
         if bx.width() >= FORMULA_MIN_SIDE {
             let formula = line(FORMULA, 10.0);
@@ -1683,6 +1753,41 @@ mod tests {
         }
         assert_eq!(w.note(), "average of 55 cells");
         assert_eq!(w.label(), "rows 0–9 · mod 10 · selection");
+    }
+
+
+    #[test]
+    fn a_ghost_draws_its_own_rows_and_modulus_in_step() {
+        // rows 0–9 mod 2 with a ghost of rows 0–4 mod 5: the ghost's curve is what an
+        // overlay of those rows alone draws, in the same scroll, and the main one is
+        // untouched by it
+        let mut w = overlay();
+        w.set_rows(2, 0, 9);
+        w.set_ghost(Some((5, (0, 4))));
+        let mut alone = overlay();
+        alone.set_rows(5, 0, 4);
+        let mut plain = overlay();
+        plain.set_rows(2, 0, 9);
+        for _ in 0..90 {
+            w.update(1.0 / 60.0);
+            alone.update(1.0 / 60.0);
+            plain.update(1.0 / 60.0);
+        }
+        let g = w.ghost_samples().expect("a ghost");
+        assert_eq!(g.len(), alone.samples().len());
+        for (a, b) in g.iter().zip(alone.samples()) {
+            assert!((a - b).abs() < 1e-4, "{a} vs {b}");
+        }
+        assert_eq!(w.samples(), plain.samples());
+        assert_eq!(w.ghost_label(), Some("ghost: rows 0–4 · mod 5"));
+        assert_eq!(w.label(), "rows 0–9 · mod 2 · selection");
+        // the ghost follows its inputs, and goes when asked
+        w.set_ghost(Some((5, (2, 6))));
+        run(&mut w, 0.5, 1.0 / 60.0);
+        assert_eq!(w.ghost_label(), Some("ghost: rows 2–6 · mod 5"));
+        assert!(w.is_animating(), "it scrolls");
+        w.set_ghost(None);
+        assert!(w.ghost_label().is_none());
     }
 
 }
