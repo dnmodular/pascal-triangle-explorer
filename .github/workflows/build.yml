@@ -1,0 +1,83 @@
+# Builds the app for Windows, macOS and Linux on every push, and zips each build
+# with the README and licence as a downloadable artifact (the run's page under the
+# Actions tab, "Artifacts"). Pushing a version tag (v0.1.0, …) also publishes a
+# GitHub release with the three zips attached.
+#
+# The CPU unit tests run on Linux. The GPU tests (tests/*.rs) need a graphics
+# adapter, so they are left to a machine that has one: `cargo test`.
+
+name: Build
+
+on:
+  push:
+    branches: [main, "claude/**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x64
+            os: windows-latest
+            exe: pascal-triangle-explorer.exe
+          - name: macos-arm64
+            os: macos-latest
+            exe: pascal-triangle-explorer
+          - name: linux-x64
+            os: ubuntu-latest
+            exe: pascal-triangle-explorer
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Unit tests (CPU only)
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo test --release --locked --lib --bins
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Package
+        shell: bash
+        run: |
+          dir=pascal-triangle-explorer-${{ matrix.name }}
+          mkdir "$dir"
+          cp "target/release/${{ matrix.exe }}" README.md LICENSE "$dir/"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            7z a "$dir.zip" "$dir" > /dev/null
+          else
+            zip -qr "$dir.zip" "$dir"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pascal-triangle-explorer-${{ matrix.name }}
+          path: pascal-triangle-explorer-${{ matrix.name }}.zip
+          if-no-files-found: error
+
+  release:
+    name: Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.zip
+          generate_release_notes: true

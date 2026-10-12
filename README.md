@@ -12,20 +12,72 @@ The look, palettes, controls and keys follow `reference/pascal-core.html`; the
 layer stack (measures blended into a field, transforms on top, two field color
 modes) follows the `MAP_MODES` registry of `reference/pascal.html`.
 
-## Build and run
+## Download and run
 
-Requirements: a Rust toolchain (stable, via [rustup](https://rustup.rs)) and a
-GPU with Vulkan, Metal, DirectX 12 or OpenGL. No other SDKs are needed.
+Ready-to-run builds for Windows, macOS and Linux are made by GitHub Actions on every
+push ([`.github/workflows/build.yml`](.github/workflows/build.yml)):
+
+* **Releases:** the repository's *Releases* page has a zip per platform for each
+  version tag (`v0.1.0`, …).
+* **Latest build of a branch:** the *Actions* tab → the newest *Build* run for the
+  branch → *Artifacts* at the bottom of the run's page (signing in to GitHub is
+  needed; artifacts expire after 90 days).
+
+Unzip and run `pascal-triangle-explorer.exe` (Windows) or `pascal-triangle-explorer`
+(macOS, Linux). Nothing else is installed; a GPU driver with Vulkan, Metal,
+DirectX 12 or OpenGL is all it needs.
+
+* **Windows:** the build is not code-signed, so SmartScreen may say *Windows
+  protected your PC*: *More info* → *Run anyway*. A console window opens beside the
+  app with its log; leave it open (closing it closes the app).
+* **macOS:** unsigned too. Right-click the file → *Open* the first time, or run
+  `xattr -dr com.apple.quarantine pascal-triangle-explorer` in its folder. The macOS
+  build is for Apple silicon.
+* **Linux:** needs `libxkbcommon` and a Vulkan or GL driver, e.g. on Debian/Ubuntu
+  `sudo apt install libxkbcommon-x11-0 mesa-vulkan-drivers`. Wayland and X11 both
+  work. `chmod +x pascal-triangle-explorer` if the zip lost the execute bit.
+
+## Build from source
+
+You need two things: the Rust toolchain (via [rustup](https://rustup.rs)) and, on
+Windows and macOS, the system's C linker that Rust uses. No other SDKs or libraries;
+every dependency is fetched and built by Cargo.
+
+**Windows**
+
+1. Download and run `rustup-init.exe` from [rustup.rs](https://rustup.rs). When it
+   says the Visual Studio C++ build tools are missing, let it install them (the
+   *Desktop development with C++* workload: the MSVC linker and the Windows SDK).
+   Then accept the default Rust install (stable, MSVC).
+2. Get the code: install [Git](https://git-scm.com) and run
+   `git clone https://github.com/dnmodular/pascal-triangle-explorer`, or use
+   *Code* → *Download ZIP* on GitHub and unzip it. For a branch other than the
+   default, add `-b <branch>` to the clone (or pick the branch before downloading).
+3. Open PowerShell in the folder and run `cargo run --release`. The first build
+   downloads and compiles the dependencies (a few minutes); later ones take seconds.
+   The app is then `target\release\pascal-triangle-explorer.exe`, which you can run
+   or pin directly.
+
+**macOS**
 
 ```sh
-cargo run --release
+xcode-select --install                                          # the linker
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh  # Rust
+git clone https://github.com/dnmodular/pascal-triangle-explorer
+cd pascal-triangle-explorer && cargo run --release              # Metal
 ```
 
-| Platform | Notes |
-| --- | --- |
-| **Windows** | Install Rust from rustup.rs (MSVC toolchain). `cargo run --release` uses DirectX 12 or Vulkan. |
-| **macOS** | `xcode-select --install` for the linker, then `cargo run --release` (Metal). |
-| **Linux** | Needs `libxkbcommon` and a Vulkan or GL driver at runtime, e.g. on Debian/Ubuntu `sudo apt install libxkbcommon-x11-0 mesa-vulkan-drivers`. Wayland and X11 both work. |
+**Linux**
+
+```sh
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh  # Rust
+sudo apt install build-essential libxkbcommon-x11-0 mesa-vulkan-drivers   # Debian/Ubuntu
+git clone https://github.com/dnmodular/pascal-triangle-explorer
+cd pascal-triangle-explorer && cargo run --release
+```
+
+The app runs on DirectX 12 or Vulkan on Windows, Metal on macOS, and Vulkan or GL on
+Linux. Use `--release`: a debug build works but draws far more slowly.
 
 Headless rendering (no window), handy for scripts and for machines without a
 display:
