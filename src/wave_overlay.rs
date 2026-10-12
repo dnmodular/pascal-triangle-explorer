@@ -438,6 +438,19 @@ impl WaveOverlay {
         }
     }
 
+    /// Point the overlay at whole rows: every cell of the rows from `a_row` to `b_row`
+    /// (either order), the wave being their average. The region between the marked
+    /// cells, as wide as the deepest row: each row keeps all of its own cells.
+    pub fn set_rows(&mut self, modulus: u64, a_row: u64, b_row: u64) {
+        let (n_lo, n_hi) = (a_row.min(b_row), a_row.max(b_row));
+        let w = n_hi.min(i64::MAX as u64) as i64;
+        let src = Source::Region { modulus, n_lo, n_hi, x2_lo: -w, x2_hi: w };
+        if self.source != Some(src) {
+            self.source = Some(src);
+            self.dirty = true;
+        }
+    }
+
     /// Lend the overlay the app's closed form for the current modulus, so long rows do not
     /// build a second copy of its tables. Cheap (an Arc clone when it changed).
     pub fn share_closed_form(&mut self, md: &Arc<Modulus>) {
@@ -1646,5 +1659,31 @@ mod tests {
             assert!(Rect::from_min_size(Pos2::new(300.0, 0.0), Vec2::new(980.0, 736.0)).contains_rect(b), "{c:?}");
         }
     }
+
+    #[test]
+    fn whole_rows_take_every_cell_of_each_row() {
+        // the top 1 and the row under it, mod 10: three 1s, at frequencies 0, +1 and −1
+        let mut w = overlay();
+        w.set_rows(10, 0, 1);
+        w.update(1.0 / 60.0);
+        assert_eq!((w.target(0), w.target(1), w.target(-1)), (1.0, 1.0, 1.0));
+        assert_eq!(w.note(), "average of 3 cells");
+        // rows 0–9 mod 10 (either order): every cell of every row, by frequency n − 2k
+        let mut w = overlay();
+        w.set_rows(10, 9, 0);
+        w.update(1.0 / 60.0);
+        let mut want: HashMap<i64, f64> = HashMap::new();
+        for n in 0..=9u32 {
+            for k in 0..=n {
+                *want.entry(n as i64 - 2 * k as i64).or_default() += (binom_exact(n, k).unwrap() % 10) as f64;
+            }
+        }
+        for f in -10..=10i64 {
+            assert_eq!(w.target(f) as f64, want.get(&f).copied().unwrap_or(0.0), "f = {f}");
+        }
+        assert_eq!(w.note(), "average of 55 cells");
+        assert_eq!(w.label(), "rows 0–9 · mod 10 · selection");
+    }
+
 }
 

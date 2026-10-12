@@ -1158,7 +1158,7 @@ fn panel_ui(ui: &mut egui::Ui, model: &mut Model, canvas_px: (u32, u32), _frame_
             ui.checkbox(&mut model.wave.config.smooth, "smooth").on_hover_text("Ease from one wave to the next; off snaps straight to the new one");
             match model.wave_select {
                 WaveSelect::Off => {
-                    if ui.small_button("select cells").on_hover_text("Average the waves of a block of cells: click a start cell (red mark), then an end cell (blue mark)").clicked() {
+                    if ui.small_button("select cells").on_hover_text("Average the waves of whole rows: click a cell in the first row (red mark), then one in the last row (blue mark); every cell of those rows and the rows between counts").clicked() {
                         model.wave_select = WaveSelect::PickStart;
                     }
                 }
@@ -1178,10 +1178,13 @@ fn panel_ui(ui: &mut egui::Ui, model: &mut Model, canvas_px: (u32, u32), _frame_
             WaveSelect::Off => "selection: none".to_string(),
             WaveSelect::PickStart => "click the start cell (red)".to_string(),
             WaveSelect::PickEnd((n, k)) => format!("start ({n}, {k}) · click the end cell (blue)"),
-            WaveSelect::Active((n1, k1), (n2, k2)) => format!("cells ({n1}, {k1}) – ({n2}, {k2})"),
+            WaveSelect::Active((n1, _), (n2, _)) => {
+                let (lo, hi) = (n1.min(n2), n1.max(n2));
+                if lo == hi { format!("row {lo}, whole") } else { format!("rows {lo}–{hi}, whole") }
+            }
         };
         mono_line(ui, &status);
-        note(ui, "Plays one row as w(θ) = Σ (C(n,k) mod m)·cos((n−2k)θ + φ): the row under the pointer, else the last visible row. Click a cell to pin its row; a selection plays the average of its cells instead.");
+        note(ui, "Plays one row as w(θ) = Σ (C(n,k) mod m)·cos((n−2k)θ + φ): the row under the pointer, else the last visible row. Click a cell to pin its row; a selection plays the average of every cell of its rows instead.");
     });
 
     section(ui, "Tetra stack", |ui| tetra_ui::panel(ui, model));
@@ -1816,7 +1819,8 @@ fn wave_overlay(ui: &mut egui::Ui, model: &mut Model, rect: Rect, ppp: f32, dt: 
         model.wave_row = row;
         model.wave.share_closed_form(&model.modulus);
         if let WaveSelect::Active(a, b) = model.wave_select {
-            model.wave.set_region(model.m as u64, (a.0 as u64, a.1 as u64), (b.0 as u64, b.1 as u64));
+            // (whole rows for now: the marked cells pick the rows, every cell of them counts)
+            model.wave.set_rows(model.m as u64, a.0 as u64, b.0 as u64);
         } else {
             let (k_lo, k_hi) = model.view.visible_k(row, cw);
             model.wave.set_source(row as u64, model.m as u64, (k_lo as u64, k_hi as u64));
@@ -1839,8 +1843,12 @@ fn wave_overlay(ui: &mut egui::Ui, model: &mut Model, rect: Rect, ppp: f32, dt: 
         _ => (None, None),
     };
     if let (Some(a), Some(b)) = (start, end) {
-        let r = cell_box(a).union(cell_box(b));
-        painter.rect_stroke(r, 0.0, egui::Stroke::new(1.0, Color32::from_white_alpha(140)), egui::StrokeKind::Outside);
+        // the whole rows between the marks: a trapezoid from the top row's ends to the
+        // bottom row's
+        let (lo, hi) = (a.0.min(b.0), a.0.max(b.0));
+        let (tl, tr, bl, br) = (cell_box((lo, 0)), cell_box((lo, lo)), cell_box((hi, 0)), cell_box((hi, hi)));
+        let outline = vec![tl.left_top(), tr.right_top(), br.right_bottom(), bl.left_bottom()];
+        painter.add(egui::Shape::closed_line(outline, egui::Stroke::new(1.0, Color32::from_white_alpha(140))));
     }
     for (cell, rgb) in [(start, (235, 64, 64)), (end, (70, 130, 255))] {
         if let Some(c) = cell {

@@ -236,9 +236,11 @@ r_k = C(n, k) mod m        w(θ) = Σ_k r_k · cos((n − 2k)·(θ − s(t))),  
 
 The row is the pinned one if any, else the row under the pointer, else the last
 visible row; small ticks at the canvas edges mark it. **Select cells** (next to
-"smooth") plays a block of cells instead: click a start cell (red mark), then an end
-cell (blue mark); the overlay plays the average of every cell in the rectangle
-between them, (1/N) Σ r_{n,k} cos((n − 2k)(θ − s)), binned by frequency like a row.
+"smooth") plays whole rows instead: click a cell in the first row (red mark), then
+one in the last (blue mark); the overlay plays the average of every cell of those
+rows and the rows between, (1/N) Σ r_{n,k} cos((n − 2k)(θ − s)), binned by frequency
+like a row (the outline marks the rows). The top 1 and the row under it, mod 10, are
+three 1s, at frequencies 0 and ±1.
 It is exact for any selection Pascal's rule can step through in about 24 million
 additions — rows up to 2048 directly, deeper ones from their first row (closed form)
 down the selection's light cone. Larger selections are summed in 16 exact bands of
