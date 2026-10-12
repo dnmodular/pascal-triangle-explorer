@@ -4,7 +4,7 @@
 // One thread per cell (m, n, k) of the stack, in the CPU's enumeration: slices
 // in order, and inside a slice the strided rows i = 0.. with cells j = 0..i
 // (n = i·stride, k = j·stride), or for a face row (kind 1) its cells
-// k = j·stride of row row_n. Each slice carries its own modulus: the factor
+// cells (row_n + j·dn·stride, k0 + j·dk·stride). Each slice carries its own modulus: the factor
 // descriptors from `factor_off` (their tables shared between slices with the
 // same prime power), recombined by Garner's CRT exactly as the 2D passes do.
 //
@@ -31,16 +31,16 @@ struct Slice {
   nfactors: u32,
   factor_off: u32,    // factors[factor_off ..] (garner constants per slice)
   level_off: u32,     // residue → palette level bytes at levels[level_off + r] (draw pass)
-  kind: u32,          // 0 rows row_n, row_n + s, … (a triangle); 1 the single row row_n
+  kind: u32,          // 0 rows row_n, row_n + s, … (a triangle); else a line, 1 | dn << 1 | dk << 2
   row_n: u32,
   ox: f32,            // cell (n, k) sits at o + n·nv + (k, 0, 0) (draw pass)
   oy: f32,
   oz: f32,
-  pad0: u32,
+  k0: u32,          // a line's first k
   nx: f32,
   ny: f32,
   nz: f32,
-  pad1: u32,
+  peel_id: u32,     // the row the front side's peel counts from | layer << 16
 };
 
 @group(0) @binding(0) var<uniform> C: CellParams;
@@ -90,10 +90,11 @@ fn tetra_cells(@builtin(global_invocation_id) gid: vec3<u32>) {
   let l = g - s.cell_base;
   var n = 0u;
   var k = 0u;
-  if (s.kind == 1u) {
-    // a face row: row_n, cells 0, s, 2s, …
-    n = s.row_n;
-    k = l * C.stride;
+  if (s.kind != 0u) {
+    // a line of a face: (row_n + l·dn·s, k0 + l·dk·s)
+    let step = l * C.stride;
+    n = s.row_n + select(0u, step, (s.kind & 2u) != 0u);
+    k = s.k0 + select(0u, step, (s.kind & 4u) != 0u);
   } else {
   // row i with i(i+1)/2 ≤ l < (i+1)(i+2)/2: the f32 root is within one, then exact
   var i = u32(max(floor((sqrt(8.0 * f32(l) + 1.0) - 1.0) * 0.5), 0.0));

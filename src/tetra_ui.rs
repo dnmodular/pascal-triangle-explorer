@@ -1,14 +1,15 @@
 //! The tetra stack's UI: a small entry in the main panel, the live preview tile on the
 //! 2D canvas, and the isolated 3D space with its own options panel, a HUD, and a
-//! thumbnail of the 2D view to go back. The space shows the stack, its front face laid
-//! flat, or the diamond (the face with the base slice hinged down beside it).
+//! thumbnail of the 2D view to go back. The space shows the stack, one of its faces laid
+//! flat (front, left, right, base, or the stack from the top), or the diamond (the
+//! front face with the base slice hinged down beside it).
 
 use egui::{Align2, Color32, CornerRadius, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2};
 use pascal::layers::Preset;
 use pascal::math::Modulus;
 use pascal::palette::Scheme;
 use pascal::sweep::{ModMode, PrimeOrder, Seq};
-use pascal::tetra::{describe, TILE_BUDGET, Side, Snap, face_row_alternates, face_row_zeros, selected_moduli, view_stride, Camera, CubeId, Layout, SceneKey, Shape, SliceKind, Spacing, TetraConfig, View, BUDGETS, FOLD, TETRA_MAX_M};
+use pascal::tetra::{describe, Face, TILE_BUDGET, Side, Snap, face_row_alternates, face_row_zeros, selected_moduli, view_stride, Camera, CubeId, Layout, SceneKey, Shape, SliceKind, Spacing, TetraConfig, View, BUDGETS, FOLD, TETRA_MAX_M};
 use pascal::tetra_gpu::{outline_vertices, DrawOptions, TetraRenderer, BACKGROUND};
 use pascal::wave_overlay::Corner;
 
@@ -22,8 +23,9 @@ const FILL_TIME: f32 = 0.35;
 const UNFOLD_TIME: f32 = 1.1;
 /// Seconds for a snapped camera to glide into place.
 const SNAP_TIME: f32 = 0.45;
-/// What a peel extent was counted for: the sides, and the layout (total, stride, slices).
-type PeelKey = ([bool; 5], u32, u32, usize);
+/// What a peel extent was counted for: the sides, and the layout (view, face, total,
+/// stride, slices).
+type PeelKey = ([bool; 5], View, Face, u32, u32, usize);
 /// Width of the space's options panel (points).
 const OPTIONS_W: f32 = 270.0;
 
@@ -158,7 +160,7 @@ impl TetraView {
     pub fn peel_extent(&mut self) -> u32 {
         let Some(l) = &self.layout else { return 0 };
         let p = self.config.peel;
-        let key = (p.sides, l.total, l.stride, l.slices.len());
+        let key = (p.sides, l.view, l.face, l.total, l.stride, l.slices.len());
         match self.peel_extent {
             Some((k, e)) if k == key => e,
             _ => {
@@ -189,12 +191,26 @@ impl TetraView {
         }
     }
 
-    /// The peel the next draw uses: the space's stack only.
+    /// The peel shows: the space's stack and faces (not the diamond).
+    fn peeling(&self) -> bool {
+        self.open && self.config.view != View::Diamond
+    }
+
+    /// The peel the next draw uses.
     fn peel_depths(&self) -> [u32; 5] {
-        if self.open && self.config.view == View::Stack {
+        if self.peeling() {
             self.config.peel.depths()
         } else {
             [0; 5]
+        }
+    }
+
+    /// How many layers into its face the face view is (its own side's peel): the face
+    /// is rebuilt at that depth. The top is the stack itself and needs no rebuild.
+    fn face_depth(&self) -> u32 {
+        match self.config.face.side() {
+            Some(i) if self.peeling() && self.config.view == View::Face => self.config.peel.depths()[i],
+            _ => 0,
         }
     }
 
@@ -235,7 +251,7 @@ impl TetraView {
             }
         }
         // the peel, a layer at a time while it plays, round and round
-        if self.config.peel.playing && self.open && self.config.view == View::Stack && self.config.peel.active() {
+        if self.config.peel.playing && self.peeling() && self.config.peel.active() {
             let speed = self.config.peel.speed.clamp(0.1, 120.0);
             self.peel_clock += dt * speed;
             let steps = self.peel_clock.floor();
@@ -263,7 +279,7 @@ impl TetraView {
         let want = if self.tile_hot { 1.0 } else { 0.0 };
         let tile = !self.open && self.visible() && self.fill != want;
         let hinge = self.open && self.config.view == View::Diamond && self.unfold < 1.0;
-        let peel = self.open && self.config.view == View::Stack && self.config.peel.playing && self.config.peel.active();
+        let peel = self.peeling() && self.config.peel.playing && self.config.peel.active();
         tile || hinge || peel || self.snap.is_some()
     }
 
@@ -315,12 +331,15 @@ pub fn render(model: &mut Model, cache: &mut TetraCache, r: &mut TetraRenderer, 
     // all the time, so it draws a light stack
     t.max_cells = r.max_cells();
     let budget = t.budget_for();
-    let mut key = t.config.scene_key(view);
+    let mut key = t.config.scene_key(view, t.face_depth());
     key.7 = budget;
-    // (no layout: the model was reset to a config the cache still holds)
-    if (cache.scene != Some(key) && !dragging) || t.layout.is_none() {
+    // keys equal but for the face's depth: the face is peeled a layer deeper or back
+    let deeper = |k: Option<SceneKey>| k.is_some_and(|mut k| k.11 != key.11 && { k.11 = key.11; k == key });
+    // (no layout: the model was reset to a config the cache still holds; a peel slider
+    // being dragged still shows each layer)
+    if (cache.scene != Some(key) && (!dragging || deeper(cache.scene))) || t.layout.is_none() {
         let mods = selected_moduli(&t.config.sweep);
-        let mut layout = Layout::build(view, &mods, t.config.spacing, t.config.shape, budget);
+        let mut layout = if view == View::Face { Layout::build_face(t.config.face, key.11, &mods, t.config.spacing, t.config.shape, budget) } else { Layout::build(view, &mods, t.config.spacing, t.config.shape, budget) };
         if view == View::Diamond {
             layout.set_fold(t.fold_angle());
         }
@@ -337,8 +356,9 @@ pub fn render(model: &mut Model, cache: &mut TetraCache, r: &mut TetraRenderer, 
         // and zoom relative to the new size. Only a new view (stack, face, diamond) or a
         // double-click frames it afresh.
         let mut resnap = None;
-        if t.open && t.space_key != Some(key) {
-            let same_view = t.space_key.is_some_and(|k| k.9 == view);
+        if t.open && t.space_key != Some(key) && !deeper(t.space_key) {
+            // (a face peeled deeper keeps the camera as it is: the layers come off in place)
+            let same_view = t.space_key.is_some_and(|k| k.9 == view && k.10 == key.10);
             match (same_view, t.camera.as_mut(), t.space_bounds) {
                 (true, Some(cam), Some(old)) => {
                     let new = layout.at_rest().bounds();
@@ -468,6 +488,15 @@ fn options(ui: &mut egui::Ui, t: &mut TetraView) {
         }
     });
     note(ui, t.config.view.note());
+    if t.config.view == View::Face {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(egui::RichText::new("face").color(ui.visuals().weak_text_color()));
+            for f in Face::ALL {
+                ui.selectable_value(&mut t.config.face, f, f.label()).on_hover_text(format!("{} (F)", f.note()));
+            }
+        });
+        note(ui, t.config.face.note());
+    }
     if t.config.view == View::Diamond && ui.small_button("unfold again (U)").on_hover_text("Fold the base slice back to where it sits in the tetrahedron and swing it open").clicked() {
         t.replay_unfold();
     }
@@ -488,6 +517,9 @@ fn options(ui: &mut egui::Ui, t: &mut TetraView) {
                 }
             }
         });
+    }
+    if t.config.view != View::Diamond {
+        ui.separator();
         peel_controls(ui, t);
     }
     ui.separator();
@@ -530,14 +562,14 @@ fn options(ui: &mut egui::Ui, t: &mut TetraView) {
             _ => {}
         });
     }
-    ui.add_enabled_ui(c.view == View::Stack, |ui| {
+    ui.add_enabled_ui(c.view == View::Stack || (c.view == View::Face && c.face == Face::Top), |ui| {
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("shape").color(ui.visuals().weak_text_color()));
             egui::ComboBox::from_id_salt("tetra shape").width(150.0).selected_text(c.shape.label()).show_ui(ui, |ui| {
                 for sh in Shape::ALL {
                     ui.selectable_value(&mut c.shape, sh, sh.label()).on_hover_text(sh.note());
                 }
-            }).response.on_hover_text(c.shape.note()).on_disabled_hover_text("The face and the diamond are flat: the shape is the stack's");
+            }).response.on_hover_text(c.shape.note()).on_disabled_hover_text("The faces and the diamond are flat: the shape is the stack's (the top shows it)");
         });
     });
     ui.horizontal(|ui| {
@@ -559,7 +591,7 @@ fn options(ui: &mut egui::Ui, t: &mut TetraView) {
             }
         }).response.on_hover_text(format!("Most cubes drawn. \"all\" draws every cell of the range, up to {} cubes (what one scene holds here); past that, or under a smaller budget, every s-th slice, row and cell is drawn, as cubes s cells wide (the HUD says so). Fewer cubes turn faster", group(max_cells as u64)));
     });
-    ui.checkbox(&mut c.solid_zeros, "solid zeros on the face / diamond").on_hover_text("Draw the zeros of the flat views as dark cubes, so the shapes have no gaps (the stack keeps its zeros as tunnels)");
+    ui.checkbox(&mut c.solid_zeros, "solid zeros on the faces / diamond").on_hover_text("Draw the zeros of the flat views as dark cells, so the shapes have no gaps (the stack keeps its zeros as tunnels; from the top, holes show the slices below)");
     let mods = selected_moduli(&c.sweep);
     let text = match (mods.first(), mods.last()) {
         (Some(a), Some(b)) => {
@@ -571,7 +603,7 @@ fn options(ui: &mut egui::Ui, t: &mut TetraView) {
     };
     mono_line(ui, &text);
     ui.separator();
-    note(ui, "Keys: V next view · 1–5 snap the stack's camera · P play the peel · U unfold again · G spacing · O options · Esc back. Stack: drag orbit, right / shift-drag pan, wheel zoom. Face and diamond: drag pan, wheel zoom. Double-click reframes.");
+    note(ui, "Keys: V next view · F next face · 1–5 snap the stack's camera · P play the peel · U unfold again · G spacing · O options · Esc back. Stack: drag orbit, right / shift-drag pan, wheel zoom. Faces and diamond: drag pan, wheel zoom. Double-click reframes.");
 }
 
 /// The peel: which sides, how many layers, and the animation that takes them off one by
@@ -579,6 +611,10 @@ fn options(ui: &mut egui::Ui, t: &mut TetraView) {
 fn peel_controls(ui: &mut egui::Ui, t: &mut TetraView) {
     let extent = t.peel_extent();
     let p = &mut t.config.peel;
+    // (another view or face may peel away in fewer layers)
+    if !p.playing && p.active() && extent > 0 {
+        p.layers = p.layers.min(extent);
+    }
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("peel").color(ui.visuals().weak_text_color()));
     });
@@ -765,7 +801,12 @@ pub fn space(ui: &mut egui::Ui, model: &mut Model, ppp: f32, tex: Option<egui::T
                 if pk {
                     let p = &mut t.config.peel;
                     if !p.active() {
-                        p.sides[0] = true;
+                        // the face being looked at (the top's own side), else the left
+                        let i = match t.config.view {
+                            View::Face => t.config.face.side().unwrap_or(3),
+                            _ => 0,
+                        };
+                        p.sides[i] = true;
                     }
                     p.playing = !p.playing;
                 }
@@ -786,6 +827,9 @@ pub fn space(ui: &mut egui::Ui, model: &mut Model, ppp: f32, tex: Option<egui::T
                 if v {
                     let next = t.config.view.next();
                     t.set_view(next);
+                }
+                if ui.input(|i| i.key_pressed(egui::Key::F) && !i.modifiers.any()) && t.config.view == View::Face {
+                    t.config.face = t.config.face.next();
                 }
                 if u && t.config.view == View::Diamond {
                     t.replay_unfold();
@@ -820,8 +864,11 @@ pub fn space(ui: &mut egui::Ui, model: &mut Model, ppp: f32, tex: Option<egui::T
             } else {
                 let gap = l.half_extents()[0] * 2.0 + 0.6;
                 for (si, s) in l.slices.iter().enumerate() {
-                    let SliceKind::Row(n) = s.kind else { continue };
-                    let c = l.center(si, n, 0);
+                    if !matches!(s.kind, SliceKind::Line { .. }) {
+                        continue;
+                    }
+                    // at the line's left end
+                    let c = l.slice_corners(si).into_iter().min_by(|a, b| a[0].total_cmp(&b[0])).unwrap_or_default();
                     let Some(p) = to_pt([c[0] - gap, c[1], c[2]]) else { continue };
                     if !rect.contains(p) || (p.y - last_y).abs() < 11.0 || drawn > 400 {
                         continue;
@@ -851,7 +898,7 @@ pub fn space(ui: &mut egui::Ui, model: &mut Model, ppp: f32, tex: Option<egui::T
         // the hovered face row's facts (computed once per row)
         if let (Some(c), Some(l)) = (t.hover, &t.layout) {
             if let Some(s) = l.slices.get(c.slice as usize) {
-                if matches!(s.kind, SliceKind::Row(_)) && t.row_stats.is_none_or(|r| r.0 != s.m) {
+                if s.kind == SliceKind::row(s.m - 1) && t.row_stats.is_none_or(|r| r.0 != s.m) {
                     let md = Modulus::new(s.m);
                     t.row_stats = Some((s.m, face_row_alternates(&md), face_row_zeros(&md)));
                 }
@@ -863,10 +910,11 @@ pub fn space(ui: &mut egui::Ui, model: &mut Model, ppp: f32, tex: Option<egui::T
         if let Some(l) = &t.layout {
             match (l.mods.first(), l.mods.last()) {
                 (Some(a), Some(z)) => {
-                    lines.push(format!("TETRA STACK · {} · m {a}–{z} · {} moduli · {}", l.view.label(), l.mods.len(), t.config.sweep.mode.label()));
+                    let what = if l.view == View::Face { format!("{} face", l.face.label()) } else { l.view.label().to_string() };
+                    lines.push(format!("TETRA STACK · {what} · m {a}–{z} · {} moduli · {}", l.mods.len(), t.config.sweep.mode.label()));
                     lines.push(format!("{} cubes, {} zeros{}", group(t.counts.0 as u64), group(t.counts.1 as u64), if t.config.ghosts { " (ghosts)" } else { " (hidden)" }));
                     if l.stride > 1 {
-                        let what = if l.view == View::Stack { "slices" } else { "face rows" };
+                        let what = if l.view == View::Stack || (l.view == View::Face && matches!(l.face, Face::Top | Face::Base)) { "slices" } else { "face rows" };
                         lines.push(format!("LOD: stride {} — {} of {} {what} (at least a cube apart), 1 in {} rows and cells, cubes {} cells wide: {} of {} cells", l.stride, l.slices.len(), l.mods.len(), l.stride, l.stride, group(l.total as u64), group(l.full_total)));
                     }
                 }
@@ -880,9 +928,32 @@ pub fn space(ui: &mut egui::Ui, model: &mut Model, ppp: f32, tex: Option<egui::T
                         Spacing::Packed => "packed: height = slice index, so the sides curve: slice size no longer tracks height (G)".into(),
                     });
                 }
+                View::Face if l.face != Face::Front => {
+                    let d = t.face_depth() * l.stride;
+                    lines.push(match l.face {
+                        Face::Left if d == 0 => "left face: k = 0 of every slice, all 1s (peel it to go in: d layers in is C(n, d) mod m)".into(),
+                        Face::Left => format!("left face, {d} in: k = {d} of every slice, C(n, {d}) mod m for {d} ≤ n < m"),
+                        Face::Right if d == 0 => "right face: k = n of every slice, all 1s (peel it to go in: the left face mirrored)".into(),
+                        Face::Right => format!("right face, {d} in: k = n − {d} of every slice, C(n, {d}) mod m mirrored"),
+                        Face::Base => match l.slices.first() {
+                            Some(b) if d == 0 => format!("base: the base slice, the whole triangle mod {}", b.m),
+                            Some(b) => format!("base, {} layers up: the slice mod {}, the whole triangle", t.face_depth(), b.m),
+                            None => "base: peeled through every slice".into(),
+                        },
+                        _ => "top: the stack seen straight down (orthographic), each cell the topmost cube over it".into(),
+                    });
+                    if l.face == Face::Top {
+                        lines.push(format!("shape: {} · lower slices peek out around the upper ones", l.shape.label()));
+                    }
+                }
                 View::Face | View::Diamond => {
-                    lines.push("front face: row m − 1 of the triangle mod m for each m, so row r = C(r, k) mod (r + 1)".into());
-                    lines.push("a row alternates 1, m−1, 1, … exactly when m is prime; zeros need 3+ distinct prime factors (first at 30)".into());
+                    let d = if l.view == View::Face { t.face_depth() * l.stride } else { 0 };
+                    if d == 0 {
+                        lines.push("front face: row m − 1 of the triangle mod m for each m, so row r = C(r, k) mod (r + 1)".into());
+                        lines.push("a row alternates 1, m−1, 1, … exactly when m is prime; zeros need 3+ distinct prime factors (first at 30)".into());
+                    } else {
+                        lines.push(format!("front face, {d} in: row m − 1 − {d} of the triangle mod m for each m"));
+                    }
                     if l.view == View::Diamond {
                         // l.fold is what is still folded: 0 lies flat
                         let (open, swinging) = ((FOLD - l.fold).to_degrees(), l.fold.to_degrees() > 0.05);
@@ -896,7 +967,7 @@ pub fn space(ui: &mut egui::Ui, model: &mut Model, ppp: f32, tex: Option<egui::T
                 }
             }
             let p = t.config.peel;
-            if l.view == View::Stack && p.active() && (p.layers > 0 || p.playing) {
+            if l.view != View::Diamond && p.active() && (p.layers > 0 || p.playing) {
                 let names: Vec<&str> = p.checked().map(Side::name).collect();
                 let how = if names.len() == Side::ALL.len() { "every side".to_string() } else { names.join(", ") };
                 lines.push(format!("peeled: {} layer{} off {how}{} (P)", p.layers, if p.layers == 1 { "" } else { "s" }, if p.playing { ", playing" } else { "" }));
@@ -910,8 +981,8 @@ pub fn space(ui: &mut egui::Ui, model: &mut Model, ppp: f32, tex: Option<egui::T
             if let Some(c) = t.hover {
                 if let Some(s) = l.slices.get(c.slice as usize) {
                     lines.push(describe(s.m, &c));
-                    if let (SliceKind::Row(_), Some((m, alt, zeros))) = (s.kind, t.row_stats) {
-                        if m == s.m {
+                    if let Some((m, alt, zeros)) = t.row_stats {
+                        if m == s.m && s.kind == SliceKind::row(m - 1) {
                             let pattern = if alt { "alternates 1, m−1, 1, … (m is prime)" } else { "does not alternate (m is composite)" };
                             lines.push(format!("row {} mod {m}: {pattern} · {zeros} zero{}", m - 1, if zeros == 1 { "" } else { "s" }));
                         }
@@ -921,7 +992,7 @@ pub fn space(ui: &mut egui::Ui, model: &mut Model, ppp: f32, tex: Option<egui::T
         }
         lines.push(match t.config.view {
             View::Stack => "drag orbit · right / shift-drag pan · wheel zoom · double-click reset · V view · O options · Esc back",
-            View::Face => "drag pan · wheel zoom · double-click reframe · V view · O options · Esc back",
+            View::Face => "drag pan · wheel zoom · double-click reframe · V view · F face · P peel · O options · Esc back",
             View::Diamond => "drag pan · wheel zoom · double-click reframe · V view · U unfold · O options · Esc back",
         }.into());
         let galleys: Vec<_> = lines.iter().enumerate().map(|(i, s)| {

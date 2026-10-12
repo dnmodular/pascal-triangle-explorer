@@ -264,17 +264,31 @@ voids run through the solid as tunnels.
   cube budget. **O** (or *hide ◀* / *options ▶*) hides and shows it. The 2D canvas keeps
   rendering while you are away if the sweep plays, so the thumbnail stays live.
 * **Navigation.** In the stack: drag to orbit, right-, middle- or shift-drag to pan,
-  wheel or pinch to zoom. In the face and the diamond (an orthographic camera,
+  wheel or pinch to zoom. In the faces and the diamond (an orthographic camera,
   straight on): drag to pan, wheel to zoom about the pointer. Double-click reframes.
-  **V** cycles the views, **G** toggles the spacing, **U** swings the diamond's hinge
+  **V** cycles the views, **F** the faces, **G** toggles the spacing, **U** swings the diamond's hinge
   open again, **P** plays the peel, **1–5** snap the stack's camera.
 * **Views.**
   * *Stack*: the tetrahedron.
-  * *Front face*: the face the slices' last rows make, laid flat. Slice m's last row
-    is row m − 1 of the triangle mod m; stacked, they form a triangle again (the
-    tetrahedron's face is equilateral), whose row r is C(r, k) mod (r + 1). Rows sit
-    at m − 1 in true spacing (skipped moduli leave blank rows), one per modulus when
-    packed, with m labeled down the left edge.
+  * *Face*: one face of the tetrahedron laid flat, chosen under the view buttons:
+    * *front*: the face the slices' last rows make. Slice m's last row is row m − 1
+      of the triangle mod m; stacked, they form a triangle again (the tetrahedron's
+      face is equilateral), whose row r is C(r, k) mod (r + 1). Rows sit at m − 1 in
+      true spacing (skipped moduli leave blank rows), one per modulus when packed,
+      with m labeled down the left edge.
+    * *left* and *right*: the k = 0 and k = n edges of every slice, front corner on
+      the right and the left. As they stand they are all 1s; peeled d layers they
+      are C(n, d) mod m for every m and n < m (the right face is the left mirrored,
+      C(n, n − d) = C(n, d)).
+    * *base*: the base slice, the whole triangle mod M; peeled, the slice d moduli up.
+    * *top*: the stack itself, turned and seen straight down through the orthographic
+      camera: each cell shows the topmost cube over it, so the left, right and front
+      faces show from above and the lower slices peek out around the upper ones (in
+      the equilateral shape their cells sit a third of a row off the ones above; the
+      shape setting applies here). Peeling the top shows the slices below.
+    The peel works in every face: the face's own side takes it a layer deeper (the
+    face is rebuilt at that depth, the camera left as it is), the other checked sides
+    trim its edges, and the top and the base take whole rows (moduli).
   * *Diamond*: the front face with the whole base slice (the last modulus, every
     row, not just the last one it shares with the face) hinged down along that shared
     row: the tetrahedron's net of two faces, a rhombus. When the view is chosen the
@@ -287,8 +301,10 @@ voids run through the solid as tunnels.
     stripes. Zeros on the face are rare: none until m = 30 = 2·3·5, and (tested up to
     1200) only for moduli with three or more distinct prime factors, though not all
     of them (42 has none); they show as dark streaks. Hovering a face row reports
-    both facts for that row. The face and the diamond are drawn in the palette's true
-    colors (faces toward the viewer are not shaded).
+    both facts for that row. The faces and the diamond are drawn in the palette's true
+    colors (faces toward the viewer are not shaded), cell against cell: each cell is a
+    box one cell wide and one row (√3/2) high, with no gap and no dark edge, as in
+    the 2D view (the stack keeps its separate cubes).
 * **Look.** In the 3D space every cube is filled in its palette color, through the
   same residue → level table, color offset and palette as the 2D view, with flat
   shading and darker edges. The tile's wire is green on near-black: its edges are
@@ -298,8 +314,8 @@ voids run through the solid as tunnels.
   uniforms: cubes whose centre lies at or above it are filled, the rest are wire.
   Faint green triangles outline every slice. *Ghost zeros* draws the zero cells as
   faint additive cubes that glow through the solid, which shows the tunnels.
-* **Solid zeros on the face and the diamond** (on by default): their zero cells are
-  drawn as dark cubes, so the flat shapes have no gaps (the first zeros are row 29
+* **Solid zeros on the faces and the diamond** (on by default): their zero cells are
+  drawn as dark cells, so the flat shapes have no gaps (the first zeros are row 29
   mod 30), and they can be hovered. The stack keeps its zeros as voids, its tunnels.
 * **Hover.** An ID pass renders the nonzero cubes into a 1 × 1 `Rg32Uint` target
   through a projection that maps the pointer's pixel onto it. It returns the
@@ -308,12 +324,12 @@ voids run through the solid as tunnels.
   hovered slice) light up, with white edges. The zero / nonzero mask lens colors the
   cubes white; other layer setups fall back to residue coloring, and the HUD says
   so. The HUD shows the shape, m and its factorization, n, k and the residue.
-* **Peel** (stack view): takes the stack apart layer by layer from its sides: left
+* **Peel** (stack and face views): takes the stack apart layer by layer from its sides: left
   (k = 0), right (k = n), front (the last rows), top (slices from the apex down) and
   base (slices from the bottom up). Each side has a checkbox: the checked sides peel
   together, the same number of layers each, and the unchecked ones stay (check one
   side to peel just it, or all but one to keep that one). **P** checks the left side
-  if none is checked. A layer is a row or cell of the stride
+  (in a face view, that face's own side) if none is checked. A layer is a row or cell of the stride
   on the sides and a drawn slice at the top and the base. The ▶ button (or **P**)
   plays it, a layer every 1/speed s, starting over once nothing is left; the slider
   sets the layers by hand. The first layer off the left and right sides is the white
@@ -329,8 +345,8 @@ voids run through the solid as tunnels.
   new shape; orbiting or panning by hand lets go of it.
 * **The view stays put.** Rebuilding the stack (a new range, visit mode, spacing,
   shape or level of detail) keeps the camera's angle and its pan and zoom relative to
-  the new size; only switching between stack, face and diamond, or a double-click,
-  frames it afresh.
+  the new size; only switching between stack, face and diamond (or to another face),
+  or a double-click, frames it afresh.
 * **Selection.** A start / end range (2–4096) and the sweep's selection modes: all,
   primes (with their orderings), composites, even, odd, and the interval sequences.
 * **Spacing.** *True* (default): slice height follows m. Skipped moduli leave gaps,
@@ -567,7 +583,11 @@ Verified (by `cargo test` on Mesa lavapipe, and by the headless export):
   casts straight rays and zooms about the pointer. GPU residues match the additive
   rule for the face and the diamond (stride 1 and strided; a prime face is all ±1),
   and GPU picks match the CPU ray cast on the flat face, the open diamond and the
-  half-open diamond at a slant.
+  half-open diamond at a slant. Every face (front, left, right, base, top) peeled
+  into: each cell is written once with its residue on the face's own line (row
+  m − 1 − d, k = d, n − k = d, the slice d up), the pick sees through the peel, the
+  extent clears each face and does not depend on the depth the face is at, and the
+  flat views' cells tile a cell apart, centred.
 * Tetra stack: the equilateral stack's edges are all equal (a regular tetrahedron),
   every slice's centroid is on the axis, and each flush shape keeps its corner or
   edge midpoint on the axis. Every cube's residue equals the additive rule for moduli 2–64, the

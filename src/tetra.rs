@@ -131,8 +131,10 @@ pub struct TetraConfig {
     pub sweep: Sweep,
     pub spacing: Spacing,
     pub shape: Shape,
-    /// What the 3D space shows: the stack, its front face, or the diamond.
+    /// What the 3D space shows: the stack, one of its faces laid flat, or the diamond.
     pub view: View,
+    /// The face the face view lays flat.
+    pub face: Face,
     /// Peeling the stack's sides away, layer by layer (the stack view only).
     pub peel: Peel,
     /// The options panel is open in the 3D space.
@@ -157,19 +159,21 @@ impl Default for TetraConfig {
     fn default() -> Self {
         let mut sweep = Sweep::default();
         sweep.end = 48;
-        TetraConfig { sweep, spacing: Spacing::True, shape: Shape::Regular, view: View::Stack, peel: Peel::default(), options: true, ghosts: false, brush: 2.0, color_slice: false, budget: u32::MAX, solid_zeros: true, spin: true, tile: true }
+        TetraConfig { sweep, spacing: Spacing::True, shape: Shape::Regular, view: View::Stack, face: Face::Front, peel: Peel::default(), options: true, ghosts: false, brush: 2.0, color_slice: false, budget: u32::MAX, solid_zeros: true, spin: true, tile: true }
     }
 }
 
 impl TetraConfig {
-    /// What the geometry of `view` depends on (the scene is rebuilt when it changes).
-    pub fn scene_key(&self, view: View) -> SceneKey {
+    /// What the geometry of `view` depends on (the scene is rebuilt when it changes):
+    /// the face view also on its face and how many layers into it (`depth`).
+    pub fn scene_key(&self, view: View, depth: u32) -> SceneKey {
         let s = &self.sweep;
-        (s.mode, s.prime_order, s.seq, s.step, s.start, s.end, self.spacing, self.budget, self.shape, view)
+        let face = if view == View::Face { self.face } else { Face::Front };
+        (s.mode, s.prime_order, s.seq, s.step, s.start, s.end, self.spacing, self.budget, self.shape, view, face, depth)
     }
 }
 
-pub type SceneKey = (crate::sweep::ModMode, crate::sweep::PrimeOrder, crate::sweep::Seq, u32, u32, u32, Spacing, u32, Shape, View);
+pub type SceneKey = (crate::sweep::ModMode, crate::sweep::PrimeOrder, crate::sweep::Seq, u32, u32, u32, Spacing, u32, Shape, View, Face, u32);
 
 /// The moduli in `start..=end` (clamped to 2..=TETRA_MAX_M) that the selection mode
 /// visits, ascending.
@@ -397,8 +401,8 @@ pub enum View {
     /// The tetrahedron: one slice per modulus.
     #[default]
     Stack,
-    /// The face the slices' last rows make, laid flat: row m − 1 of the triangle mod m,
-    /// for every m, which is again a triangle.
+    /// One face of the tetrahedron laid flat ([`Face`]): the front face is row m − 1 of
+    /// the triangle mod m for every m, which is again a triangle.
     Face,
     /// The face with the base slice (the last modulus, all its rows) hinged down along
     /// their shared row: the tetrahedron's net of two faces, a diamond.
@@ -411,7 +415,7 @@ impl View {
     pub fn label(self) -> &'static str {
         match self {
             View::Stack => "stack",
-            View::Face => "front face",
+            View::Face => "face",
             View::Diamond => "diamond",
         }
     }
@@ -419,7 +423,7 @@ impl View {
     pub fn note(self) -> &'static str {
         match self {
             View::Stack => "The tetrahedron: one slice per modulus, rows 0..m−1 of the triangle mod m.",
-            View::Face => "The last rows of all the slices, laid flat: row m − 1 of the triangle mod m for every m. They form a triangle again, with row r = C(r, k) mod (r + 1).",
+            View::Face => "One face of the tetrahedron laid flat and seen square on (orthographic): the front, left or right face, the base, or the stack straight from the top. Peeling a face shows the layer under it.",
             View::Diamond => "The front face with the base slice (the last modulus, every row) hinged down along the row they share: two triangles, a diamond. The hinge swings open when the view is chosen.",
         }
     }
@@ -442,13 +446,79 @@ impl View {
 /// tetrahedron's own fold, 180° minus its dihedral angle arccos(1/3).
 pub const FOLD: f32 = std::f32::consts::PI - 1.230_959_4;
 
+/// The face the face view lays flat.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Hash)]
+pub enum Face {
+    /// Row m − 1 of every slice: row r = C(r, k) mod (r + 1).
+    #[default]
+    Front,
+    /// k = 0 of every slice (all 1s until it is peeled: k layers in it is C(n, k) mod m).
+    Left,
+    /// k = n of every slice: the left face mirrored (C(n, n − k) = C(n, k)).
+    Right,
+    /// The base slice, the triangle mod M (peeled: the slices above it).
+    Base,
+    /// The stack seen straight down: each cell shows the topmost cube over it.
+    Top,
+}
+
+impl Face {
+    pub const ALL: [Face; 5] = [Face::Front, Face::Left, Face::Right, Face::Base, Face::Top];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Face::Front => "front",
+            Face::Left => "left",
+            Face::Right => "right",
+            Face::Base => "base",
+            Face::Top => "top",
+        }
+    }
+
+    pub fn note(self) -> &'static str {
+        match self {
+            Face::Front => "The last rows of all the slices: row m − 1 of the triangle mod m for every m, a triangle again with row r = C(r, k) mod (r + 1). Peeled d layers it is row m − 1 − d.",
+            Face::Left => "The k = 0 edge of every slice, front corner on the right: all 1s as it stands. Peeled d layers it is C(n, d) mod m for every m and n < m.",
+            Face::Right => "The k = n edge of every slice, front corner on the left: the left face mirrored, since C(n, n − d) = C(n, d).",
+            Face::Base => "The base slice: the whole triangle mod M, the last modulus. Peeled d layers it is the slice d moduli above.",
+            Face::Top => "The stack seen straight down, orthographic: each cell shows the topmost cube over it, the lower slices peeking out around the upper ones. Peeling the top shows the slices below.",
+        }
+    }
+
+    /// The peel side that takes this face a layer deeper (the top has none: it is the
+    /// stack itself, peeled as the stack is).
+    pub fn side(self) -> Option<usize> {
+        match self {
+            Face::Left => Some(0),
+            Face::Right => Some(1),
+            Face::Front => Some(2),
+            Face::Base => Some(4),
+            Face::Top => None,
+        }
+    }
+
+    pub fn next(self) -> Face {
+        let i = Face::ALL.iter().position(|&f| f == self).unwrap_or(0);
+        Face::ALL[(i + 1) % Face::ALL.len()]
+    }
+}
+
 /// Which cells a slice holds.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SliceKind {
     /// Rows 0, s, 2s, … of the triangle mod m, each with cells 0, s, …, n.
     Triangle,
-    /// Row n only (the face's row m − 1), cells 0, s, …
-    Row(u32),
+    /// A line of cells laid flat (a row of a face): (n + j·dn·s, k + j·dk·s) for j =
+    /// 0, 1, …, with dn, dk ∈ {0, 1}: a row (the front face), a k = const column (the
+    /// left face) or a diagonal n − k = const (the right face).
+    Line { n: u32, k: u32, dn: u32, dk: u32 },
+}
+
+impl SliceKind {
+    /// Row n, cells 0, s, … (a row of the front face).
+    pub fn row(n: u32) -> SliceKind {
+        SliceKind::Line { n, k: 0, dn: 0, dk: 1 }
+    }
 }
 
 /// One slice as laid out. Cell (n, k) of it sits at `origin + n·nvec + k·(1, 0, 0)`, so
@@ -469,6 +539,11 @@ pub struct Slice {
     pub nvec: [f32; 3],
     /// Its index in the whole selection.
     pub index: usize,
+    /// The row the front side's peel counts from (its last row in the stack, m − 1 on
+    /// a face).
+    pub front: u32,
+    /// Its place among the layers the top and the base peel (0 = the top one).
+    pub layer: u32,
 }
 
 impl Slice {
@@ -481,7 +556,7 @@ impl Slice {
     pub fn last_row(&self, stride: u32) -> u32 {
         match self.kind {
             SliceKind::Triangle => self.n0 + (self.rows - 1) * stride,
-            SliceKind::Row(n) => n,
+            SliceKind::Line { n, dn, .. } => n + (self.cells - 1) * dn * stride,
         }
     }
 
@@ -489,7 +564,7 @@ impl Slice {
     pub fn last_k(&self, stride: u32) -> u32 {
         match self.kind {
             SliceKind::Triangle => (self.rows - 1) * stride,
-            SliceKind::Row(_) => (self.cells - 1) * stride,
+            SliceKind::Line { k, dk, .. } => k + (self.cells - 1) * dk * stride,
         }
     }
 }
@@ -511,7 +586,14 @@ pub struct Layout {
     pub full_total: u64,
     /// The diamond's hinge: the base slice's angle out of the face's plane (0 = flat).
     pub fold: f32,
+    /// The face the face view lays flat (Front elsewhere).
+    pub face: Face,
+    /// Layers the top and the base peel through (the slices' `layer` runs 0..layers).
+    pub layers: u32,
 }
+
+/// The flat views' cells overlap their neighbours by this much, so no seam shows.
+const FLAT_FIT: f32 = 1.002;
 
 /// The stack's row direction: rows run back along z, half a cell left per row.
 const STACK_N: [f32; 3] = [-0.5, 0.0, SQRT3_2];
@@ -529,7 +611,7 @@ impl Layout {
     pub fn build(view: View, mods: &[u32], spacing: Spacing, shape: Shape, budget: u32) -> Layout {
         let stride = view_stride(view, mods, spacing, budget);
         let len = mods.len();
-        let mut l = Layout { view, mods: mods.to_vec(), slices: Vec::new(), spacing, shape, stride, total: 0, full_total: view_cells(view, mods, spacing, 1), fold: 0.0 };
+        let mut l = Layout { view, mods: mods.to_vec(), slices: Vec::new(), spacing, shape, stride, total: 0, full_total: view_cells(view, mods, spacing, 1), fold: 0.0, face: Face::Front, layers: 0 };
         let mut base = 0u32;
         for i in drawn(view, mods, spacing, stride) {
             let m = mods[i];
@@ -542,15 +624,90 @@ impl Layout {
                     (SliceKind::Triangle, strided_rows(m, stride), strided_cells(m, stride), [ox, -h, oz], STACK_N)
                 }
                 View::Diamond if i + 1 == len => (SliceKind::Triangle, strided_rows(m, stride), strided_cells(m, stride), [0.0; 3], [0.0; 3]),
-                View::Face | View::Diamond => (SliceKind::Row(m - 1), 1, strided_row_cells(m, stride), [0.0, -l.face_y(i, m), 0.0], [-0.5, 0.0, 0.0]),
+                View::Face | View::Diamond => (SliceKind::row(m - 1), 1, strided_row_cells(m, stride), [0.0, -l.face_y(i, m), 0.0], [-0.5, 0.0, 0.0]),
             };
-            l.slices.push(Slice { m, kind, rows, cells: cells as u32, cell_base: base, n0, origin, nvec, index: i });
+            let layer = l.slices.len() as u32;
+            let mut s = Slice { m, kind, rows, cells: cells as u32, cell_base: base, n0, origin, nvec, index: i, front: 0, layer };
+            s.front = if view == View::Stack { s.last_row(stride) } else { m - 1 };
+            l.slices.push(s);
             base += cells as u32;
         }
         l.total = base;
+        l.layers = l.slices.len() as u32;
         if view == View::Diamond {
             l.set_fold(FOLD);
         }
+        l
+    }
+
+    /// The face view of `face`, `depth` layers in (its peel side's layers): the face's
+    /// cells laid flat in the z = 0 plane, rows down the screen, for the orthographic
+    /// camera. The top is the stack itself, turned to be seen from above.
+    pub fn build_face(face: Face, depth: u32, mods: &[u32], spacing: Spacing, shape: Shape, budget: u32) -> Layout {
+        if face == Face::Top {
+            let mut l = Layout::build(View::Stack, mods, spacing, shape, budget);
+            l.view = View::Face;
+            l.face = face;
+            // (x, y, z) → (x, −z, y): the apex row at the top of the screen, higher
+            // slices nearer the viewer
+            for s in &mut l.slices {
+                let [ox, oy, oz] = s.origin;
+                s.origin = [ox, -oz, oy];
+                s.nvec = [-0.5, -SQRT3_2, 0.0];
+            }
+            return l;
+        }
+        let len = mods.len();
+        let mut l = Layout { view: View::Face, mods: mods.to_vec(), slices: Vec::new(), spacing, shape, stride: 1, total: 0, full_total: 0, fold: 0.0, face, layers: 0 };
+        if len == 0 {
+            return l;
+        }
+        if face == Face::Base {
+            // the stride of the base slice itself, so every slice above shares it
+            let budget = budget.max(1) as u64;
+            let big = mods[len - 1];
+            let mut st = 1;
+            while strided_cells(big, st) > budget {
+                st += 1;
+            }
+            l.stride = st;
+            l.full_total = strided_cells(big, 1);
+            l.layers = len as u32;
+            let Some(i) = (len - 1).checked_sub(depth as usize) else { return l };
+            let m = mods[i];
+            let cells = strided_cells(m, st) as u32;
+            l.slices.push(Slice { m, kind: SliceKind::Triangle, rows: strided_rows(m, st), cells, cell_base: 0, n0: (m - 1) % st, origin: [0.0; 3], nvec: [-0.5, -SQRT3_2, 0.0], index: i, front: m - 1, layer: i as u32 });
+            l.total = cells;
+            return l;
+        }
+        let st = view_stride(View::Face, mods, spacing, budget);
+        l.stride = st;
+        l.full_total = view_cells(View::Face, mods, spacing, 1);
+        let rows = drawn(View::Face, mods, spacing, st);
+        l.layers = rows.len() as u32;
+        let ds = depth * st;
+        let mut base = 0u32;
+        for (r, &i) in rows.iter().enumerate() {
+            let m = mods[i];
+            let top = m - 1;
+            if top < ds {
+                continue;
+            }
+            let y = -l.face_y(i, m);
+            let cells = (top - ds) / st + 1;
+            // each row centred on x = 0, as the front face's rows are
+            let n_min = top - (cells - 1) * st;
+            let (kind, ox, nvec) = match face {
+                Face::Front => (SliceKind::row(top - ds), 0.0, [-0.5, 0.0, 0.0]),
+                // x = n − (top + n_min)/2: the front corner on the right
+                Face::Left => (SliceKind::Line { n: n_min, k: ds, dn: 1, dk: 0 }, -((top + n_min) as f32) / 2.0 - ds as f32, [1.0, 0.0, 0.0]),
+                // k = n − ds, x = (top + n_min)/2 − n: the front corner on the left
+                _ => (SliceKind::Line { n: n_min, k: n_min - ds, dn: 1, dk: 1 }, (top + n_min) as f32 / 2.0 + ds as f32, [-2.0, 0.0, 0.0]),
+            };
+            l.slices.push(Slice { m, kind, rows: 1, cells, cell_base: base, n0: 0, origin: [ox, y, 0.0], nvec, index: i, front: top, layer: r as u32 });
+            base += cells;
+        }
+        l.total = base;
         l
     }
 
@@ -593,9 +750,16 @@ impl Layout {
         l
     }
 
-    /// Cube half extents (x, y, z) in world units: a cube, s cells wide.
+    /// Cube half extents (x, y, z) in world units: a cube, s cells wide. The flat views
+    /// tile the plane instead, cell against cell with no gap: a cell wide and a row
+    /// (√3/2) high, a hair over so no seam shows.
     pub fn half_extents(&self) -> [f32; 3] {
-        [CUBE_HALF * self.stride as f32; 3]
+        let s = self.stride as f32;
+        if self.view.flat() {
+            [0.5 * s * FLAT_FIT, SQRT3_2 * 0.5 * s * FLAT_FIT, CUBE_HALF * s]
+        } else {
+            [CUBE_HALF * s; 3]
+        }
     }
 
     /// The centres of a slice's corner cubes.
@@ -604,7 +768,7 @@ impl Layout {
         let (n_last, k_last) = (s.last_row(self.stride), s.last_k(self.stride));
         match s.kind {
             SliceKind::Triangle => vec![self.center(si, s.n0, 0), self.center(si, n_last, 0), self.center(si, n_last, k_last)],
-            SliceKind::Row(n) => vec![self.center(si, n, 0), self.center(si, n, k_last)],
+            SliceKind::Line { n, k, .. } => vec![self.center(si, n, k), self.center(si, n_last, k_last)],
         }
     }
 
@@ -640,8 +804,9 @@ impl Layout {
         let si = self.slices.partition_point(|s| s.cell_base <= g) - 1;
         let s = &self.slices[si];
         let l = (g - s.cell_base) as u64;
-        if let SliceKind::Row(n) = s.kind {
-            return Some((si, n, l as u32 * self.stride));
+        if let SliceKind::Line { n, k, dn, dk } = s.kind {
+            let j = l as u32 * self.stride;
+            return Some((si, n + j * dn, k + j * dk));
         }
         let mut i = (((8 * l + 1) as f64).sqrt() as u64 - 1) / 2;
         while i * (i + 1) / 2 > l {
@@ -658,7 +823,7 @@ impl Layout {
     pub fn slice_cells(&self, si: usize) -> Vec<(u32, u32)> {
         let s = &self.slices[si];
         match s.kind {
-            SliceKind::Row(n) => (0..s.cells).map(|j| (n, j * self.stride)).collect(),
+            SliceKind::Line { n, k, dn, dk } => (0..s.cells).map(|j| (n + j * dn * self.stride, k + j * dk * self.stride)).collect(),
             SliceKind::Triangle => (0..s.rows).flat_map(|i| (0..=i).map(move |j| (i, j))).map(|(i, j)| (s.n0 + i * self.stride, j * self.stride)).collect(),
         }
     }
@@ -669,21 +834,19 @@ impl Layout {
         add(add(s.origin, scale(s.nvec, n as f32)), [k as f32, 0.0, 0.0])
     }
 
-    /// Whether cell (slice, n, k) is peeled away (the stack only), as the shaders decide.
+    /// Whether cell (slice, n, k) is peeled away (the stack and the faces), as the
+    /// shaders decide.
     pub fn peeled(&self, si: usize, n: u32, k: u32, depths: [u32; 5]) -> bool {
-        if self.view != View::Stack {
+        if self.view == View::Diamond {
             return false;
         }
         let s = &self.slices[si];
         let st = self.stride;
-        let last = s.last_row(st);
-        let n_slices = self.slices.len() as u32;
-        let si = si as u32;
         (depths[0] > 0 && k < depths[0] * st)
             || (depths[1] > 0 && n - k < depths[1] * st)
-            || (depths[2] > 0 && last - n < depths[2] * st)
-            || (depths[3] > 0 && si < depths[3])
-            || (depths[4] > 0 && n_slices - 1 - si < depths[4])
+            || (depths[2] > 0 && s.front - n < depths[2] * st)
+            || (depths[3] > 0 && s.layer < depths[3])
+            || (depths[4] > 0 && self.layers - 1 - s.layer < depths[4])
     }
 
     /// The fewest layers that peel the whole stack away with `peel`'s sides.
@@ -691,28 +854,67 @@ impl Layout {
         let mut p = *peel;
         p.layers = 1;
         let unit = p.depths();
-        if self.view != View::Stack || unit.iter().all(|&d| d == 0) {
+        if self.view == View::Diamond || unit.iter().all(|&d| d == 0) {
             return 0;
         }
+        if self.view == View::Face && self.face != Face::Top {
+            return self.face_peel_extent(unit);
+        }
         let st = self.stride;
-        let n_slices = self.slices.len() as u32;
+        let n_slices = self.layers;
         let mut extent = 0u32;
         for (si, s) in self.slices.iter().enumerate() {
-            let last = s.last_row(st);
-            let si = si as u32;
+            let last = s.front;
             // a cell survives L layers while every peeled side is at least L layers away
-            let slice_d = [si, n_slices - 1 - si];
+            let slice_d = [s.layer, n_slices - 1 - s.layer];
             let slice_min = (3..5).filter(|&i| unit[i] > 0).map(|i| slice_d[i - 3] + 1).min().unwrap_or(u32::MAX);
             if slice_min <= extent {
                 continue;
             }
-            for (n, k) in self.slice_cells(si as usize) {
+            for (n, k) in self.slice_cells(si) {
                 let cell_d = [k / st, (n - k) / st, (last - n) / st];
                 let cell_min = (0..3).filter(|&i| unit[i] > 0).map(|i| cell_d[i] + 1).min().unwrap_or(u32::MAX);
                 extent = extent.max(cell_min.min(slice_min));
             }
         }
         extent
+    }
+
+    /// The extent of a face that is rebuilt a layer deeper as it peels (every face but
+    /// the top), whatever depth this layout is at. On a line (or the base triangle) of
+    /// modulus m, L layers off each of c of the left, right and front sides leave a cell
+    /// exactly while m − 1 ≥ c·L·s; the top and the base take whole lines (slices).
+    fn face_peel_extent(&self, unit: [u32; 5]) -> u32 {
+        let st = self.stride;
+        let c = unit[..3].iter().filter(|&&d| d > 0).count() as u32;
+        let (top, bottom) = (unit[3] > 0, unit[4] > 0);
+        let sides_ok = |m: u32, l: u32| c == 0 || (m - 1) / st >= c * l;
+        let lives = |m: u32| ((m - 1) / st).checked_div(c).unwrap_or(u32::MAX);
+        if self.face == Face::Base {
+            let len = self.mods.len();
+            if bottom {
+                // each layer shows the slice one modulus up
+                let mut l = 0;
+                while (l as usize) < len {
+                    let i = (len - 1 - l as usize) as u32;
+                    if (top && i < l) || !sides_ok(self.mods[i as usize], l) {
+                        break;
+                    }
+                    l += 1;
+                }
+                return l;
+            }
+            let i = (len - 1) as u32;
+            let most = lives(self.mods[len - 1]).min(if top { i } else { u32::MAX });
+            return most.saturating_add(1);
+        }
+        let rows = drawn(View::Face, &self.mods, self.spacing, st);
+        let n = rows.len() as u32;
+        rows.iter().enumerate().map(|(r, &i)| {
+            let r = r as u32;
+            let most = lives(self.mods[i]).min(if top { r } else { u32::MAX }).min(if bottom { n - 1 - r } else { u32::MAX });
+            most.saturating_add(1)
+        }).max().unwrap_or(0)
     }
 
     /// A camera looking square onto a side of the stack (or straight down / up),
@@ -1253,14 +1455,20 @@ mod tests {
                 for view in View::ALL {
                     let l = Layout::build(view, &mods, spacing, Shape::Regular, 200_000).at_rest();
                     let he = l.half_extents();
+                    let s = l.stride as f32;
+                    if view.flat() {
+                        // the flat views tile: a cell wide and a row high, just over
+                        assert!(2.0 * he[0] >= s && 2.0 * he[0] < s * 1.01);
+                        assert!(2.0 * he[1] >= s * SQRT3_2 && 2.0 * he[1] < s * SQRT3_2 * 1.01);
+                        continue;
+                    }
                     assert!(he[0] == he[1] && he[1] == he[2], "a cube");
                     assert!((he[0] - CUBE_HALF * l.stride as f32).abs() < 1e-6);
                     let side = 2.0 * he[0];
                     // within a slice: rows and cells are at least a cube apart
-                    let s = l.stride as f32;
                     assert!(s * 1.0 >= side && s * SQRT3_2 >= side);
                     // between slices (the stack) or face rows: at least a cube apart too
-                    let ys: Vec<f32> = l.slices.iter().filter(|sl| view == View::Stack || matches!(sl.kind, SliceKind::Row(_))).map(|sl| sl.origin[1]).collect();
+                    let ys: Vec<f32> = l.slices.iter().filter(|sl| view == View::Stack || matches!(sl.kind, SliceKind::Line { .. })).map(|sl| sl.origin[1]).collect();
                     for w in ys.windows(2) {
                         assert!(w[0] - w[1] >= side - 1e-3, "{view:?} {spacing:?} stride {}: pitch {} < cube {side}", l.stride, w[0] - w[1]);
                     }
@@ -1282,7 +1490,7 @@ mod tests {
                     let m = l.slices[si].m;
                     assert!(n < m && k <= n && k.is_multiple_of(stride));
                     match l.slices[si].kind {
-                        SliceKind::Row(r) => assert_eq!((n, r), (m - 1, m - 1)),
+                        SliceKind::Line { n: r, .. } => assert_eq!((n, r), (m - 1, m - 1)),
                         SliceKind::Triangle => assert!((n - l.slices[si].n0).is_multiple_of(stride)),
                     }
                     assert!(seen.insert((si, n, k)));
@@ -1302,7 +1510,7 @@ mod tests {
         // one row per modulus: row m − 1, m cells, an equilateral triangle of rows √3/2 apart
         assert_eq!(face.slices.len(), mods.len());
         for (sl, &m) in face.slices.iter().zip(&mods) {
-            assert_eq!((sl.m, sl.kind, sl.cells), (m, SliceKind::Row(m - 1), m));
+            assert_eq!((sl.m, sl.kind, sl.cells), (m, SliceKind::row(m - 1), m));
             let si = face.slice_of(m).unwrap();
             let (a, b) = (face.center(si, m - 1, 0), face.center(si, m - 1, m - 1));
             assert!((a[0] + b[0]).abs() < 1e-4, "row {m} is centred");
@@ -1314,7 +1522,7 @@ mod tests {
         let last = d.slices.len() - 1;
         assert_eq!(d.slices[last].kind, SliceKind::Triangle);
         assert_eq!(d.slices[last].m, 30);
-        assert!(d.slices[..last].iter().all(|sl| sl.m < 30 && matches!(sl.kind, SliceKind::Row(_))));
+        assert!(d.slices[..last].iter().all(|sl| sl.m < 30 && matches!(sl.kind, SliceKind::Line { .. })));
         assert_eq!(d.total as u64, view_cells(View::Diamond, &mods, Spacing::True, 1));
         // folded: the base meets the face along its last row at the tetrahedron's dihedral
         // angle arccos(1/3)
@@ -1401,6 +1609,89 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn faces_peel_a_layer_deeper_until_the_extent_clears_them() {
+        let mut sets: Vec<[bool; 5]> = (0..5).map(|i| std::array::from_fn(|j| j == i)).collect();
+        sets.push([true, true, true, false, false]);
+        sets.push([true; 5]);
+        for (mods, budget) in [((2..=30).collect::<Vec<u32>>(), u32::MAX), ((2..=60).collect(), 400), ((2..=40).filter(|m| m % 2 == 1).collect(), u32::MAX)] {
+            for face in Face::ALL {
+                for &sides in &sets {
+                    let p = Peel { sides, ..Peel::default() };
+                    let at = |layers: u32| {
+                        let d = Peel { layers, ..p }.depths();
+                        let l = Layout::build_face(face, face.side().map_or(0, |i| d[i]), &mods, Spacing::True, Shape::Regular, budget);
+                        let left = (0..l.total).filter(|&g| {
+                            let (si, n, k) = l.cell(g).unwrap();
+                            !l.peeled(si, n, k, d)
+                        }).count();
+                        (l, left)
+                    };
+                    let (l0, all) = at(0);
+                    assert_eq!(all as u32, l0.total);
+                    let extent = l0.peel_extent(&p);
+                    assert!(extent > 0, "{face:?} {sides:?}");
+                    let mut prev = all;
+                    for layers in 1..=extent {
+                        let (l, left) = at(layers);
+                        // the extent does not depend on how deep the layout already is
+                        assert_eq!(l.peel_extent(&p), extent, "{face:?} {sides:?} at {layers}");
+                        if layers < extent {
+                            assert!(left > 0, "{face:?} {sides:?}: empty at {layers} of {extent}");
+                        } else {
+                            assert_eq!(left, 0, "{face:?} {sides:?}: {extent} layers leave cells");
+                        }
+                        // the face's own side shows a new layer; the others only take away
+                        // (the top reaches the base face only at its last layer)
+                        if face.side().is_none_or(|i| !sides[i]) {
+                            assert!(left <= prev, "{face:?} {sides:?}: layer {layers} added cells");
+                        }
+                        prev = left;
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_faces_tile_cell_against_cell() {
+        let mods: Vec<u32> = (2..=30).collect();
+        for face in Face::ALL {
+            for depth in [0, 2] {
+                let l = Layout::build_face(face, depth, &mods, Spacing::True, Shape::Regular, u32::MAX);
+                let he = l.half_extents();
+                for si in 0..l.slices.len() {
+                    let pts: Vec<[f32; 3]> = l.slice_cells(si).into_iter().map(|(n, k)| l.center(si, n, k)).collect();
+                    if let SliceKind::Line { .. } = l.slices[si].kind {
+                        // one row of the screen, a cell apart, centred
+                        for w in pts.windows(2) {
+                            assert!((w[0][1] - w[1][1]).abs() < 1e-4 && ((w[0][0] - w[1][0]).abs() - 1.0).abs() < 1e-4, "{face:?}: {w:?}");
+                        }
+                        let mid = (pts[0][0] + pts[pts.len() - 1][0]) / 2.0;
+                        assert!(mid.abs() < 1e-3, "{face:?} slice {si}: centred at {mid}");
+                        // and the boxes meet: a cell wide
+                        assert!(2.0 * he[0] >= 1.0);
+                    }
+                }
+                // the front corner: on the right for the left face, the left for the right
+                if let (Face::Left | Face::Right, Some(si)) = (face, l.slices.len().checked_sub(1)) {
+                    let s = &l.slices[si];
+                    let front = l.center(si, s.last_row(1), s.last_k(1))[0];
+                    assert_eq!(front > 0.0, face == Face::Left, "{face:?}");
+                }
+            }
+        }
+        // the top: the stack turned to be seen from above, a slice's rows down the screen
+        let stack = Layout::build(View::Stack, &mods, Spacing::True, Shape::Regular, u32::MAX);
+        let top = Layout::build_face(Face::Top, 0, &mods, Spacing::True, Shape::Regular, u32::MAX);
+        assert_eq!(stack.total, top.total);
+        for g in (0..top.total).step_by(37) {
+            let (si, n, k) = top.cell(g).unwrap();
+            let (a, b) = (stack.center(si, n, k), top.center(si, n, k));
+            assert!((a[0] - b[0]).abs() < 1e-3 && (a[2] + b[1]).abs() < 1e-3 && (a[1] - b[2]).abs() < 1e-3, "{a:?} {b:?}");
         }
     }
 

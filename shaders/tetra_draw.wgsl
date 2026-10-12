@@ -31,7 +31,7 @@ struct DrawParams {
   ghost_alpha: f32,
   fill: vec4<f32>,      // x: cubes whose centre is at or above this height are filled in color
   peel_a: vec4<u32>,    // peeled away: k < x, n − k < y, last row − n < z (cells), slice < w
-  peel_b: vec4<u32>,    // x: slices from the base, y: slices in the stack (0 = none), z: stride, w: last cube index
+  peel_b: vec4<u32>,    // x: layers from the base, y: layers in all, z: stride, w: last cube index
 };
 
 struct Slice {
@@ -46,11 +46,11 @@ struct Slice {
   ox: f32,          // cell (n, k) sits at o + n·nv + (k, 0, 0)
   oy: f32,
   oz: f32,
-  pad0: u32,
+  k0: u32,          // a line's first k
   nx: f32,
   ny: f32,
   nz: f32,
-  pad1: u32,
+  peel_id: u32,     // the row the front side's peel counts from | layer << 16
 };
 
 @group(0) @binding(0) var<uniform> D: DrawParams;
@@ -63,8 +63,8 @@ const SQRT3_2: f32 = 0.8660254;
 const FLAG_SLICE: u32 = 1u;
 const FLAG_MASK: u32 = 2u;
 const FLAG_GHOST: u32 = 4u;
-const FLAG_FLAT: u32 = 8u;
-const FLAG_ZERO: u32 = 16u;  // the zeros drawn solid (the flat views: no gaps)   // a flat view: faces toward the viewer keep their true color
+const FLAG_FLAT: u32 = 8u;   // a flat view: faces toward the viewer keep their true color, no edges
+const FLAG_ZERO: u32 = 16u;  // the zeros drawn solid (the flat views: no gaps)
 const LIGHT: vec3<f32> = vec3<f32>(236.0 / 255.0, 236.0 / 255.0, 226.0 / 255.0);
 
 fn unpack_rgb(c: u32) -> vec3<f32> {
@@ -77,19 +77,19 @@ fn cube_center(c: vec2<u32>, s: Slice) -> vec3<f32> {
   return vec3<f32>(s.ox + n * s.nx + k, s.oy + n * s.ny, s.oz + n * s.nz);
 }
 
-// Peeled cubes are not drawn (the stack's sides come off layer by layer). The
-// thresholds are the CPU's: layers × stride on the triangles' sides, layers of slices
-// at the top and the base.
+// Peeled cubes are not drawn (the stack's sides come off layer by layer, and a face's
+// edges). The thresholds are the CPU's: layers × stride on the triangles' sides, layers
+// of slices (a face's lines) at the top and the base. The diamond's are all 0.
 fn peeled(c: vec2<u32>, si: u32, s: Slice) -> bool {
-  if (s.kind != 0u) { return false; }
   let n = c.x & 0xffffu;
   let k = c.x >> 16u;
-  let last = s.row_n + (s.rows - 1u) * D.peel_b.z;
+  let last = s.peel_id & 0xffffu;
+  let layer = s.peel_id >> 16u;
   return (D.peel_a.x > 0u && k < D.peel_a.x)
       || (D.peel_a.y > 0u && n - k < D.peel_a.y)
       || (D.peel_a.z > 0u && last - n < D.peel_a.z)
-      || (D.peel_a.w > 0u && si < D.peel_a.w)
-      || (D.peel_b.x > 0u && D.peel_b.y - 1u - si < D.peel_b.x);
+      || (D.peel_a.w > 0u && layer < D.peel_a.w)
+      || (D.peel_b.x > 0u && D.peel_b.y - 1u - layer < D.peel_b.x);
 }
 
 // Outside the clip volume: a peeled cube's triangles collapse and are clipped.
@@ -187,11 +187,13 @@ fn cube_fs(in: CubeOut) -> @location(0) vec4<f32> {
     let shade = select(lit_shade, mix(lit_shade, 1.0, abs(n.z)), (D.flags & FLAG_FLAT) != 0u);
     var col = in.color * shade;
     var edge_col = col * 0.35;
+    // the flat views tile cell against cell: no dark edges, only the highlight's
+    let edged = select(ink, 0.0, (D.flags & FLAG_FLAT) != 0u && in.lit != 2u);
     if (in.lit == 2u) {
       col = mix(col, vec3<f32>(1.0), 0.3);
       edge_col = vec3<f32>(1.0);
     }
-    return vec4<f32>(mix(col, edge_col, ink * 0.8), 1.0);
+    return vec4<f32>(mix(col, edge_col, edged * 0.8), 1.0);
   }
   // wire: thin cubes far away merge into a translucent glow instead of a solid wall
   let a = ink * D.wire.a * clamp(cube_px / 10.0, 0.35, 1.0);

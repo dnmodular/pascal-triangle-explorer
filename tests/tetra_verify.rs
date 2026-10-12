@@ -11,7 +11,7 @@ use pascal::gpu::Gpu;
 use pascal::math::{triangle_dp, Modulus};
 use pascal::palette::{Palette, Scheme};
 use pascal::sweep::{ModMode, Seq};
-use pascal::tetra::{ray_cast, ray_cast_peeled, selected_moduli, Camera, CubeId, Layout, Peel, Shape, Spacing, TetraConfig, View, FOLD};
+use pascal::tetra::{ray_cast, ray_cast_peeled, selected_moduli, Camera, CubeId, Face, Layout, Peel, Shape, Spacing, TetraConfig, View, FOLD};
 use pascal::tetra_gpu::{DrawOptions, TetraRenderer, BACKGROUND};
 
 fn device() -> (Gpu, TetraRenderer) {
@@ -402,4 +402,74 @@ fn the_stack_draws_green_wire_and_lit_brush_cells() {
     let (_, _, ghost) = r.read_target_rgba();
     let brighter = (0..n).filter(|&i| px(&ghost, i).iter().zip(px(&plain, i)).any(|(a, b)| *a > b)).count();
     assert!(brighter > 100, "ghost pixels: {brighter}");
+}
+
+/// Each face of the face view, peeled into: every cell written once with its residue,
+/// on the face's own line (the front's row m − 1 − d, the left's k = d, the right's
+/// n − k = d, the base's slice d up), and the pick seeing through the other sides' peel.
+#[test]
+fn the_faces_peel_on_the_gpu() {
+    let (_gpu, mut r) = device();
+    let mods: Vec<u32> = (2..=40).collect();
+    let (w, h) = (320u32, 240u32);
+    r.ensure_target(w, h);
+    // sides in Side::ALL order: left, right, front, top, base
+    let peels: [[bool; 5]; 4] = [[false; 5], [true, false, false, false, false], [true, true, true, false, false], [false, true, true, true, true]];
+    for face in Face::ALL {
+        for (budget, sides) in [(u32::MAX, peels[0]), (u32::MAX, peels[1]), (u32::MAX, peels[2]), (300, peels[3])] {
+            for layers in [0u32, 1, 3] {
+                let peel = Peel { sides, layers, ..Peel::default() }.depths();
+                let depth = face.side().map_or(0, |i| peel[i]);
+                let layout = Layout::build_face(face, depth, &mods, Spacing::True, Shape::Regular, budget);
+                let mds: Vec<Modulus> = layout.slices.iter().map(|s| Modulus::new(s.m)).collect();
+                r.set_scene(&layout, &mds, &Palette::new(Scheme::Spectral), 0.0);
+                let (nz, z) = r.read_cubes();
+                assert_eq!((nz.len() + z.len()) as u32, layout.total, "{face:?} {sides:?} {layers}");
+                let st = layout.stride;
+                let mut seen = std::collections::HashSet::new();
+                for wd in nz.iter().chain(&z) {
+                    let c = CubeId::unpack(*wd);
+                    let s = &layout.slices[c.slice as usize];
+                    assert!(c.n < s.m && c.k <= c.n, "{face:?}: {c:?} mod {}", s.m);
+                    assert_eq!(c.residue, mds[c.slice as usize].binom(c.n, c.k), "{face:?}: {c:?}");
+                    let d = depth * st;
+                    match face {
+                        Face::Front => assert_eq!(c.n, s.m - 1 - d),
+                        Face::Left => assert_eq!(c.k, d),
+                        Face::Right => assert_eq!(c.n - c.k, d),
+                        Face::Base => assert_eq!(s.m, mods[mods.len() - 1 - depth as usize]),
+                        Face::Top => {}
+                    }
+                    assert!(seen.insert((c.slice, c.n, c.k)), "{c:?} twice");
+                }
+                // the pick against the CPU ray cast, through the peel (three layers in)
+                if layout.total == 0 || layers != 3 {
+                    continue;
+                }
+                let cam = Camera::flat(layout.bounds(), w as f32, h as f32, 0.0, 0.0);
+                let he = layout.half_extents();
+                let mut agreed = 0;
+                for py in (3..h).step_by(16) {
+                    for px in (5..w).step_by(16) {
+                        let (o, dir) = cam.ray(w, h, px as f32, py as f32);
+                        let gpu = r.pick_blocking_peeled(&cam, px as f32, py as f32, peel);
+                        if let Some(g) = gpu {
+                            assert!(!layout.peeled(g.slice as usize, g.n, g.k, peel), "{face:?}: picked a peeled cube {g:?}");
+                        }
+                        if let Some(hit) = ray_cast_peeled(&layout, &mds, o, dir, peel) {
+                            let c = layout.center(hit.cube.slice as usize, hit.cube.n, hit.cube.k);
+                            let p = [o[0] + dir[0] * hit.t, o[1] + dir[1] * hit.t, o[2] + dir[2] * hit.t];
+                            let mut m = (0..3).map(|a| he[a] - (p[a] - c[a]).abs()).collect::<Vec<_>>();
+                            m.sort_by(f32::total_cmp);
+                            if m[1] > 0.03 && hit.next_t - hit.t > 0.05 {
+                                assert_eq!(gpu, Some(hit.cube), "{face:?} {sides:?} {layers}: pixel ({px},{py})");
+                                agreed += 1;
+                            }
+                        }
+                    }
+                }
+                assert!(agreed > 0 || nz.is_empty(), "{face:?} {sides:?} {layers}: no decisive rays");
+            }
+        }
+    }
 }

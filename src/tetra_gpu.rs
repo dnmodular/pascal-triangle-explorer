@@ -60,14 +60,16 @@ pub struct GpuSlice {
     pub factor_off: u32,
     pub level_off: u32,
     /// 0 a triangle of rows row_n, row_n + s, … (row_n = its first row, 0 but for the
-    /// diamond's base); 1 the single row `row_n`.
+    /// diamond's base and the base face); else a line of cells (row_n + j·dn·s, k0 +
+    /// j·dk·s), kind = 1 | dn << 1 | dk << 2.
     pub kind: u32,
     pub row_n: u32,
     /// Cell (n, k) sits at origin + n·nvec + (k, 0, 0).
     pub origin: [f32; 3],
-    pub pad0: u32,
+    pub k0: u32,
     pub nvec: [f32; 3],
-    pub pad1: u32,
+    /// The peel's view of it: the row the front side counts from | its layer << 16.
+    pub peel_id: u32,
 }
 
 impl GpuSlice {
@@ -161,11 +163,12 @@ impl SceneData {
                     pad1: 0,
                 });
             }
-            let (kind, row_n) = match s.kind {
-                SliceKind::Triangle => (0, s.n0),
-                SliceKind::Row(n) => (1, n),
+            let (kind, row_n, k0) = match s.kind {
+                SliceKind::Triangle => (0, s.n0, 0),
+                SliceKind::Line { n, k, dn, dk } => (1 | dn << 1 | dk << 2, n, k),
             };
-            slices.push(GpuSlice { m: s.m, rows: s.rows, cell_base: s.cell_base, nfactors: md.factors.len() as u32, factor_off, level_off, kind, row_n, origin: s.origin, pad0: 0, nvec: s.nvec, pad1: 0 });
+            let peel_id = s.front | s.layer << 16;
+            slices.push(GpuSlice { m: s.m, rows: s.rows, cell_base: s.cell_base, nfactors: md.factors.len() as u32, factor_off, level_off, kind, row_n, origin: s.origin, k0, nvec: s.nvec, peel_id });
             level_off += s.m;
         }
         if tables.is_empty() {
@@ -224,7 +227,7 @@ pub struct DrawOptions {
     pub mask: bool,
     /// A flat view (the face, the diamond): faces toward the viewer in true colors.
     pub flat: bool,
-    /// Layers peeled off each [`crate::tetra::Side`] (the stack only; 0 = none).
+    /// Layers peeled off each [`crate::tetra::Side`] (the stack and the faces; 0 = none).
     pub peel: [u32; 5],
     /// The zeros as solid dark cubes instead of holes (the flat views).
     pub solid_zeros: bool,
@@ -612,8 +615,8 @@ impl TetraRenderer {
         let brush = o.brush.max(0.0) * s.layout.stride as f32;
         let (st, d) = (s.layout.stride, o.peel);
         let last = s.layout.total.saturating_sub(1);
-        let (peel_a, peel_b) = if s.layout.view == View::Stack {
-            ([d[0] * st, d[1] * st, d[2] * st, d[3]], [d[4], s.layout.slices.len() as u32, st, last])
+        let (peel_a, peel_b) = if s.layout.view != View::Diamond {
+            ([d[0] * st, d[1] * st, d[2] * st, d[3]], [d[4], s.layout.layers, st, last])
         } else {
             ([0; 4], [0, 0, st, last])
         };
