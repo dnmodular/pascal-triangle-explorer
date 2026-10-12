@@ -258,6 +258,28 @@ voids run through the solid as tunnels.
   * the **middle of an edge** (back = the last rows, left = k = 0, right = k = n):
     that one face stands vertical.
 
+* **Cell** (stack and top face; **C** cycles): what each cell is drawn as. The
+  equilateral stack in true spacing is a cannonball pile (face-centred cubic: each
+  slice sits in the hollows of the one above, √(2/3) lower, every cell 1 from its
+  twelve neighbours; its cell count is the tetrahedral number). Cubes don't share
+  the pile's threefold symmetry about its vertical axis, which is why its faces step
+  in thirds that look different at the front (bars) and the sides (half-cell steps).
+  * *cube* (default): fits every shape and spacing, and tiles cleanly at a pixel or
+    two.
+  * *rhombic*: the rhombic dodecahedron, the pile's own Voronoi cell, built from the
+    lattice's neighbour directions (twelve rhombi at ½ along each). The cells fill
+    space with no gap. Each step of a face shows one whole rhombus, the same on all
+    three sides, since from above the other two outward rhombi of a surface cell are
+    exactly edge-on. Seen square onto a face (the snaps), every cell is a hexagon of
+    three shaded rhombi: each face is a gapless honeycomb triangle. Twice a cube's
+    triangles (72 indices).
+  * *sphere*: the cannonballs, touching. A camera-facing quad per cell; the fragment
+    shader finds the sphere with a ray test and writes its depth, in the colour pass
+    and the pick pass. All faces alike, but a quarter of the pile is gaps, and small
+    on screen they turn into dots.
+  The rhombic and sphere cells fit the equilateral shape in true spacing (elsewhere
+  the slices don't sit in each other's hollows; the panel says so). The flat views
+  keep their boxes, and the preview tile its wire cubes.
 * **Entry and exit.** A live preview tile sits in a bottom corner of the 2D canvas,
   in the wave box's style (the corner the wave doesn't use). It turns slowly at about
   30 frames a second, as a green wireframe. Hover it and the palette colors run down
@@ -598,6 +620,12 @@ Verified (by `cargo test` on Mesa lavapipe, and by the headless export):
   m − 1 − d, k = d, n − k = d, the slice d up), the pick sees through the peel, the
   extent clears each face and does not depend on the depth the face is at, and the
   flat views' cells tile a cell apart, centred.
+* Tetra stack cells: the rhombic dodecahedron has twelve planar rhombi wound outward,
+  each at ½ along its neighbour direction, every corner within ½ along all of them,
+  and the volume 1/√2 of one lattice point (so the cells tile space); a slice down is
+  one of the lattice's neighbours. GPU picks with rhombic and sphere cells match a CPU
+  ray cast through the same shapes in the orbiting stack, through a peel, and in the
+  turned top face.
 * Tetra stack: the equilateral stack's edges are all equal (a regular tetrahedron),
   every slice's centroid is on the axis, and each flush shape keeps its corner or
   edge midpoint on the axis. Every cube's residue equals the additive rule for moduli 2–64, the

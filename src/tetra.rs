@@ -116,6 +116,124 @@ impl Shape {
     }
 }
 
+/// What each cell of the stack is drawn as.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Hash)]
+pub enum Cell {
+    /// A cube (axis-aligned box): fits every shape and spacing.
+    #[default]
+    Cube,
+    /// A rhombic dodecahedron: the cell of the cannonball pile the equilateral stack is
+    /// (each point's Voronoi cell), so the cells fill space with no gap and every face
+    /// of the stack steps in whole rhombi.
+    Rhombic,
+    /// A sphere: the cannonballs themselves, touching (a quarter of the pile is gaps).
+    Sphere,
+}
+
+impl Cell {
+    pub const ALL: [Cell; 3] = [Cell::Cube, Cell::Rhombic, Cell::Sphere];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Cell::Cube => "cube",
+            Cell::Rhombic => "rhombic",
+            Cell::Sphere => "sphere",
+        }
+    }
+
+    pub fn note(self) -> &'static str {
+        match self {
+            Cell::Cube => "Cubes: fit every shape and spacing, and tile cleanly when they are only a pixel or two. They do not share the equilateral pile's threefold symmetry, so its faces step in thirds that look different at the front and the sides.",
+            Cell::Rhombic => "Rhombic dodecahedra (12 rhombic faces): the equilateral stack is a cannonball pile, and these are its own cells, filling space with no gap. Every face of the stack steps in whole rhombi, the same on all three sides, and seen square on each face is a honeycomb of hexagons. They fit the equilateral shape in true spacing; twice a cube's triangles.",
+            Cell::Sphere => "Spheres: the cannonballs, each touching its twelve neighbours in the equilateral shape. All three faces look alike, but a quarter of the pile is gaps, and at a pixel or two they turn into dots.",
+        }
+    }
+}
+
+/// The six nearest-neighbour directions of the equilateral stack's lattice (and their
+/// negatives make twelve), unit length: along a row (k), along the two row directions,
+/// and down to the three cells of the next slice under a cell. `turned`: the top
+/// face's frame, (x, y, z) → (x, −z, y).
+pub fn lattice_dirs(turned: bool) -> [[f32; 3]; 6] {
+    let t = 1.0 / (2.0 * 3f32.sqrt());
+    let d = [[1.0, 0.0, 0.0], STACK_N, [0.5, 0.0, SQRT3_2], [0.0, -LEVEL, -2.0 * t], [0.5, -LEVEL, t], [-0.5, -LEVEL, t]];
+    if turned {
+        d.map(|v| [v[0], -v[2], v[1]])
+    } else {
+        d
+    }
+}
+
+/// The rhombic dodecahedron of the lattice (neighbours 1 apart): twelve rhombi, each
+/// the four corners of the face toward one neighbour, wound counterclockwise seen from
+/// outside. It is the set of points within ½ of the centre along every neighbour
+/// direction; its corners are six at 1/√2 along the cubic axes the lattice hides
+/// (axes e₁, e₂ with a row step = (e₁ + e₂)/√2 and a step down = (e₁ − e₂)/√2) and
+/// eight at (±e₁ ± e₂ ± e₃)·√2/4.
+pub fn rhombic_faces(turned: bool) -> [[[f32; 3]; 4]; 12] {
+    let dirs = lattice_dirs(turned);
+    let r2 = std::f32::consts::SQRT_2;
+    let e1 = scale(add(dirs[0], dirs[3]), 1.0 / r2);
+    let e2 = scale(sub(dirs[0], dirs[3]), 1.0 / r2);
+    let e3 = cross(e1, e2);
+    let mut corners = Vec::with_capacity(14);
+    for e in [e1, e2, e3] {
+        corners.push(scale(e, 1.0 / r2));
+        corners.push(scale(e, -1.0 / r2));
+    }
+    for i in 0..8 {
+        let sg = |b: i32| if i & b != 0 { -1.0 } else { 1.0 };
+        corners.push(scale(add(add(scale(e1, sg(1)), scale(e2, sg(2))), scale(e3, sg(4))), r2 / 4.0));
+    }
+    let mut faces = [[[0.0; 3]; 4]; 12];
+    for (f, face) in faces.iter_mut().enumerate() {
+        let v = if f < 6 { dirs[f] } else { scale(dirs[f - 6], -1.0) };
+        let mut on: Vec<[f32; 3]> = corners.iter().copied().filter(|&c| (dot(c, v) - 0.5).abs() < 1e-4).collect();
+        assert_eq!(on.len(), 4, "a rhombus has four corners");
+        // counterclockwise about v (seen from outside)
+        let mid = scale(v, 0.5);
+        let a = normalize(sub(on[0], mid));
+        let b = cross(v, a);
+        on.sort_by(|p, q| {
+            let ang = |c: [f32; 3]| dot(sub(c, mid), b).atan2(dot(sub(c, mid), a));
+            ang(*p).total_cmp(&ang(*q))
+        });
+        face.copy_from_slice(&on);
+    }
+    faces
+}
+
+/// The rhombic dodecahedron's corners face by face, as the draw shader's table.
+pub fn rhombic_wgsl() -> String {
+    let pts: Vec<String> = rhombic_faces(false).iter().flatten().map(|c| format!("vec3<f32>({:.7}, {:.7}, {:.7})", c[0], c[1], c[2])).collect();
+    format!("var<private> RHOMBIC: array<vec3<f32>, 48> = array<vec3<f32>, 48>({});\n", pts.join(", "))
+}
+
+/// Where the ray o + t·d (t ≥ 0) enters the slabs |vᵢ·(x − c)| ≤ hᵢ, if it does.
+fn ray_slabs(o: [f32; 3], d: [f32; 3], c: [f32; 3], slabs: &[([f32; 3], f32)]) -> Option<f32> {
+    let (mut t0, mut t1) = (0f32, f32::MAX);
+    let oc = sub(o, c);
+    for &(v, h) in slabs {
+        let (a, dv) = (dot(oc, v), dot(d, v));
+        if dv.abs() < 1e-12 {
+            if a.abs() > h {
+                return None;
+            }
+            continue;
+        }
+        let (mut ta, mut tb) = ((-h - a) / dv, (h - a) / dv);
+        if ta > tb {
+            std::mem::swap(&mut ta, &mut tb);
+        }
+        t0 = t0.max(ta);
+        t1 = t1.min(tb);
+        if t0 > t1 {
+            return None;
+        }
+    }
+    Some(t0)
+}
+
 /// How slices are spaced vertically.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Spacing {
@@ -149,6 +267,8 @@ pub struct TetraConfig {
     pub sweep: Sweep,
     pub spacing: Spacing,
     pub shape: Shape,
+    /// What the stack's cells are drawn as in the 3D space (the tile keeps cubes).
+    pub cell: Cell,
     /// What the 3D space shows: the stack, one of its faces laid flat, or the diamond.
     pub view: View,
     /// The face the face view lays flat.
@@ -177,7 +297,7 @@ impl Default for TetraConfig {
     fn default() -> Self {
         let mut sweep = Sweep::default();
         sweep.end = 48;
-        TetraConfig { sweep, spacing: Spacing::True, shape: Shape::Regular, view: View::Stack, face: Face::Front, peel: Peel::default(), options: true, ghosts: false, brush: 2.0, color_slice: false, budget: u32::MAX, solid_zeros: true, spin: true, tile: true }
+        TetraConfig { sweep, spacing: Spacing::True, shape: Shape::Regular, cell: Cell::Cube, view: View::Stack, face: Face::Front, peel: Peel::default(), options: true, ghosts: false, brush: 2.0, color_slice: false, budget: u32::MAX, solid_zeros: true, spin: true, tile: true }
     }
 }
 
@@ -783,6 +903,63 @@ impl Layout {
         }
     }
 
+    /// The stack is shown here (the stack view, or the top face, which is the stack
+    /// turned): the cells it draws as `cell`; every other view draws boxes.
+    pub fn draws(&self, cell: Cell) -> Cell {
+        if self.view == View::Stack || (self.view == View::Face && self.face == Face::Top) {
+            cell
+        } else {
+            Cell::Cube
+        }
+    }
+
+    /// The top face's frame: the stack turned, (x, y, z) → (x, −z, y).
+    pub fn turned(&self) -> bool {
+        self.view == View::Face && self.face == Face::Top
+    }
+
+    /// Where the ray o + t·d enters cell (si, n, k) drawn as `cell`, and how far inside
+    /// its outline the entry point is (near 0 at an edge or the rim: the GPU may pick
+    /// either neighbour there).
+    pub fn cell_hit(&self, si: usize, n: u32, k: u32, cell: Cell, o: [f32; 3], d: [f32; 3]) -> Option<(f32, f32)> {
+        let c = self.center(si, n, k);
+        let s = self.stride as f32;
+        // the margins of the entry point to every slab: the smallest is the face it is
+        // on (≈ 0), the next one its distance to that face's edge
+        let second = |slabs: &[([f32; 3], f32)], t: f32| {
+            let p = sub(add(o, scale(d, t)), c);
+            let mut m: Vec<f32> = slabs.iter().map(|&(v, h)| h - dot(p, v).abs()).collect();
+            m.sort_by(f32::total_cmp);
+            m[1]
+        };
+        match self.draws(cell) {
+            Cell::Cube => {
+                let he = self.half_extents();
+                let slabs = [([1.0, 0.0, 0.0], he[0]), ([0.0, 1.0, 0.0], he[1]), ([0.0, 0.0, 1.0], he[2])];
+                ray_slabs(o, d, c, &slabs).map(|t| (t, second(&slabs, t)))
+            }
+            Cell::Rhombic => {
+                let slabs = lattice_dirs(self.turned()).map(|v| (v, 0.5 * s));
+                // (an edge of a rhombus is where two slabs meet, so the second margin
+                // is the distance to the nearest edge, up to a constant)
+                ray_slabs(o, d, c, &slabs).map(|t| (t, second(&slabs, t)))
+            }
+            Cell::Sphere => {
+                let r = 0.5 * s;
+                let oc = sub(o, c);
+                let b = dot(oc, d) / dot(d, d);
+                let h = b * b - (dot(oc, oc) - r * r) / dot(d, d);
+                if h < 0.0 {
+                    return None;
+                }
+                let t = -b - h.sqrt();
+                // the rim: how far the ray passes inside the silhouette
+                let miss = (dot(oc, oc) - b * b * dot(d, d)).max(0.0).sqrt();
+                (t >= 0.0).then_some((t, r - miss))
+            }
+        }
+    }
+
     /// The centres of a slice's corner cubes.
     pub fn slice_corners(&self, si: usize) -> Vec<[f32; 3]> {
         let s = &self.slices[si];
@@ -1166,7 +1343,8 @@ impl Camera {
         add(self.target, scale([sy * cp, sp, -cy * cp], self.dist))
     }
 
-    fn basis(&self) -> ([f32; 3], [f32; 3], [f32; 3]) {
+    /// The camera's forward, right and up directions (unit).
+    pub fn basis(&self) -> ([f32; 3], [f32; 3], [f32; 3]) {
         let f = normalize(sub(self.target, self.eye()));
         let r = normalize(cross(f, [0.0, 1.0, 0.0]));
         let u = cross(r, f);
@@ -1307,6 +1485,8 @@ pub struct RayHit {
     pub cube: CubeId,
     pub t: f32,
     pub next_t: f32,
+    /// How far inside the hit cell's outline the ray enters (see [`Layout::cell_hit`]).
+    pub margin: f32,
 }
 
 /// The reference ray cast over every nonzero cube of the layout (CPU residues;
@@ -1317,7 +1497,14 @@ pub fn ray_cast(layout: &Layout, mods: &[Modulus], o: [f32; 3], d: [f32; 3]) -> 
 
 /// The same through a peel: peeled cubes are not there.
 pub fn ray_cast_peeled(layout: &Layout, mods: &[Modulus], o: [f32; 3], d: [f32; 3], peel: [u32; 5]) -> Option<RayHit> {
-    let he = layout.half_extents();
+    ray_cast_cell(layout, mods, o, d, peel, Cell::Cube)
+}
+
+/// The same with the cells drawn as `cell`.
+pub fn ray_cast_cell(layout: &Layout, mods: &[Modulus], o: [f32; 3], d: [f32; 3], peel: [u32; 5], cell: Cell) -> Option<RayHit> {
+    // (a rhombic cell reaches 1/√2 of a stride from its centre, a sphere ½)
+    let st = layout.stride as f32;
+    let he = layout.half_extents().map(|h| h.max(0.72 * st));
     let mut best: Option<RayHit> = None;
     let mut second = f32::MAX;
     for (si, md) in mods.iter().enumerate().take(layout.slices.len()) {
@@ -1336,8 +1523,7 @@ pub fn ray_cast_peeled(layout: &Layout, mods: &[Modulus], o: [f32; 3], d: [f32; 
             if layout.peeled(si, n, k, peel) {
                 continue;
             }
-            let c = layout.center(si, n, k);
-            let Some(t) = ray_box(o, d, sub(c, he), add(c, he)) else { continue };
+            let Some((t, margin)) = layout.cell_hit(si, n, k, cell, o, d) else { continue };
             let r = md.binom(n, k);
             if r == 0 {
                 continue;
@@ -1348,7 +1534,7 @@ pub fn ray_cast_peeled(layout: &Layout, mods: &[Modulus], o: [f32; 3], d: [f32; 
                     if let Some(b) = best {
                         second = second.min(b.t);
                     }
-                    best = Some(RayHit { cube: CubeId { slice: si as u32, n, k, residue: r }, t, next_t: 0.0 });
+                    best = Some(RayHit { cube: CubeId { slice: si as u32, n, k, residue: r }, t, next_t: 0.0, margin });
                 }
             }
         }
@@ -1448,6 +1634,48 @@ mod tests {
         assert!(on_axis(Shape::FaceLeft, &|c| mid(c[0], c[1])));
         assert!(on_axis(Shape::FaceRight, &|c| mid(c[0], c[2])));
         assert!(!on_axis(Shape::Regular, &|c| c[0]));
+    }
+
+    #[test]
+    fn the_rhombic_cell_is_the_lattices_own() {
+        // the equilateral stack's neighbours: one row apart, and one slice down
+        let l = Layout::build(View::Stack, &(2..=12).collect::<Vec<_>>(), Spacing::True, Shape::Regular, u32::MAX);
+        let (a, b) = (l.center(5, 3, 1), l.center(6, 3, 1));
+        let step = sub(b, a);
+        assert!((dot(step, step) - 1.0).abs() < 1e-4, "a slice down is a neighbour: {step:?}");
+        assert!(lattice_dirs(false).iter().any(|v| dot(sub(*v, step), sub(*v, step)) < 1e-6));
+        for turned in [false, true] {
+            let dirs = lattice_dirs(turned);
+            for (i, u) in dirs.iter().enumerate() {
+                assert!((dot(*u, *u) - 1.0).abs() < 1e-5);
+                // neighbours meet at 60°, 90° or 120°, never closer
+                for v in &dirs[i + 1..] {
+                    let c = dot(*u, *v).abs();
+                    assert!((c - 0.5).abs() < 1e-4 || c < 1e-4, "{u:?} {v:?}");
+                }
+            }
+            let faces = rhombic_faces(turned);
+            let mut volume = 0.0;
+            for (f, q) in faces.iter().enumerate() {
+                let v = if f < 6 { dirs[f] } else { scale(dirs[f - 6], -1.0) };
+                // planar at ½ along its neighbour, a rhombus, wound outward
+                assert!(q.iter().all(|c| (dot(*c, v) - 0.5).abs() < 1e-4));
+                let side = |i: usize| { let e = sub(q[(i + 1) % 4], q[i]); dot(e, e).sqrt() };
+                assert!((0..4).all(|i| (side(i) - side(0)).abs() < 1e-4), "face {f}: sides differ");
+                for (x, y, z) in [(0, 1, 2), (0, 2, 3)] {
+                    let nrm = cross(sub(q[y], q[x]), sub(q[z], q[x]));
+                    assert!(dot(nrm, v) > 0.0, "face {f} wound inward");
+                    volume += dot(q[x], cross(q[y], q[z])) / 6.0;
+                }
+            }
+            // the volume per lattice point: the cells fill space with no gap or overlap
+            assert!((volume - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-4, "volume {volume}");
+            // and it is the set within ½ along every neighbour: every corner is inside
+            for c in faces.iter().flatten() {
+                assert!(dirs.iter().all(|v| dot(*c, *v).abs() <= 0.5 + 1e-4));
+            }
+        }
+        assert_eq!(rhombic_wgsl().matches("vec3<f32>(").count(), 48);
     }
 
     #[test]

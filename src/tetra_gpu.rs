@@ -16,7 +16,7 @@ use wgpu::util::DeviceExt;
 use crate::gpu::{GpuFactor, BINOM_WGSL};
 use crate::math::{to_mont, Modulus};
 use crate::palette::{level_map, level_map_words, residue_level, Palette, Scheme};
-use crate::tetra::{Camera, CubeId, Layout, Mat4, SliceKind, View};
+use crate::tetra::{rhombic_wgsl, Camera, Cell, CubeId, Layout, Mat4, SliceKind, View};
 
 pub const TETRA_CELLS_WGSL: &str = include_str!("../shaders/tetra_cells.wgsl");
 pub const TETRA_DRAW_WGSL: &str = include_str!("../shaders/tetra_draw.wgsl");
@@ -37,6 +37,28 @@ const CUBE_INDICES: [u16; 36] = [
     0, 4, 2, 2, 4, 6, // −x
     1, 3, 5, 3, 7, 5, // +x
 ];
+
+/// Every cell shape's indices in one buffer: the cube's 36, then the rhombic
+/// dodecahedron's 72 (two triangles per rhombus, corners 4f..4f + 3), then the sphere
+/// quad's 6.
+fn cell_indices() -> Vec<u16> {
+    let mut v = CUBE_INDICES.to_vec();
+    for f in 0..12u16 {
+        let b = 4 * f;
+        v.extend([b, b + 1, b + 2, b, b + 2, b + 3]);
+    }
+    v.extend([0, 1, 2, 2, 1, 3]);
+    v
+}
+
+/// (index count, first index) of a cell shape in [`cell_indices`].
+fn cell_range(cell: Cell) -> (u32, u32) {
+    match cell {
+        Cell::Cube => (36, 0),
+        Cell::Rhombic => (72, 36),
+        Cell::Sphere => (6, 108),
+    }
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
@@ -93,6 +115,10 @@ struct DrawParams {
     fill: [f32; 4],
     peel_a: [u32; 4],
     peel_b: [u32; 4],
+    eye: [f32; 4],
+    fwd: [f32; 4],
+    right: [f32; 4],
+    up: [f32; 4],
 }
 
 const FLAG_SLICE: u32 = 1;
@@ -100,6 +126,9 @@ const FLAG_MASK: u32 = 2;
 const FLAG_GHOST: u32 = 4;
 const FLAG_FLAT: u32 = 8;
 const FLAG_ZERO: u32 = 16;
+const FLAG_RHOMBIC: u32 = 32;
+const FLAG_SPHERE: u32 = 64;
+const FLAG_TURNED: u32 = 128;
 /// Most cubes a scene holds, whatever the budget (8 bytes each, one buffer).
 pub const MAX_CELLS: u32 = 48_000_000;
 
@@ -231,6 +260,16 @@ pub struct DrawOptions {
     pub peel: [u32; 5],
     /// The zeros as solid dark cubes instead of holes (the flat views).
     pub solid_zeros: bool,
+    /// What the cells are drawn as (the stack and the top face; elsewhere boxes).
+    pub cell: Cell,
+}
+
+/// What a pick sees: the peel, whether the zeros are solid (and pickable), the cells.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PickSpec {
+    pub peel: [u32; 5],
+    pub zeros: bool,
+    pub cell: Cell,
 }
 
 struct Target {
@@ -276,6 +315,9 @@ pub struct TetraRenderer {
     ghost_pipe: wgpu::RenderPipeline,
     pick_pipe: wgpu::RenderPipeline,
     line_pipe: wgpu::RenderPipeline,
+    sphere_pipe: wgpu::RenderPipeline,
+    sphere_pick_pipe: wgpu::RenderPipeline,
+    /// The cells' indices: the cube's, the rhombic dodecahedron's, the sphere's quad.
     index_buf: wgpu::Buffer,
     draw_ubuf: wgpu::Buffer,
     ghost_ubuf: wgpu::Buffer,
@@ -321,11 +363,11 @@ fn layouts(device: &wgpu::Device) -> (wgpu::BindGroupLayout, wgpu::BindGroupLayo
 
 /// The shader modules exactly as compiled: the compute module and the draw module.
 pub fn module_sources() -> [(&'static str, String); 2] {
-    [("tetra-cells", format!("{BINOM_WGSL}\n{TETRA_CELLS_WGSL}")), ("tetra-draw", TETRA_DRAW_WGSL.to_string())]
+    [("tetra-cells", format!("{BINOM_WGSL}\n{TETRA_CELLS_WGSL}")), ("tetra-draw", format!("{TETRA_DRAW_WGSL}\n{}", rhombic_wgsl()))]
 }
 
 /// Pipelines by name, for `--check-shaders`.
-pub const PIPELINES: [&str; 6] = ["tetra_cells", "cube", "solid", "ghost", "pick", "line"];
+pub const PIPELINES: [&str; 8] = ["tetra_cells", "cube", "solid", "ghost", "pick", "line", "sphere", "sphere_pick"];
 
 struct Pipes {
     cells: wgpu::ComputePipeline,
@@ -335,6 +377,9 @@ struct Pipes {
     ghost: wgpu::RenderPipeline,
     pick: wgpu::RenderPipeline,
     line: wgpu::RenderPipeline,
+    /// Spheres: the quads' fragments find the sphere and write its depth.
+    sphere: wgpu::RenderPipeline,
+    sphere_pick: wgpu::RenderPipeline,
 }
 
 fn depth_state(write: bool, compare: wgpu::CompareFunction) -> wgpu::DepthStencilState {
@@ -368,7 +413,7 @@ fn build_pipes(device: &wgpu::Device, cells_layout: &wgpu::BindGroupLayout, draw
         let m = module(cells_src.0, &cells_src.1);
         device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: Some("tetra_cells"), layout: Some(&cells_layout_p), module: &m, entry_point: Some("tetra_cells"), compilation_options: Default::default(), cache: None })
     });
-    let draw_m = (want("cube") || want("solid") || want("ghost") || want("pick") || want("line")).then(|| module(draw_src.0, &draw_src.1));
+    let draw_m = PIPELINES[1..].iter().any(|n| want(n)).then(|| module(draw_src.0, &draw_src.1));
     let render = |label: &str, vs: &str, fs: &str, format: wgpu::TextureFormat, blend: Option<wgpu::BlendState>, depth: wgpu::DepthStencilState, topology: wgpu::PrimitiveTopology, cull: Option<wgpu::Face>, buffers: &[Option<wgpu::VertexBufferLayout>]| {
         let m = draw_m.as_ref().expect("draw module");
         device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -391,7 +436,9 @@ fn build_pipes(device: &wgpu::Device, cells_layout: &wgpu::BindGroupLayout, draw
     let line_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4, 2 => Float32];
     let line_buf = wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<LineVertex>() as u64, step_mode: wgpu::VertexStepMode::Vertex, attributes: &line_attrs };
     let line = want("line").then(|| render("line", "line_vs", "line_fs", COLOR_FORMAT, Some(PREMULTIPLIED), depth_state(false, wgpu::CompareFunction::LessEqual), wgpu::PrimitiveTopology::LineList, None, &[Some(line_buf.clone())]));
-    Some(Pipes { cells: cells?, cube: cube?, solid: solid?, ghost: ghost?, pick: pick?, line: line? })
+    let sphere = want("sphere").then(|| render("sphere", "cube_vs", "sphere_fs", COLOR_FORMAT, Some(PREMULTIPLIED), depth_state(true, wgpu::CompareFunction::Less), tri, None, &[]));
+    let sphere_pick = want("sphere_pick").then(|| render("sphere_pick", "pick_vs", "sphere_pick_fs", PICK_FORMAT, None, depth_state(true, wgpu::CompareFunction::Less), tri, None, &[]));
+    Some(Pipes { cells: cells?, cube: cube?, solid: solid?, ghost: ghost?, pick: pick?, line: line?, sphere: sphere?, sphere_pick: sphere_pick? })
 }
 
 /// Compile one tetra pipeline on its own (for `--check-shaders`).
@@ -405,7 +452,7 @@ impl TetraRenderer {
         let (cells_layout, draw_layout) = layouts(&device);
         let unchecked = crate::gpu::unchecked_shaders_requested();
         let p = build_pipes(&device, &cells_layout, &draw_layout, None, unchecked).expect("all pipelines");
-        let index_buf = init(&device, "cube indices", bytemuck::cast_slice(&CUBE_INDICES), wgpu::BufferUsages::INDEX);
+        let index_buf = init(&device, "cell indices", bytemuck::cast_slice(&cell_indices()), wgpu::BufferUsages::INDEX);
         let ubuf = |label| device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size: std::mem::size_of::<DrawParams>() as u64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let draw_ubuf = ubuf("tetra draw params");
         let ghost_ubuf = ubuf("tetra ghost params");
@@ -431,6 +478,8 @@ impl TetraRenderer {
             ghost_pipe: p.ghost,
             pick_pipe: p.pick,
             line_pipe: p.line,
+            sphere_pipe: p.sphere,
+            sphere_pick_pipe: p.sphere_pick,
             index_buf,
             draw_ubuf,
             ghost_ubuf,
@@ -596,7 +645,16 @@ impl TetraRenderer {
             }
             _ => ([0.0; 4], u32::MAX),
         };
-        let mut flags = 0;
+        let cell = s.layout.draws(o.cell);
+        let st = s.layout.stride as f32;
+        let (he, mut flags) = match cell {
+            Cell::Cube => (he, 0),
+            Cell::Rhombic => ([st; 3], FLAG_RHOMBIC),
+            Cell::Sphere => ([0.5 * st; 3], FLAG_SPHERE),
+        };
+        if s.layout.turned() {
+            flags |= FLAG_TURNED;
+        }
         if o.color_slice {
             flags |= FLAG_SLICE;
         }
@@ -620,7 +678,20 @@ impl TetraRenderer {
         } else {
             ([0; 4], [0, 0, st, last])
         };
-        DrawParams { view_proj, hover, half: [he[0], he[1], he[2], brush], wire: if ghost { [0.55, 0.75, 0.6, 1.0] } else { WIRE }, hover_slice, flags, line_px: 0.75, ghost_alpha: 0.07, fill: [o.fill.clamp(-1e30, 1e30), 0.0, 0.0, 0.0], peel_a, peel_b }
+        let (f, r, u) = o.camera.basis();
+        let e = o.camera.eye();
+        let persp = if o.camera.ortho > 0.0 { 0.0 } else { 1.0 };
+        DrawParams { view_proj, hover, half: [he[0], he[1], he[2], brush], wire: if ghost { [0.55, 0.75, 0.6, 1.0] } else { WIRE }, hover_slice, flags, line_px: 0.75, ghost_alpha: 0.07, fill: [o.fill.clamp(-1e30, 1e30), 0.0, 0.0, 0.0], peel_a, peel_b, eye: [e[0], e[1], e[2], persp], fwd: [f[0], f[1], f[2], 0.0], right: [r[0], r[1], r[2], 0.0], up: [u[0], u[1], u[2], 0.0] }
+    }
+
+    /// Point both indirect draws (the nonzero cubes, the zeros) at `cell`'s indices; the
+    /// instance counts the compute pass wrote stay.
+    fn use_cell(&self, s: &Scene, cell: Cell) {
+        let (count, first) = cell_range(s.layout.draws(cell));
+        for base in [0u64, 20] {
+            self.queue.write_buffer(&s.counters, base, bytemuck::bytes_of(&count));
+            self.queue.write_buffer(&s.counters, base + 8, bytemuck::bytes_of(&first));
+        }
     }
 
     /// Draw the stack into the target: the cubes, the outlines, then the ghosts.
@@ -640,17 +711,19 @@ impl TetraRenderer {
         let Some(s) = &self.scene else { return };
         let p = self.params(o, vp, false);
         self.queue.write_buffer(&self.draw_ubuf, 0, bytemuck::bytes_of(&p));
+        self.use_cell(s, o.cell);
+        let sphere = s.layout.draws(o.cell) == Cell::Sphere;
         pass.set_index_buffer(self.index_buf.slice(..), wgpu::IndexFormat::Uint16);
         // all filled: no wire to see through, so back faces can go
         let solid = o.fill == f32::NEG_INFINITY;
-        pass.set_pipeline(if solid { &self.solid_pipe } else { &self.cube_pipe });
+        pass.set_pipeline(if sphere { &self.sphere_pipe } else if solid { &self.solid_pipe } else { &self.cube_pipe });
         pass.set_bind_group(0, &s.draw_nz, &[]);
         pass.draw_indexed_indirect(&s.counters, 0);
         if o.solid_zeros {
             // the zeros as dark cubes (the ghosts' uniforms are free: they are not drawn)
             let pz = self.params_for(o, vp, false, true);
             self.queue.write_buffer(&self.ghost_ubuf, 0, bytemuck::bytes_of(&pz));
-            pass.set_pipeline(&self.solid_pipe);
+            pass.set_pipeline(if sphere { &self.sphere_pipe } else { &self.solid_pipe });
             pass.set_bind_group(0, &s.draw_z, &[]);
             pass.draw_indexed_indirect(&s.counters, 20);
         }
@@ -688,12 +761,15 @@ impl TetraRenderer {
 
     /// Encode the ID pass for pixel (px, py) of the target and copy its result out, unless
     /// a pick is still in flight. Call [`Self::start_pick_map`] after submitting.
-    pub fn encode_pick(&mut self, enc: &mut wgpu::CommandEncoder, camera: &Camera, px: f32, py: f32, peel: [u32; 5], zeros: bool) -> bool {
+    pub fn encode_pick(&mut self, enc: &mut wgpu::CommandEncoder, camera: &Camera, px: f32, py: f32, spec: PickSpec) -> bool {
+        let PickSpec { peel, zeros, cell } = spec;
         if self.pick_pending.is_some() {
             return false;
         }
         let (Some(t), Some(s)) = (&self.target, &self.scene) else { return false };
-        let o = DrawOptions { camera: *camera, fill: f32::INFINITY, hover: None, brush: 0.0, color_slice: false, ghosts: false, mask: false, flat: false, peel, solid_zeros: false };
+        let o = DrawOptions { camera: *camera, fill: f32::INFINITY, hover: None, brush: 0.0, color_slice: false, ghosts: false, mask: false, flat: false, peel, solid_zeros: false, cell };
+        self.use_cell(s, cell);
+        let sphere = s.layout.draws(cell) == Cell::Sphere;
         let vp = camera.pick_view_proj(t.w, t.h, px, py);
         let p = self.params(&o, vp, false);
         self.queue.write_buffer(&self.pick_ubuf, 0, bytemuck::bytes_of(&p));
@@ -711,7 +787,7 @@ impl TetraRenderer {
                 multiview_mask: None,
             });
             pass.set_index_buffer(self.index_buf.slice(..), wgpu::IndexFormat::Uint16);
-            pass.set_pipeline(&self.pick_pipe);
+            pass.set_pipeline(if sphere { &self.sphere_pick_pipe } else { &self.pick_pipe });
             pass.set_bind_group(0, &s.pick_nz, &[]);
             pass.draw_indexed_indirect(&s.counters, 0);
             if zeros {
@@ -782,8 +858,13 @@ impl TetraRenderer {
 
     /// Pick synchronously, the zeros too when `zeros` (the solid zeros of the flat views).
     pub fn pick_blocking_with(&mut self, camera: &Camera, px: f32, py: f32, peel: [u32; 5], zeros: bool) -> Option<CubeId> {
+        self.pick_blocking_cell(camera, px, py, peel, zeros, Cell::Cube)
+    }
+
+    /// Pick synchronously with the cells drawn as `cell` (tests).
+    pub fn pick_blocking_cell(&mut self, camera: &Camera, px: f32, py: f32, peel: [u32; 5], zeros: bool, cell: Cell) -> Option<CubeId> {
         let mut enc = self.device.create_command_encoder(&Default::default());
-        assert!(self.encode_pick(&mut enc, camera, px, py, peel, zeros), "no pick in flight");
+        assert!(self.encode_pick(&mut enc, camera, px, py, PickSpec { peel, zeros, cell }), "no pick in flight");
         self.queue.submit(Some(enc.finish()));
         self.start_pick_map();
         loop {

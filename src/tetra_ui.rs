@@ -9,8 +9,8 @@ use pascal::layers::Preset;
 use pascal::math::Modulus;
 use pascal::palette::Scheme;
 use pascal::sweep::{ModMode, PrimeOrder, Seq};
-use pascal::tetra::{describe, Face, TILE_BUDGET, Side, Snap, face_row_alternates, face_row_zeros, selected_moduli, view_stride, Camera, CubeId, Layout, SceneKey, Shape, SliceKind, Spacing, TetraConfig, View, BUDGETS, FOLD, TETRA_MAX_M};
-use pascal::tetra_gpu::{outline_vertices, DrawOptions, TetraRenderer, BACKGROUND};
+use pascal::tetra::{describe, Cell, Face, TILE_BUDGET, Side, Snap, face_row_alternates, face_row_zeros, selected_moduli, view_stride, Camera, CubeId, Layout, SceneKey, Shape, SliceKind, Spacing, TetraConfig, View, BUDGETS, FOLD, TETRA_MAX_M};
+use pascal::tetra_gpu::{outline_vertices, DrawOptions, PickSpec, TetraRenderer, BACKGROUND};
 use pascal::wave_overlay::Corner;
 
 use super::{group, mono_drag, mono_drag_with, mono_line, note, Model};
@@ -56,7 +56,7 @@ pub struct TetraView {
     /// The hovered face row's facts: (m, alternates ±1, zeros).
     row_stats: Option<(u32, bool, u32)>,
     /// Pointer and camera of the last pick, so an unchanged view is not picked again.
-    last_pick: Option<((f32, f32), Camera, [u32; 5])>,
+    last_pick: Option<((f32, f32), Camera, PickSpec)>,
     /// The peel animation's clock (a layer comes off every 1/speed s), and the extent
     /// (layers that peel everything) for the sides and the layout it was counted for.
     peel_clock: f32,
@@ -463,7 +463,9 @@ pub fn render(model: &mut Model, cache: &mut TetraCache, r: &mut TetraRenderer, 
     let hover = if t.open { t.hover } else { None };
     let peel = t.peel_depths();
     let solid_zeros = t.open && view.flat() && t.config.solid_zeros;
-    let opts = DrawOptions { camera, fill: t.fill_height(), hover, brush: t.config.brush, color_slice: t.config.color_slice, ghosts: t.config.ghosts, mask, flat: t.open && view.flat(), peel, solid_zeros };
+    // (the tile keeps its wire cubes)
+    let cell = if t.open { t.config.cell } else { Cell::Cube };
+    let opts = DrawOptions { camera, fill: t.fill_height(), hover, brush: t.config.brush, color_slice: t.config.color_slice, ghosts: t.config.ghosts, mask, flat: t.open && view.flat(), peel, solid_zeros, cell };
     // an unchanged picture is not drawn again (hover, egui repaints)
     let drawn = (opts, t.target_px);
     if recreated || cache.drawn != Some(drawn) {
@@ -472,8 +474,9 @@ pub fn render(model: &mut Model, cache: &mut TetraCache, r: &mut TetraRenderer, 
     }
     if t.open {
         if let Some(p) = t.pointer {
-            if t.last_pick != Some((p, camera, peel)) && r.encode_pick(enc, &camera, p.0, p.1, peel, solid_zeros) {
-                t.last_pick = Some((p, camera, peel));
+            let spec = PickSpec { peel, zeros: solid_zeros, cell };
+            if t.last_pick != Some((p, camera, spec)) && r.encode_pick(enc, &camera, p.0, p.1, spec) {
+                t.last_pick = Some((p, camera, spec));
             }
         }
     }
@@ -605,6 +608,17 @@ fn options(ui: &mut egui::Ui, t: &mut TetraView) {
             }).response.on_hover_text(c.shape.note()).on_disabled_hover_text("The faces and the diamond are flat: the shape is the stack's (the top shows it)");
         });
     });
+    ui.add_enabled_ui(c.view == View::Stack || (c.view == View::Face && c.face == Face::Top), |ui| {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("cell").color(ui.visuals().weak_text_color()));
+            for cl in Cell::ALL {
+                ui.selectable_value(&mut c.cell, cl, cl.label()).on_hover_text(format!("{} (C)", cl.note()));
+            }
+        });
+    });
+    if c.cell != Cell::Cube && (c.shape != Shape::Regular || c.spacing != Spacing::True) && (c.view == View::Stack || (c.view == View::Face && c.face == Face::Top)) {
+        note(ui, "The rhombic and sphere cells fit the equilateral shape in true spacing: elsewhere the slices do not sit in each other's hollows, and the cells overlap or leave gaps.");
+    }
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("spacing").color(ui.visuals().weak_text_color()));
         ui.selectable_value(&mut c.spacing, Spacing::True, "true").on_hover_text("Height (or a face row's place) follows m: skipped moduli leave gaps (in the stack dashed, with the gap size) and the edges stay straight (G)");
@@ -636,7 +650,7 @@ fn options(ui: &mut egui::Ui, t: &mut TetraView) {
     };
     mono_line(ui, &text);
     ui.separator();
-    note(ui, "Keys: V next view · F next face · 1–5 snap the stack's camera · ← → step the peel a layer (Shift: ten) · Home / End none / all · P play it, R rewind · U unfold again · G spacing · O options · Esc back. Stack: drag orbit, right / shift-drag pan, wheel zoom. Faces and diamond: drag pan, wheel zoom. Double-click reframes.");
+    note(ui, "Keys: V next view · F next face · C next cell · 1–5 snap the stack's camera · ← → step the peel a layer (Shift: ten) · Home / End none / all · P play it, R rewind · U unfold again · G spacing · O options · Esc back. Stack: drag orbit, right / shift-drag pan, wheel zoom. Faces and diamond: drag pan, wheel zoom. Double-click reframes.");
 }
 
 /// The peel: which sides, how many layers, and the animation that takes them off one by
@@ -897,6 +911,10 @@ pub fn space(ui: &mut egui::Ui, model: &mut Model, ppp: f32, tex: Option<egui::T
                     let next = t.config.view.next();
                     t.set_view(next);
                 }
+                if ui.input(|i| i.key_pressed(egui::Key::C) && !i.modifiers.any()) {
+                    let i = Cell::ALL.iter().position(|&c| c == t.config.cell).unwrap_or(0);
+                    t.config.cell = Cell::ALL[(i + 1) % Cell::ALL.len()];
+                }
                 if ui.input(|i| i.key_pressed(egui::Key::F) && !i.modifiers.any()) && t.config.view == View::Face {
                     t.config.face = t.config.face.next();
                 }
@@ -992,6 +1010,11 @@ pub fn space(ui: &mut egui::Ui, model: &mut Model, ppp: f32, tex: Option<egui::T
             match l.view {
                 View::Stack => {
                     lines.push(format!("shape: {}", l.shape.label()));
+                    match t.config.cell {
+                        Cell::Rhombic => lines.push("cells: rhombic dodecahedra, the cannonball pile's own cells: no gaps, every step a whole rhombus (C)".into()),
+                        Cell::Sphere => lines.push("cells: spheres, the cannonballs, each touching twelve neighbours (C)".into()),
+                        Cell::Cube => {}
+                    }
                     lines.push(match l.spacing {
                         Spacing::True => "true spacing: height follows m; gaps are skipped moduli (G)".into(),
                         Spacing::Packed => "packed: height = slice index, so the sides curve: slice size no longer tracks height (G)".into(),
@@ -1012,7 +1035,7 @@ pub fn space(ui: &mut egui::Ui, model: &mut Model, ppp: f32, tex: Option<egui::T
                         _ => "top: the stack seen straight down (orthographic), each cell the topmost cube over it".into(),
                     });
                     if l.face == Face::Top {
-                        lines.push(format!("shape: {} · lower slices peek out around the upper ones", l.shape.label()));
+                        lines.push(format!("shape: {} · cells: {} · lower slices peek out around the upper ones", l.shape.label(), t.config.cell.label()));
                     }
                 }
                 View::Face | View::Diamond => {

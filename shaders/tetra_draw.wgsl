@@ -17,6 +17,12 @@
 //   cube_vs / cube_fs   the cubes (wire, or filled under the brush); the ghost
 //                       pass draws the zeros with the same shaders (flag bit 2)
 //   pick_vs / pick_fs   the ID pass: the cube under one pixel, as its words
+//   sphere_fs / sphere_pick_fs   spheres: a quad facing the camera, the sphere found
+//                       per pixel by a ray test, its depth written
+//
+// A cell is a cube (8 corners, 36 indices), a rhombic dodecahedron (12 rhombi of 4
+// corners each, 72 indices; the corners face by face in RHOMBIC, appended by the
+// renderer) or a sphere (a quad, 6 indices), by flag.
 //   line_vs / line_fs   slice outlines (solid) and skipped moduli (dashed)
 // ============================================================================
 
@@ -32,6 +38,10 @@ struct DrawParams {
   fill: vec4<f32>,      // x: cubes whose centre is at or above this height are filled in color
   peel_a: vec4<u32>,    // peeled away: k < x, n − k < y, last row − n < z (cells), slice < w
   peel_b: vec4<u32>,    // x: layers from the base, y: layers in all, z: stride, w: last cube index
+  eye: vec4<f32>,       // the camera: eye (w 1 perspective, 0 orthographic), forward, right, up
+  fwd: vec4<f32>,
+  right: vec4<f32>,
+  up: vec4<f32>,
 };
 
 struct Slice {
@@ -65,6 +75,9 @@ const FLAG_MASK: u32 = 2u;
 const FLAG_GHOST: u32 = 4u;
 const FLAG_FLAT: u32 = 8u;   // a flat view: faces toward the viewer keep their true color, no edges
 const FLAG_ZERO: u32 = 16u;  // the zeros drawn solid (the flat views: no gaps)
+const FLAG_RHOMBIC: u32 = 32u;  // cells are rhombic dodecahedra (half.x = the stride)
+const FLAG_SPHERE: u32 = 64u;   // cells are spheres (half.x = the radius)
+const FLAG_TURNED: u32 = 128u;  // the top face's frame: (x, y, z) → (x, −z, y)
 const LIGHT: vec3<f32> = vec3<f32>(236.0 / 255.0, 236.0 / 255.0, 226.0 / 255.0);
 
 fn unpack_rgb(c: u32) -> vec3<f32> {
@@ -107,6 +120,56 @@ fn corner_of(vi: u32) -> vec3<f32> {
   return vec3<f32>(f32(vi & 1u), f32((vi >> 1u) & 1u), f32((vi >> 2u) & 1u));
 }
 
+struct CellVertex {
+  offset: vec3<f32>,   // from the cell's centre
+  local: vec3<f32>,    // a cube's corner in 0..1; a rhombus's (u, v, 0); a quad's (±1, ±1, 0)
+};
+
+// Vertex vi of a cell, by the cell flags.
+fn cell_vertex(vi: u32) -> CellVertex {
+  var out: CellVertex;
+  if ((D.flags & FLAG_RHOMBIC) != 0u) {
+    var p = RHOMBIC[vi] * D.half.x;
+    if ((D.flags & FLAG_TURNED) != 0u) { p = vec3<f32>(p.x, -p.z, p.y); }
+    let c = vi & 3u;
+    out.offset = p;
+    out.local = vec3<f32>(select(0.0, 1.0, c == 1u || c == 2u), select(0.0, 1.0, c >= 2u), 0.0);
+  } else if ((D.flags & FLAG_SPHERE) != 0u) {
+    // a little over the radius: in perspective the silhouette is a hair wider
+    let q = vec2<f32>(select(-1.0, 1.0, (vi & 1u) != 0u), select(-1.0, 1.0, (vi & 2u) != 0u));
+    out.offset = (D.right.xyz * q.x + D.up.xyz * q.y) * D.half.x * 1.25;
+    out.local = vec3<f32>(q, 0.0);
+  } else {
+    let corner = corner_of(vi);
+    out.offset = (corner * 2.0 - 1.0) * D.half.xyz;
+    out.local = corner;
+  }
+  return out;
+}
+
+// The ray through a point of a sphere's quad, against the sphere: the entry point and
+// how squarely it is hit (1 head on, 0 at the rim), or w < 0 for a miss.
+fn sphere_ray(world: vec3<f32>, center: vec3<f32>) -> vec4<f32> {
+  let r = D.half.x;
+  var o = world - D.fwd.xyz * (4.0 * r);
+  var d = D.fwd.xyz;
+  if (D.eye.w > 0.5) {
+    o = D.eye.xyz;
+    d = normalize(world - o);
+  }
+  let oc = o - center;
+  let b = dot(oc, d);
+  let h = b * b - (dot(oc, oc) - r * r);
+  if (h < 0.0) { return vec4<f32>(0.0, 0.0, 0.0, -1.0); }
+  let p = o + d * (-b - sqrt(h));
+  return vec4<f32>(p, -dot((p - center) / r, d));
+}
+
+fn depth_of(p: vec3<f32>) -> f32 {
+  let c = D.view_proj * vec4<f32>(p, 1.0);
+  return c.z / c.w;
+}
+
 // The palette color of residue r in slice si: level, offset map, color.
 fn residue_rgb(si: u32, s: Slice, r: u32) -> vec3<f32> {
   if ((D.flags & FLAG_MASK) != 0u) {
@@ -125,6 +188,7 @@ struct CubeOut {
   @location(1) color: vec3<f32>,
   @location(2) world: vec3<f32>,
   @location(3) @interpolate(flat) lit: u32,   // 0 wire, 1 filled, 2 filled and highlighted
+  @location(4) @interpolate(flat) center: vec3<f32>,
 };
 
 @vertex
@@ -133,8 +197,8 @@ fn cube_vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> 
   let si = c.y & 0xffffu;
   let s = slices[si];
   let center = cube_center(c, s);
-  let corner = corner_of(vi);
-  let world = center + (corner * 2.0 - 1.0) * D.half.xyz;
+  let cv = cell_vertex(vi);
+  let world = center + cv.offset;
   var lit = false;
   if (D.hover.w > 0.5) {
     if ((D.flags & FLAG_SLICE) != 0u) {
@@ -146,8 +210,9 @@ fn cube_vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> 
   }
   var out: CubeOut;
   out.pos = select(D.view_proj * vec4<f32>(world, 1.0), NOWHERE, peeled(c, si, s));
-  out.local = corner;
+  out.local = cv.local;
   out.world = world;
+  out.center = center;
   let filled = center.y >= D.fill.x || lit || (D.flags & FLAG_ZERO) != 0u;
   out.lit = select(select(0u, 1u, filled), 2u, lit);
   out.color = D.wire.rgb;
@@ -170,7 +235,13 @@ fn cube_fs(in: CubeOut) -> @location(0) vec4<f32> {
   let lw = fwidth(in.local);
   let cube_px = 1.0 / max(max(lw.x, lw.y), max(lw.z, 1e-6));
   let n = normalize(cross(dpdx(in.world), dpdy(in.world)));
-  let ink = 1.0 - smoothstep(D.line_px - 0.5, D.line_px + 0.5, edge);
+  var ink = 1.0 - smoothstep(D.line_px - 0.5, D.line_px + 0.5, edge);
+  if ((D.flags & FLAG_SPHERE) != 0u) {
+    // (the ghosts of spheres: a faint ring, the disk beyond it dropped)
+    let hit = sphere_ray(in.world, in.center);
+    if (hit.w < 0.0) { discard; }
+    ink = 1.0 - smoothstep(0.0, 0.3, hit.w);
+  }
 
   if ((D.flags & FLAG_GHOST) != 0u) {
     let a = ink * D.ghost_alpha * select(1.0, 3.0, in.lit == 2u);
@@ -201,11 +272,38 @@ fn cube_fs(in: CubeOut) -> @location(0) vec4<f32> {
   return vec4<f32>(in.color * a, a);
 }
 
+struct SphereOut {
+  @location(0) color: vec4<f32>,
+  @builtin(frag_depth) depth: f32,
+};
+
+// A filled sphere: lit from the same light as the cubes, its rim darkened (white under
+// the highlight).
+@fragment
+fn sphere_fs(in: CubeOut) -> SphereOut {
+  let hit = sphere_ray(in.world, in.center);
+  if (hit.w < 0.0) { discard; }
+  let n = (hit.xyz - in.center) / D.half.x;
+  let l = normalize(vec3<f32>(0.35, 0.85, -0.4));
+  var col = in.color * (0.5 + 0.5 * max(dot(n, l), 0.0) + 0.12 * hit.w);
+  let rim = 1.0 - smoothstep(0.0, 0.35, hit.w);
+  col = mix(col, col * 0.35, rim * 0.8);
+  if (in.lit == 2u) {
+    col = mix(mix(col, vec3<f32>(1.0), 0.3), vec3<f32>(1.0), rim * 0.8);
+  }
+  var out: SphereOut;
+  out.color = vec4<f32>(col, 1.0);
+  out.depth = depth_of(hit.xyz);
+  return out;
+}
+
 // ---- picking: the frontmost nonzero cube under one pixel -----------------------
 
 struct PickOut {
   @builtin(position) pos: vec4<f32>,
   @location(0) @interpolate(flat) id: vec2<u32>,
+  @location(1) world: vec3<f32>,
+  @location(2) @interpolate(flat) center: vec3<f32>,
 };
 
 @vertex
@@ -213,16 +311,34 @@ fn pick_vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> 
   let c = cubes[cube_index(ii)];
   let si = c.y & 0xffffu;
   let s = slices[si];
-  let world = cube_center(c, s) + (corner_of(vi) * 2.0 - 1.0) * D.half.xyz;
+  let center = cube_center(c, s);
+  let world = center + cell_vertex(vi).offset;
   var out: PickOut;
   out.pos = select(D.view_proj * vec4<f32>(world, 1.0), NOWHERE, peeled(c, si, s));
   out.id = vec2<u32>(c.x, c.y | 0x80000000u);
+  out.world = world;
+  out.center = center;
   return out;
 }
 
 @fragment
 fn pick_fs(in: PickOut) -> @location(0) vec2<u32> {
   return in.id;
+}
+
+struct SpherePick {
+  @location(0) id: vec2<u32>,
+  @builtin(frag_depth) depth: f32,
+};
+
+@fragment
+fn sphere_pick_fs(in: PickOut) -> SpherePick {
+  let hit = sphere_ray(in.world, in.center);
+  if (hit.w < 0.0) { discard; }
+  var out: SpherePick;
+  out.id = in.id;
+  out.depth = depth_of(hit.xyz);
+  return out;
 }
 
 // ---- lines ----------------------------------------------------------------------

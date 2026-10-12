@@ -11,7 +11,7 @@ use pascal::gpu::Gpu;
 use pascal::math::{triangle_dp, Modulus};
 use pascal::palette::{Palette, Scheme};
 use pascal::sweep::{ModMode, Seq};
-use pascal::tetra::{ray_cast, ray_cast_peeled, selected_moduli, Camera, CubeId, Face, Layout, Peel, Shape, Spacing, TetraConfig, View, FOLD};
+use pascal::tetra::{ray_cast, ray_cast_cell, ray_cast_peeled, selected_moduli, Camera, Cell, CubeId, Face, Layout, Peel, Shape, Spacing, TetraConfig, View, FOLD};
 use pascal::tetra_gpu::{DrawOptions, TetraRenderer, BACKGROUND};
 
 fn device() -> (Gpu, TetraRenderer) {
@@ -172,7 +172,7 @@ fn the_flat_views_draw_their_zeros_solid() {
     let (w, h) = (640u32, 480u32);
     r.ensure_target(w, h);
     let cam = Camera::flat(layout.bounds(), w as f32, h as f32, 0.0, 0.0);
-    let mut o = DrawOptions { camera: cam, fill: f32::NEG_INFINITY, hover: None, brush: 0.0, color_slice: false, ghosts: false, mask: false, flat: true, peel: [0; 5], solid_zeros: false };
+    let mut o = DrawOptions { camera: cam, fill: f32::NEG_INFINITY, hover: None, brush: 0.0, color_slice: false, ghosts: false, mask: false, flat: true, peel: [0; 5], solid_zeros: false, cell: Cell::Cube };
     r.draw_blocking(&o);
     let (_, _, holes) = r.read_target_rgba();
     o.solid_zeros = true;
@@ -346,7 +346,7 @@ fn the_stack_draws_green_wire_and_lit_brush_cells() {
     let (w, h) = (400u32, 300u32);
     r.ensure_target(w, h);
     let cam = Camera::framing(layout.bounds());
-    let mut o = DrawOptions { camera: cam, fill: f32::INFINITY, hover: None, brush: 3.0, color_slice: false, ghosts: false, mask: false, flat: false, peel: [0; 5], solid_zeros: false };
+    let mut o = DrawOptions { camera: cam, fill: f32::INFINITY, hover: None, brush: 3.0, color_slice: false, ghosts: false, mask: false, flat: false, peel: [0; 5], solid_zeros: false, cell: Cell::Cube };
     r.draw_blocking(&o);
     let (_, _, plain) = r.read_target_rgba();
     let bg = BACKGROUND.map(|c| (c * 255.0).round() as u8);
@@ -470,6 +470,60 @@ fn the_faces_peel_on_the_gpu() {
                 }
                 assert!(agreed > 0 || nz.is_empty(), "{face:?} {sides:?} {layers}: no decisive rays");
             }
+        }
+    }
+}
+
+/// The rhombic and sphere cells: the GPU's pick (the rhombic dodecahedron's rhombi, the
+/// sphere's per-pixel ray test and its written depth) names the cell the CPU ray cast
+/// through the same shapes hits, in the stack from around it, through a peel, and in
+/// the top face (the stack turned, the rhombi with it, seen orthographically).
+#[test]
+fn rhombic_and_sphere_cells_pick_what_the_ray_hits() {
+    let (_gpu, mut r) = device();
+    let mods: Vec<u32> = (2..=22).collect();
+    let (w, h) = (320u32, 240u32);
+    r.ensure_target(w, h);
+    for cell in [Cell::Rhombic, Cell::Sphere] {
+        for (face, peel) in [(None, [0u32; 5]), (None, [2, 0, 3, 0, 0]), (Some(Face::Top), [0; 5]), (Some(Face::Top), [0, 0, 0, 4, 0])] {
+            let layout = match face {
+                Some(f) => Layout::build_face(f, 0, &mods, Spacing::True, Shape::Regular, u32::MAX),
+                None => Layout::build(View::Stack, &mods, Spacing::True, Shape::Regular, u32::MAX),
+            };
+            let mds: Vec<Modulus> = layout.slices.iter().map(|s| Modulus::new(s.m)).collect();
+            r.set_scene(&layout, &mds, &Palette::new(Scheme::Spectral), 0.0);
+            let cams: Vec<Camera> = if face.is_some() {
+                let base = Camera::flat(layout.bounds(), w as f32, h as f32, 0.0, 0.0);
+                let mut near = base;
+                near.zoom(600.0);
+                vec![base, near]
+            } else {
+                [(0.0, 0.0), (1.1, 0.4), (-2.0, -0.5), (2.9, 1.1)].iter().map(|&(yaw, pitch)| {
+                    let mut c = Camera::framing(layout.bounds());
+                    c.yaw += yaw;
+                    c.pitch = (c.pitch + pitch).clamp(-1.5, 1.5);
+                    c
+                }).collect()
+            };
+            let (mut agreed, mut misses) = (0, 0);
+            for cam in &cams {
+                for py in (4..h).step_by(17) {
+                    for px in (6..w).step_by(17) {
+                        let (o, d) = cam.ray(w, h, px as f32, py as f32);
+                        let gpu = r.pick_blocking_cell(cam, px as f32, py as f32, peel, false, cell);
+                        match ray_cast_cell(&layout, &mds, o, d, peel, cell) {
+                            Some(hit) if hit.margin > 0.04 && hit.next_t - hit.t > 0.05 => {
+                                assert_eq!(gpu, Some(hit.cube), "{cell:?} {face:?} {peel:?}: pixel ({px},{py})");
+                                agreed += 1;
+                            }
+                            None if gpu.is_none() => misses += 1,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            eprintln!("{cell:?} {face:?} {peel:?}: {agreed} hits agreed, {misses} misses");
+            assert!(agreed > 30 && misses > 15, "{cell:?} {face:?}: too few decisive rays");
         }
     }
 }
