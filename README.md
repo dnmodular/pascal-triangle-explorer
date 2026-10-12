@@ -310,10 +310,10 @@ voids run through the solid as tunnels.
   so. The HUD shows the shape, m and its factorization, n, k and the residue.
 * **Peel** (stack view): takes the stack apart layer by layer from its sides: left
   (k = 0), right (k = n), front (the last rows), top (slices from the apex down) and
-  base (slices from the bottom up). The top and the base are in the same list as the
-  triangles' sides, so peeling "from the top" needs no extra option. *One side* peels
-  the chosen side; *all but one* keeps the chosen side and peels every other one
-  uniformly, the same number of layers each. A layer is a row or cell of the stride
+  base (slices from the bottom up). Each side has a checkbox: the checked sides peel
+  together, the same number of layers each, and the unchecked ones stay (check one
+  side to peel just it, or all but one to keep that one). **P** checks the left side
+  if none is checked. A layer is a row or cell of the stride
   on the sides and a drawn slice at the top and the base. The ▶ button (or **P**)
   plays it, a layer every 1/speed s, starting over once nothing is left; the slider
   sets the layers by hand. The first layer off the left and right sides is the white

@@ -308,6 +308,16 @@ pub enum Side {
 impl Side {
     pub const ALL: [Side; 5] = [Side::Left, Side::Right, Side::Front, Side::Top, Side::Base];
 
+    pub fn name(self) -> &'static str {
+        match self {
+            Side::Left => "left",
+            Side::Right => "right",
+            Side::Front => "front",
+            Side::Top => "top",
+            Side::Base => "base",
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Side::Left => "left (k = 0)",
@@ -319,36 +329,13 @@ impl Side {
     }
 }
 
-/// How the sides peel.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Hash)]
-pub enum PeelMode {
-    #[default]
-    Off,
-    /// The chosen side, one layer at a time.
-    One,
-    /// Every side but the chosen one, all at once, uniformly.
-    AllBut,
-}
-
-impl PeelMode {
-    pub const ALL: [PeelMode; 3] = [PeelMode::Off, PeelMode::One, PeelMode::AllBut];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            PeelMode::Off => "off",
-            PeelMode::One => "one side",
-            PeelMode::AllBut => "all but one",
-        }
-    }
-}
-
 /// Peeling: which sides, and how many layers are off. A layer is one row or cell of the
 /// stride on the triangles' sides (k, n − k, last row − n) and one drawn slice at the top
 /// or the base, so a stride never makes a layer peel nothing.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Peel {
-    pub mode: PeelMode,
-    pub side: Side,
+    /// The sides that peel, in `Side::ALL` order; the unchecked ones stay.
+    pub sides: [bool; 5],
     pub layers: u32,
     /// The animation: a layer comes off every 1/speed s while playing, and when the
     /// last cube is gone it starts again from nothing peeled.
@@ -358,25 +345,24 @@ pub struct Peel {
 
 impl Default for Peel {
     fn default() -> Self {
-        Peel { mode: PeelMode::Off, side: Side::Left, layers: 0, playing: false, speed: 6.0 }
+        Peel { sides: [false; 5], layers: 0, playing: false, speed: 6.0 }
     }
 }
 
 impl Peel {
+    /// Whether any side peels.
+    pub fn active(&self) -> bool {
+        self.sides.iter().any(|&on| on)
+    }
+
     /// Layers off each side, in `Side::ALL` order (0 = untouched).
     pub fn depths(&self) -> [u32; 5] {
-        let mut d = [0u32; 5];
-        for (i, side) in Side::ALL.iter().enumerate() {
-            let on = match self.mode {
-                PeelMode::Off => false,
-                PeelMode::One => *side == self.side,
-                PeelMode::AllBut => *side != self.side,
-            };
-            if on {
-                d[i] = self.layers;
-            }
-        }
-        d
+        self.sides.map(|on| if on { self.layers } else { 0 })
+    }
+
+    /// The checked sides.
+    pub fn checked(&self) -> impl Iterator<Item = Side> + '_ {
+        Side::ALL.into_iter().zip(self.sides).filter(|&(_, on)| on).map(|(sd, _)| sd)
     }
 }
 
@@ -1375,11 +1361,15 @@ mod tests {
         for budget in [u32::MAX, 3_000] {
             let l = Layout::build(View::Stack, &(2..=30).collect::<Vec<_>>(), Spacing::True, Shape::Regular, budget);
             let cells: Vec<(usize, u32, u32)> = (0..l.total).map(|g| l.cell(g).unwrap()).collect();
-            for mode in [PeelMode::One, PeelMode::AllBut] {
-                for side in Side::ALL {
-                    let mut p = Peel { mode, side, ..Peel::default() };
+            // each side alone, every side but one, and all five
+            let mut sets: Vec<[bool; 5]> = (0..5).map(|i| std::array::from_fn(|j| j == i)).collect();
+            sets.extend((0..5).map(|i| std::array::from_fn(|j| j != i)));
+            sets.push([true; 5]);
+            for sides in sets {
+                {
+                    let mut p = Peel { sides, ..Peel::default() };
                     let extent = l.peel_extent(&p);
-                    assert!(extent > 0, "{mode:?} {side:?}");
+                    assert!(extent > 0, "{sides:?}");
                     let left = |layers: u32| {
                         let q = Peel { layers, ..p };
                         cells.iter().filter(|&&(si, n, k)| !l.peeled(si, n, k, q.depths())).count()
@@ -1389,12 +1379,12 @@ mod tests {
                     let mut prev = cells.len();
                     for layers in 1..=extent {
                         let now = left(layers);
-                        assert!(now < prev, "{mode:?} {side:?} stride {}: layer {layers} took nothing", l.stride);
+                        assert!(now < prev, "{sides:?} stride {}: layer {layers} took nothing", l.stride);
                         prev = now;
                     }
-                    assert_eq!(prev, 0, "{mode:?} {side:?}: {extent} layers leave cubes");
+                    assert_eq!(prev, 0, "{sides:?}: {extent} layers leave cubes");
                     // one layer of a side is exactly its outer cells
-                    if mode == PeelMode::One {
+                    if let [side] = p.checked().collect::<Vec<_>>()[..] {
                         p.layers = 1;
                         let st = l.stride;
                         for &(si, n, k) in &cells {

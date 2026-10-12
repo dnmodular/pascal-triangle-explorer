@@ -11,7 +11,7 @@ use pascal::gpu::Gpu;
 use pascal::math::{triangle_dp, Modulus};
 use pascal::palette::{Palette, Scheme};
 use pascal::sweep::{ModMode, Seq};
-use pascal::tetra::{ray_cast, ray_cast_peeled, selected_moduli, Camera, CubeId, Layout, Peel, PeelMode, Shape, Side, Spacing, TetraConfig, View, FOLD};
+use pascal::tetra::{ray_cast, ray_cast_peeled, selected_moduli, Camera, CubeId, Layout, Peel, Shape, Spacing, TetraConfig, View, FOLD};
 use pascal::tetra_gpu::{DrawOptions, TetraRenderer, BACKGROUND};
 
 fn device() -> (Gpu, TetraRenderer) {
@@ -125,8 +125,9 @@ fn the_pick_sees_through_the_peel() {
     let (w, h) = (320u32, 240u32);
     r.ensure_target(w, h);
     let he = layout.half_extents();
-    for (mode, side, layers) in [(PeelMode::One, Side::Left, 3), (PeelMode::One, Side::Front, 5), (PeelMode::One, Side::Top, 6), (PeelMode::AllBut, Side::Base, 2)] {
-        let peel = Peel { mode, side, layers, ..Peel::default() }.depths();
+    // sides in Side::ALL order: left, right, front, top, base
+    for (sides, layers) in [([true, false, false, false, false], 3), ([false, false, true, false, false], 5), ([false, false, false, true, false], 6), ([true, true, true, true, false], 2), ([true, false, true, false, true], 2)] {
+        let peel = Peel { sides, layers, ..Peel::default() }.depths();
         let cam = Camera::framing(layout.bounds());
         let (mut tested, mut agreed_misses) = (0, 0);
         for py in (3..h).step_by(11) {
@@ -134,7 +135,7 @@ fn the_pick_sees_through_the_peel() {
                 let (o, d) = cam.ray(w, h, px as f32, py as f32);
                 let gpu = r.pick_blocking_peeled(&cam, px as f32, py as f32, peel);
                 if let Some(g) = gpu {
-                    assert!(!layout.peeled(g.slice as usize, g.n, g.k, peel), "{mode:?} {side:?}: picked a peeled cube {g:?}");
+                    assert!(!layout.peeled(g.slice as usize, g.n, g.k, peel), "{sides:?}: picked a peeled cube {g:?}");
                 }
                 match ray_cast_peeled(&layout, &mds, o, d, peel) {
                     Some(hit) => {
@@ -143,7 +144,7 @@ fn the_pick_sees_through_the_peel() {
                         let mut m = (0..3).map(|a| he[a] - (p[a] - c[a]).abs()).collect::<Vec<_>>();
                         m.sort_by(f32::total_cmp);
                         if m[1] > 0.03 && hit.next_t - hit.t > 0.05 {
-                            assert_eq!(gpu, Some(hit.cube), "{mode:?} {side:?} pixel ({px},{py})");
+                            assert_eq!(gpu, Some(hit.cube), "{sides:?} pixel ({px},{py})");
                             tested += 1;
                         }
                     }
@@ -155,7 +156,7 @@ fn the_pick_sees_through_the_peel() {
                 }
             }
         }
-        eprintln!("{mode:?} {side:?} {layers}: {tested} hits, {agreed_misses} misses agreed");
+        eprintln!("{sides:?} {layers}: {tested} hits, {agreed_misses} misses agreed");
         assert!(tested > 40 && agreed_misses > 50, "too few decisive rays");
     }
 }

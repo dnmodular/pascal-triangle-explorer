@@ -8,7 +8,7 @@ use pascal::layers::Preset;
 use pascal::math::Modulus;
 use pascal::palette::Scheme;
 use pascal::sweep::{ModMode, PrimeOrder, Seq};
-use pascal::tetra::{describe, TILE_BUDGET, PeelMode, Side, Snap, face_row_alternates, face_row_zeros, selected_moduli, view_stride, Camera, CubeId, Layout, SceneKey, Shape, SliceKind, Spacing, TetraConfig, View, BUDGETS, FOLD, TETRA_MAX_M};
+use pascal::tetra::{describe, TILE_BUDGET, Side, Snap, face_row_alternates, face_row_zeros, selected_moduli, view_stride, Camera, CubeId, Layout, SceneKey, Shape, SliceKind, Spacing, TetraConfig, View, BUDGETS, FOLD, TETRA_MAX_M};
 use pascal::tetra_gpu::{outline_vertices, DrawOptions, TetraRenderer, BACKGROUND};
 use pascal::wave_overlay::Corner;
 
@@ -23,7 +23,7 @@ const UNFOLD_TIME: f32 = 1.1;
 /// Seconds for a snapped camera to glide into place.
 const SNAP_TIME: f32 = 0.45;
 /// What a peel extent was counted for: the sides, and the layout (total, stride, slices).
-type PeelKey = (PeelMode, Side, u32, u32, usize);
+type PeelKey = ([bool; 5], u32, u32, usize);
 /// Width of the space's options panel (points).
 const OPTIONS_W: f32 = 270.0;
 
@@ -158,7 +158,7 @@ impl TetraView {
     pub fn peel_extent(&mut self) -> u32 {
         let Some(l) = &self.layout else { return 0 };
         let p = self.config.peel;
-        let key = (p.mode, p.side, l.total, l.stride, l.slices.len());
+        let key = (p.sides, l.total, l.stride, l.slices.len());
         match self.peel_extent {
             Some((k, e)) if k == key => e,
             _ => {
@@ -235,7 +235,7 @@ impl TetraView {
             }
         }
         // the peel, a layer at a time while it plays, round and round
-        if self.config.peel.playing && self.open && self.config.view == View::Stack && self.config.peel.mode != PeelMode::Off {
+        if self.config.peel.playing && self.open && self.config.view == View::Stack && self.config.peel.active() {
             let speed = self.config.peel.speed.clamp(0.1, 120.0);
             self.peel_clock += dt * speed;
             let steps = self.peel_clock.floor();
@@ -263,7 +263,7 @@ impl TetraView {
         let want = if self.tile_hot { 1.0 } else { 0.0 };
         let tile = !self.open && self.visible() && self.fill != want;
         let hinge = self.open && self.config.view == View::Diamond && self.unfold < 1.0;
-        let peel = self.open && self.config.view == View::Stack && self.config.peel.playing && self.config.peel.mode != PeelMode::Off;
+        let peel = self.open && self.config.view == View::Stack && self.config.peel.playing && self.config.peel.active();
         tile || hinge || peel || self.snap.is_some()
     }
 
@@ -581,27 +581,13 @@ fn peel_controls(ui: &mut egui::Ui, t: &mut TetraView) {
     let p = &mut t.config.peel;
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("peel").color(ui.visuals().weak_text_color()));
-        for m in PeelMode::ALL {
-            let tip = match m {
-                PeelMode::Off => "Nothing peeled",
-                PeelMode::One => "Peel the chosen side, one layer at a time",
-                PeelMode::AllBut => "Keep the chosen side and peel every other one uniformly",
-            };
-            ui.selectable_value(&mut p.mode, m, m.label()).on_hover_text(tip);
-        }
     });
-    if p.mode == PeelMode::Off {
+    for (sd, on) in Side::ALL.into_iter().zip(p.sides.iter_mut()) {
+        ui.checkbox(on, sd.label()).on_hover_text(format!("Peel the {} side; unchecked sides stay", sd.name()));
+    }
+    if !p.active() {
         return;
     }
-    ui.horizontal(|ui| {
-        let what = if p.mode == PeelMode::One { "side" } else { "keep" };
-        ui.label(egui::RichText::new(what).color(ui.visuals().weak_text_color()));
-        egui::ComboBox::from_id_salt("peel side").width(150.0).selected_text(p.side.label()).show_ui(ui, |ui| {
-            for sd in Side::ALL {
-                ui.selectable_value(&mut p.side, sd, sd.label());
-            }
-        });
-    });
     ui.horizontal(|ui| {
         let playing = p.playing;
         if ui.add(egui::Button::new(if playing { "❚❚" } else { "▶" }).small().selected(playing)).on_hover_text(if playing { "Stop peeling (P)" } else { "Peel a layer at a time, and start over when nothing is left (P)" }).clicked() {
@@ -778,8 +764,8 @@ pub fn space(ui: &mut egui::Ui, model: &mut Model, ppp: f32, tex: Option<egui::T
                 let (esc, g, v, u, o, pk) = ui.input(|i| (i.key_pressed(egui::Key::Escape), i.key_pressed(egui::Key::G), i.key_pressed(egui::Key::V), i.key_pressed(egui::Key::U), i.key_pressed(egui::Key::O), i.key_pressed(egui::Key::P)));
                 if pk {
                     let p = &mut t.config.peel;
-                    if p.mode == PeelMode::Off {
-                        p.mode = PeelMode::One;
+                    if !p.active() {
+                        p.sides[0] = true;
                     }
                     p.playing = !p.playing;
                 }
@@ -910,8 +896,9 @@ pub fn space(ui: &mut egui::Ui, model: &mut Model, ppp: f32, tex: Option<egui::T
                 }
             }
             let p = t.config.peel;
-            if l.view == View::Stack && p.mode != PeelMode::Off && (p.layers > 0 || p.playing) {
-                let how = if p.mode == PeelMode::One { format!("the {} side", p.side.label()) } else { format!("every side but {}", p.side.label()) };
+            if l.view == View::Stack && p.active() && (p.layers > 0 || p.playing) {
+                let names: Vec<&str> = p.checked().map(Side::name).collect();
+                let how = if names.len() == Side::ALL.len() { "every side".to_string() } else { names.join(", ") };
                 lines.push(format!("peeled: {} layer{} off {how}{} (P)", p.layers, if p.layers == 1 { "" } else { "s" }, if p.playing { ", playing" } else { "" }));
             }
             let lens = match model.layers.preset() {
