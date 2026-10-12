@@ -8,7 +8,7 @@ use egui::{Align2, Color32, CornerRadius, FontId, Pos2, Rect, Sense, Stroke, Str
 use pascal::layers::Preset;
 use pascal::math::Modulus;
 use pascal::palette::Scheme;
-use pascal::sweep::{ModMode, PrimeOrder, Seq};
+use pascal::sweep::{ModMode, PrimeOrder};
 use pascal::tetra::{describe, Cell, Face, TILE_BUDGET, Side, Snap, face_row_alternates, face_row_zeros, selected_moduli, view_stride, Camera, CubeId, Layout, SceneKey, Shape, SliceKind, Spacing, TetraConfig, View, BUDGETS, FOLD, TETRA_MAX_M};
 use pascal::tetra_gpu::{outline_vertices, DrawOptions, PickSpec, TetraRenderer, BACKGROUND};
 use pascal::wave_overlay::Corner;
@@ -577,7 +577,7 @@ fn options(ui: &mut egui::Ui, t: &mut TetraView) {
     });
     // the mode's own options on a line of their own (they would overflow the panel)
     if matches!(c.sweep.mode, ModMode::Prime | ModMode::Interval) {
-        ui.horizontal(|ui| match c.sweep.mode {
+        ui.horizontal_wrapped(|ui| match c.sweep.mode {
             ModMode::Prime => {
                 egui::ComboBox::from_id_salt("tetra prime order").width(110.0).selected_text(c.sweep.prime_order.label()).show_ui(ui, |ui| {
                     for o in PrimeOrder::ALL {
@@ -585,16 +585,7 @@ fn options(ui: &mut egui::Ui, t: &mut TetraView) {
                     }
                 });
             }
-            ModMode::Interval => {
-                egui::ComboBox::from_id_salt("tetra seq").width(100.0).selected_text(c.sweep.seq.label()).show_ui(ui, |ui| {
-                    for q in Seq::ALL {
-                        ui.selectable_value(&mut c.sweep.seq, q, q.label());
-                    }
-                });
-                if c.sweep.seq == Seq::Fixed {
-                    mono_drag_with(ui, &mut c.sweep.step, 1..=TETRA_MAX_M, 0.2, false).on_hover_text("Step from the first modulus");
-                }
-            }
+            ModMode::Interval => super::seq_picker(ui, &mut c.sweep, "tetra seq", 110.0),
             _ => {}
         });
     }

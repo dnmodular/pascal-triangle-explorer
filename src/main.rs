@@ -1370,6 +1370,53 @@ fn bar_button(ui: &mut egui::Ui, label: &str, selected: bool, tip: &str) -> bool
     ui.add_sized([30.0, h], egui::Button::new(egui::RichText::new(label).font(FontId::monospace(12.0))).selected(selected)).on_hover_text(tip).clicked()
 }
 
+/// The interval sequence picker: the presets in a list (picking the current one again
+/// resets it to its standard values), then the sequence's knobs, and ↺ when they are
+/// off the standard. The 2D sweep bar and the tetra panel share it.
+fn seq_picker(ui: &mut egui::Ui, sw: &mut pascal::sweep::Sweep, id: &str, width: f32) {
+    let note = if sw.seq == Seq::Fixed {
+        "Constant step from the range start."
+    } else if sw.seq.absolute() {
+        "Lands directly on the sequence's values at or above the range start."
+    } else {
+        "Increments follow the sequence from the range start; zero increments are skipped."
+    };
+    egui::ComboBox::from_id_salt(id)
+        .width(width)
+        .selected_text(sw.seq_name())
+        .show_ui(ui, |ui| {
+            for q in Seq::ALL {
+                let tip = if q == sw.seq { "Pick it again to reset its knobs to the standard values" } else { "Its standard values; the knobs beside the list open it up" };
+                if ui.selectable_label(sw.seq == q, q.label()).on_hover_text(tip).clicked() {
+                    sw.choose_seq(q);
+                }
+            }
+        })
+        .response
+        .on_hover_text(format!("{note} Picking the selected sequence again resets it."));
+    if sw.seq == Seq::Fixed {
+        bar_label(ui, "step");
+        bar_drag(ui, 56.0, &mut sw.step, 1..=10000u32, 0.2);
+        return;
+    }
+    let mut k = sw.knobs();
+    for (v, kn) in k.iter_mut().zip(sw.seq.knobs()) {
+        if kn.flag {
+            let mut on = *v == 1;
+            ui.checkbox(&mut on, kn.name).on_hover_text(kn.tip);
+            *v = on as u32;
+        } else {
+            bar_label(ui, kn.name);
+            let w = if kn.hi >= 1000 { 52.0 } else { 36.0 };
+            bar_drag(ui, w, v, kn.lo..=kn.hi, 0.1).on_hover_text(format!("{} (standard {})", kn.tip, kn.standard));
+        }
+    }
+    sw.set_knobs(k);
+    if !sw.standard_knobs() && bar_button(ui, "↺", false, &format!("Back to the standard {} (or pick it again in the list)", sw.seq.label())) {
+        sw.choose_seq(sw.seq);
+    }
+}
+
 fn bar_sep(ui: &mut egui::Ui) {
     ui.add_space(6.0);
     ui.separator();
@@ -1382,7 +1429,7 @@ fn bar_sep(ui: &mut egui::Ui) {
 fn sweep_bar(ui: &mut egui::Ui, model: &mut Model) {
     let sw = &mut model.sweep;
     let mut action: Option<i32> = None; // Some(0) = jump to start, Some(n) = step n frames
-    let before = (sw.mode, sw.prime_order, sw.seq, sw.step, sw.start);
+    let before = (sw.mode, sw.prime_order, sw.seq, sw.step, sw.knobs(), sw.start);
     ui.spacing_mut().item_spacing = Vec2::new(4.0, 6.0);
 
     // ---- row 1: transport · selection mode · mode options · range ----
@@ -1423,7 +1470,7 @@ fn sweep_bar(ui: &mut egui::Ui, model: &mut Model) {
             .response
             .on_hover_text(sw.mode.note());
         // the mode's own options, in a slot of constant width
-        slot(ui, 270.0, |ui| match sw.mode {
+        slot(ui, 340.0, |ui| match sw.mode {
             ModMode::Prime => {
                 egui::ComboBox::from_id_salt("primeorder").width(150.0).selected_text(sw.prime_order.label()).show_ui(ui, |ui| {
                     for o in PrimeOrder::ALL {
@@ -1431,38 +1478,8 @@ fn sweep_bar(ui: &mut egui::Ui, model: &mut Model) {
                     }
                 });
             }
-            ModMode::Interval => {
-                let prev = sw.seq;
-                let note = if sw.seq == Seq::Fixed {
-                    "Constant step from the range start."
-                } else if sw.seq.absolute() {
-                    "Lands directly on the sequence's values at or above the range start."
-                } else {
-                    "Increments follow the sequence from the range start; zero increments are skipped."
-                };
-                egui::ComboBox::from_id_salt("seq")
-                    .width(150.0)
-                    .selected_text(sw.seq.label())
-                    .show_ui(ui, |ui| {
-                        for q in Seq::ALL {
-                            ui.selectable_value(&mut sw.seq, q, q.label());
-                        }
-                    })
-                    .response
-                    .on_hover_text(note);
-                // as in the reference, the 2×Pn and 3×Pn walks start on their first term
-                if sw.seq != prev {
-                    match sw.seq {
-                        Seq::Semi2p => sw.start = 4,
-                        Seq::Semi3p => sw.start = 6,
-                        _ => {}
-                    }
-                }
-                if sw.seq == Seq::Fixed {
-                    bar_label(ui, "step");
-                    bar_drag(ui, 56.0, &mut sw.step, 1..=10000u32, 0.2);
-                }
-            }
+            // (as in the reference, the 2×Pn and 3×Pn walks start on their first term)
+            ModMode::Interval => seq_picker(ui, sw, "seq", 130.0),
             _ => {}
         });
         bar_sep(ui);
@@ -1497,7 +1514,7 @@ fn sweep_bar(ui: &mut egui::Ui, model: &mut Model) {
         mono_line(ui, &text);
     });
 
-    let changed = before != (sw.mode, sw.prime_order, sw.seq, sw.step, sw.start);
+    let changed = before != (sw.mode, sw.prime_order, sw.seq, sw.step, sw.knobs(), sw.start);
     match action {
         Some(0) => {
             let (lo, hi) = model.sweep.bounds();

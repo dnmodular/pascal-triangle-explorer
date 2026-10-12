@@ -307,11 +307,13 @@ impl TetraConfig {
     pub fn scene_key(&self, view: View, depth: u32) -> SceneKey {
         let s = &self.sweep;
         let face = if view == View::Face { self.face } else { Face::Front };
-        (s.mode, s.prime_order, s.seq, s.step, s.start, s.end, self.spacing, self.budget, self.shape, view, face, depth)
+        (s.mode, s.prime_order, s.seq, (s.step, s.knobs()), s.start, s.end, self.spacing, self.budget, self.shape, view, face, depth)
     }
 }
 
-pub type SceneKey = (crate::sweep::ModMode, crate::sweep::PrimeOrder, crate::sweep::Seq, u32, u32, u32, Spacing, u32, Shape, View, Face, u32);
+/// (mode, prime order, sequence, (step, knobs), start, end, spacing, budget, shape, view,
+/// face, depth)
+pub type SceneKey = (crate::sweep::ModMode, crate::sweep::PrimeOrder, crate::sweep::Seq, (u32, [u32; 2]), u32, u32, Spacing, u32, Shape, View, Face, u32);
 
 /// The moduli in `start..=end` (clamped to 2..=TETRA_MAX_M) that the selection mode
 /// visits, ascending.

@@ -432,6 +432,24 @@ while the modulus or the mode changes:
   composites, even, odd, and interval sequences starting at the range start: fixed
   step, π digits, Fibonacci, primes, squares, powers of 2, 2×Pn, 3×Pn, primes + 2×Pn,
   semiprimes, primes + semiprimes, sphenic numbers.
+* **Sequence knobs.** Each interval sequence is a preset of a family with up to two
+  knobs, shown beside the list: picking a preset gives its standard values, the knobs
+  open it up, and picking the selected preset again (or ↺) resets it.
+
+  | Preset | Family | Knobs (standard) |
+  |---|---|---|
+  | 2×Pn, 3×Pn | k × the primes: lands on k·p | k (2, 3); *distinct* skips primes dividing k (off, on) |
+  | primes + 2×Pn | the primes and k·p | k (2) |
+  | semiprimes, sphenic | squarefree products of r distinct primes | r (2, 3; 1–7) |
+  | primes + semiprimes | the primes and those products | r (2) |
+  | Fibonacci | lands on b, a + b, … | seeds a, b (1, 2; 2, 1 is Lucas) |
+  | π digits, primes | increments × a | × (1) |
+  | squares | increments i^e | power (2) |
+  | powers of 2 | increments 1, b, b², … | base (2) |
+
+  A k×Pn walk starts on its first term (k·p₀); moving the start afterwards shifts
+  the whole walk. The name shows the live family ("5×Pn", "products of 4 primes"),
+  and the 2D sweep bar and the tetra stack's panel share the picker.
 * **Range, frame time (ms) and loop:** the frame time has a slider (16 ms–1 s) and a
   field that takes any value typed or dragged, 16 ms–10 s. The bar's number fields
   apply typed values on Enter (or when they lose focus), so a half-typed number never

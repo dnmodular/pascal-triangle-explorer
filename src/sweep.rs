@@ -20,6 +20,8 @@ const SEQ_STEP_GUARD: usize = 100_000;
 pub struct PrimeTables {
     pub primes: Vec<u32>,
     composite: Vec<bool>,
+    /// The number of distinct prime factors of v when v is squarefree, else 0xFF.
+    sqf_omega: Vec<u8>,
     pub semiprimes: Vec<u32>,
     pub sphenics: Vec<u32>,
 }
@@ -77,7 +79,26 @@ impl PrimeTables {
             }
         }
         sphenics.sort_unstable();
-        PrimeTables { primes, composite, semiprimes, sphenics }
+        let mut sqf_omega = vec![0u8; cap + 1];
+        for &p in &primes {
+            let p = p as usize;
+            for m in (p..=cap).step_by(p) {
+                sqf_omega[m] = sqf_omega[m].saturating_add(1);
+            }
+            if p * p <= cap {
+                for m in (p * p..=cap).step_by(p * p) {
+                    sqf_omega[m] = 0xFF;
+                }
+            }
+        }
+        PrimeTables { primes, composite, sqf_omega, semiprimes, sphenics }
+    }
+
+    /// The squarefree products of exactly r distinct primes in [lo, hi], ascending
+    /// (r = 1 the primes, 2 the distinct-pair semiprimes, 3 the sphenic numbers).
+    pub fn products_of(&self, r: u32, lo: u32, hi: u32) -> Vec<u32> {
+        let hi = hi.min(MOD_CAP) as usize;
+        (lo.max(2) as usize..=hi).filter(|&v| self.sqf_omega[v] as u32 == r).map(|v| v as u32).take(SEQ_MAX).collect()
     }
 
     pub fn is_prime(&self, v: u32) -> bool {
@@ -204,6 +225,76 @@ impl Seq {
             Seq::Sphenic => "sphenic",
         }
     }
+    /// The sequence's knobs (none, one or two), each with its standard value: the
+    /// preset is the family at those values.
+    pub fn knobs(self) -> &'static [Knob] {
+        const MUL: Knob = Knob { name: "×", tip: "Each increment times this", lo: 1, hi: 100, standard: 1, flag: false };
+        const fn k(standard: u32) -> Knob {
+            Knob { name: "k", tip: "k × each prime: the walk lands on k·p", lo: 1, hi: 1000, standard, flag: false }
+        }
+        const fn distinct(standard: u32) -> Knob {
+            Knob { name: "distinct", tip: "Skip the primes that divide k, so k and p are distinct factors (3×3 = 9 is a square)", lo: 0, hi: 1, standard, flag: true }
+        }
+        const fn r(standard: u32) -> Knob {
+            Knob { name: "r", tip: "Squarefree products of r distinct primes: 1 the primes, 2 semiprimes, 3 sphenic, up to 7 (510510 = 2·3·5·7·11·13·17)", lo: 1, hi: 7, standard, flag: false }
+        }
+        const SEMI2: [Knob; 2] = [k(2), distinct(0)];
+        const SEMI3: [Knob; 2] = [k(3), distinct(1)];
+        const K2: [Knob; 1] = [k(2)];
+        const R2: [Knob; 1] = [r(2)];
+        const R3: [Knob; 1] = [r(3)];
+        match self {
+            Seq::Fixed => &[],
+            Seq::Pi | Seq::Prime => &[MUL],
+            Seq::Fib => &[
+                Knob { name: "a", tip: "First seed: the walk lands on b, a + b, a + 2b, … (1, 2 Fibonacci; 2, 1 Lucas)", lo: 0, hi: 10_000, standard: 1, flag: false },
+                Knob { name: "b", tip: "Second seed: the first term landed on", lo: 1, hi: 10_000, standard: 2, flag: false },
+            ],
+            Seq::Square => &[Knob { name: "power", tip: "Increments 1^e, 2^e, 3^e, … (2 squares, 3 cubes)", lo: 1, hi: 6, standard: 2, flag: false }],
+            Seq::Pow2 => &[Knob { name: "base", tip: "Increments 1, b, b², b³, …", lo: 2, hi: 16, standard: 2, flag: false }],
+            Seq::Semi2p => &SEMI2,
+            Seq::Semi3p => &SEMI3,
+            Seq::PrimeSemi => &K2,
+            Seq::SemiFull | Seq::PrimeSemiFull => &R2,
+            Seq::Sphenic => &R3,
+        }
+    }
+
+    /// The knob values of the preset (0 for knobs it does not have).
+    pub fn standard(self) -> [u32; 2] {
+        let ks = self.knobs();
+        [ks.first().map_or(0, |k| k.standard), ks.get(1).map_or(0, |k| k.standard)]
+    }
+
+    /// The family's name at these knob values: the preset's own when standard.
+    pub fn describe(self, knobs: [u32; 2]) -> String {
+        if knobs == self.standard() {
+            return self.label().to_string();
+        }
+        let [a, b] = knobs;
+        match self {
+            Seq::Pi => format!("{a} × π digits"),
+            Seq::Prime => format!("{a} × primes"),
+            Seq::Fib => format!("Fibonacci from {a}, {b}"),
+            Seq::Square => format!("powers i^{a}"),
+            Seq::Pow2 => format!("powers of {a}"),
+            Seq::Semi2p | Seq::Semi3p => format!("{a}×Pn{}", if b == 1 { ", p ∤ k" } else { "" }),
+            Seq::PrimeSemi => format!("primes + {a}×Pn"),
+            Seq::SemiFull | Seq::Sphenic => format!("products of {a} primes"),
+            Seq::PrimeSemiFull => format!("primes + products of {a}"),
+            Seq::Fixed => self.label().to_string(),
+        }
+    }
+
+    /// Where the walk starts when the preset is chosen (or its knobs change): the k×Pn
+    /// walks on their first term, k·(the first prime they use).
+    pub fn first_term(self, knobs: [u32; 2]) -> Option<u32> {
+        match self {
+            Seq::Semi2p | Seq::Semi3p => kpn_primes(knobs).next().map(|p| (p as u64 * knobs[0].max(1) as u64).min(MOD_CAP as u64) as u32),
+            _ => None,
+        }
+    }
+
     /// Sequences whose terms are landed on directly (not added as increments).
     pub fn absolute(self) -> bool {
         matches!(self, Seq::Fib | Seq::PrimeSemi | Seq::SemiFull | Seq::PrimeSemiFull | Seq::Sphenic)
@@ -219,36 +310,54 @@ const PI_DIGITS: &str = concat!(
     "6692346034861045432664821339360726024914127372458700660631558817",
 );
 
-/// Increment number `i` of an increment sequence (`seqIncrement` in the reference).
-fn seq_increment(seq: Seq, i: usize, fixed: u32) -> u64 {
-    let t = prime_tables();
-    let pr = &t.primes;
+/// One knob of a sequence: a number in lo..=hi, or a switch (0 / 1).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Knob {
+    pub name: &'static str,
+    pub tip: &'static str,
+    pub lo: u32,
+    pub hi: u32,
+    /// The preset's value.
+    pub standard: u32,
+    /// A switch (shown as a checkbox).
+    pub flag: bool,
+}
+
+/// The primes a k×Pn walk multiplies: all of them, or (distinct) those not dividing k.
+fn kpn_primes(knobs: [u32; 2]) -> impl Iterator<Item = u32> {
+    let (k, distinct) = (knobs[0].max(1), knobs[1] == 1);
+    prime_tables().primes.iter().copied().filter(move |&p| !(distinct && k.is_multiple_of(p)))
+}
+
+/// The increments of an increment sequence (`seqIncrement` in the reference), with
+/// its knobs: the walk adds them one by one to the start.
+fn seq_increments(seq: Seq, fixed: u32, knobs: [u32; 2]) -> Box<dyn Iterator<Item = u64>> {
+    let pr = &prime_tables().primes;
+    let [a, _] = knobs;
+    let a = a as u64;
     match seq {
-        Seq::Pi => {
-            let d = PI_DIGITS.as_bytes();
-            (d[i % d.len()] - b'0') as u64
+        Seq::Pi => Box::new(PI_DIGITS.bytes().cycle().map(move |d| (d - b'0') as u64 * a)),
+        Seq::Prime => Box::new(pr.iter().map(move |&p| p as u64 * a).chain(std::iter::repeat(*pr.last().unwrap() as u64 * a))),
+        Seq::Square => Box::new((1u64..).map(move |i| i.checked_pow(a as u32).unwrap_or(u64::MAX))),
+        Seq::Pow2 => Box::new((0u32..).map(move |i| a.max(2).checked_pow(i).unwrap_or(u64::MAX))),
+        Seq::Semi2p | Seq::Semi3p => {
+            // k × the gaps between the primes used: from k·p₀ the walk lands on k·p
+            let k = a.max(1);
+            let ps: Vec<u32> = kpn_primes(knobs).collect();
+            Box::new((0..ps.len().saturating_sub(1)).map(move |i| k * (ps[i + 1] - ps[i]) as u64).chain(std::iter::repeat(k)))
         }
-        Seq::Prime => *pr.get(i).unwrap_or(pr.last().unwrap()) as u64,
-        Seq::Square => ((i + 1) * (i + 1)) as u64,
-        Seq::Pow2 => 1u64.checked_shl(i as u32).unwrap_or(u64::MAX),
-        Seq::Semi2p => match (pr.get(i), pr.get(i + 1)) {
-            (Some(a), Some(b)) => 2 * (b - a) as u64,
-            _ => 2,
-        },
-        Seq::Semi3p => {
-            // the primes with 3 left out (3·3 is a square, not a distinct-pair semiprime)
-            let idx = |j: usize| if j == 0 { pr.first() } else { pr.get(j + 1) };
-            match (idx(i), idx(i + 1)) {
-                (Some(a), Some(b)) => 3 * (b - a) as u64,
-                _ => 3,
-            }
-        }
-        _ => fixed.max(1) as u64,
+        _ => Box::new(std::iter::repeat(fixed.max(1) as u64)),
     }
 }
 
-/// The list of moduli a sequence visits in `[start, hi]` (`buildSeqMods`).
+/// The list of moduli a sequence visits in `[start, hi]` (`buildSeqMods`), at the
+/// preset's standard knobs.
 pub fn seq_mods(start: u32, hi: u32, seq: Seq, fixed: u32) -> Vec<u32> {
+    seq_mods_with(start, hi, seq, fixed, seq.standard())
+}
+
+/// The same at any knob values.
+pub fn seq_mods_with(start: u32, hi: u32, seq: Seq, fixed: u32, knobs: [u32; 2]) -> Vec<u32> {
     let t = prime_tables();
     let mut out = Vec::new();
     if seq.absolute() {
@@ -286,9 +395,10 @@ pub fn seq_mods(start: u32, hi: u32, seq: Seq, fixed: u32) -> Vec<u32> {
         };
         match seq {
             Seq::Fib => {
-                let (mut a, mut b) = (1u64, 2u64);
+                // b, a + b, …: ascending once past the seeds (only rising terms are kept)
+                let (mut a, mut b) = (knobs[0] as u64, knobs[1].max(1) as u64);
                 while out.len() < SEQ_MAX && b <= hi as u64 {
-                    if b >= lo as u64 {
+                    if b >= lo as u64 && out.last().is_none_or(|&l| (l as u64) < b) {
                         out.push(b as u32);
                     }
                     let c = a + b;
@@ -297,12 +407,12 @@ pub fn seq_mods(start: u32, hi: u32, seq: Seq, fixed: u32) -> Vec<u32> {
                 }
             }
             Seq::PrimeSemi => {
-                let doubled: Vec<u32> = t.primes.iter().map(|&p| p.saturating_mul(2)).collect();
-                merge(&t.primes, &doubled, &mut out);
+                let k = knobs[0].max(1);
+                let times: Vec<u32> = t.primes.iter().map(|&p| p.saturating_mul(k)).collect();
+                merge(&t.primes, &times, &mut out);
             }
-            Seq::SemiFull => out.extend(t.semiprimes.iter().copied().filter(|&v| v >= lo && v <= hi).take(SEQ_MAX)),
-            Seq::PrimeSemiFull => merge(&t.primes, &t.semiprimes, &mut out),
-            Seq::Sphenic => out.extend(t.sphenics.iter().copied().filter(|&v| v >= lo && v <= hi).take(SEQ_MAX)),
+            Seq::SemiFull | Seq::Sphenic => out = t.products_of(knobs[0], lo, hi),
+            Seq::PrimeSemiFull => merge(&t.primes, &t.products_of(knobs[0], 2, hi), &mut out),
             _ => unreachable!(),
         }
         return out;
@@ -311,11 +421,10 @@ pub fn seq_mods(start: u32, hi: u32, seq: Seq, fixed: u32) -> Vec<u32> {
     if v >= 2 && v <= hi as u64 {
         out.push(v as u32);
     }
-    for i in 0..SEQ_STEP_GUARD {
+    for inc in seq_increments(seq, fixed, knobs).take(SEQ_STEP_GUARD) {
         if out.len() >= SEQ_MAX {
             break;
         }
-        let inc = seq_increment(seq, i, fixed);
         if inc == 0 {
             continue;
         }
@@ -368,6 +477,9 @@ pub struct Sweep {
     pub seq: Seq,
     /// Step for `Seq::Fixed` (1..=10000).
     pub step: u32,
+    /// Knobs set by hand ([`Seq::knobs`]), for the sequence they were set on; any other
+    /// sequence (or None) runs at its preset's standard values.
+    custom: Option<(Seq, [u32; 2])>,
     /// Playback range; `start` is also the interval anchor.
     pub start: u32,
     pub end: u32,
@@ -380,7 +492,7 @@ pub struct Sweep {
     /// Display-only transition between frames, 0 = hard cuts.
     pub tween_ms: u32,
     /// Cached walk lists, rebuilt when the mode parameters change.
-    cache: Option<(ModMode, PrimeOrder, Seq, u32, u32, Vec<u32>)>,
+    cache: Option<(PoolKey, Vec<u32>)>,
 }
 
 impl Default for Sweep {
@@ -390,6 +502,7 @@ impl Default for Sweep {
             prime_order: PrimeOrder::All,
             seq: Seq::Fixed,
             step: 3,
+            custom: None,
             start: 2,
             end: 128,
             speed_ms: 150,
@@ -402,22 +515,66 @@ impl Default for Sweep {
     }
 }
 
+/// What a walk list is built from: mode, prime order, sequence, step, knobs, anchor.
+type PoolKey = (ModMode, PrimeOrder, Seq, u32, [u32; 2], u32);
+
 impl Sweep {
+    /// Choose sequence `q` at its standard knobs (choosing the current one again resets
+    /// it to them); the k×Pn walks start on their first term.
+    pub fn choose_seq(&mut self, q: Seq) {
+        self.seq = q;
+        self.custom = None;
+        if let Some(v) = q.first_term(q.standard()) {
+            self.start = v;
+        }
+    }
+
+    /// The current sequence's knob values.
+    pub fn knobs(&self) -> [u32; 2] {
+        match self.custom {
+            Some((q, k)) if q == self.seq => k,
+            _ => self.seq.standard(),
+        }
+    }
+
+    /// Set the knobs by hand (clamped to their ranges). The k×Pn walks move their start
+    /// onto their first term again; the start can still be moved off it afterwards,
+    /// which shifts the walk.
+    pub fn set_knobs(&mut self, mut k: [u32; 2]) {
+        if k == self.knobs() {
+            return;
+        }
+        for (v, kn) in k.iter_mut().zip(self.seq.knobs()) {
+            *v = (*v).clamp(kn.lo, kn.hi);
+        }
+        self.custom = Some((self.seq, k));
+        if let Some(v) = self.seq.first_term(k) {
+            self.start = v;
+        }
+    }
+
+    /// The knobs are the preset's.
+    pub fn standard_knobs(&self) -> bool {
+        self.knobs() == self.seq.standard()
+    }
+
+    /// The sequence's current name.
+    pub fn seq_name(&self) -> String {
+        self.seq.describe(self.knobs())
+    }
+
     fn anchor(&self) -> u32 {
         clamp_mod(self.start as i64)
     }
 
     /// The explicit walk list of list-based modes (primes in walk order, or a sequence).
     fn pool(&mut self) -> Option<&[u32]> {
-        let key = (self.mode, self.prime_order, self.seq, self.step, self.anchor());
+        let key: PoolKey = (self.mode, self.prime_order, self.seq, self.step, self.knobs(), self.anchor());
         let list_mode = self.mode == ModMode::Prime || (self.mode == ModMode::Interval && self.seq != Seq::Fixed);
         if !list_mode {
             return None;
         }
-        let stale = match &self.cache {
-            Some((m, o, s, st, a, _)) => (*m, *o, *s, *st, *a) != key,
-            None => true,
-        };
+        let stale = self.cache.as_ref().is_none_or(|(k, _)| *k != key);
         if stale {
             let list = if self.mode == ModMode::Prime {
                 let pr = &prime_tables().primes;
@@ -428,11 +585,11 @@ impl Sweep {
                     PrimeOrder::ByRem4 => std::iter::once(2).chain(pr.iter().copied().filter(|p| p % 4 == 1)).chain(pr.iter().copied().filter(|p| p % 4 == 3)).collect(),
                 }
             } else {
-                seq_mods(self.anchor(), MOD_CAP, self.seq, self.step)
+                seq_mods_with(self.anchor(), MOD_CAP, self.seq, self.step, key.4)
             };
-            self.cache = Some((key.0, key.1, key.2, key.3, key.4, list));
+            self.cache = Some((key, list));
         }
-        self.cache.as_ref().map(|c| c.5.as_slice())
+        self.cache.as_ref().map(|c| c.1.as_slice())
     }
 
 
@@ -636,6 +793,69 @@ mod tests {
         assert_eq!(&seq_mods(2, 1000, Seq::SemiFull, 1)[..4], &[6, 10, 14, 15]);
         assert_eq!(&seq_mods(2, 1000, Seq::PrimeSemiFull, 1)[..8], &[2, 3, 5, 6, 7, 10, 11, 13]);
         assert_eq!(&seq_mods(40, 1000, Seq::Sphenic, 1)[..3], &[42, 66, 70]);
+    }
+
+    #[test]
+    fn families_open_their_presets_up() {
+        let t = prime_tables();
+        // products of r distinct primes: r = 2 and 3 are the semiprime and sphenic tables
+        // (lists stop at SEQ_MAX terms, as the presets' always did)
+        assert_eq!(t.products_of(2, 2, 1_000_000), t.semiprimes[..SEQ_MAX]);
+        assert_eq!(t.products_of(3, 2, 1_000_000), t.sphenics[..SEQ_MAX.min(t.sphenics.len())]);
+        assert_eq!(&t.products_of(1, 2, 30), &[2, 3, 5, 7, 11, 13, 17, 19, 23, 29]);
+        assert_eq!(&t.products_of(4, 2, 1000)[..4], &[210, 330, 390, 462]);
+        assert_eq!(&t.products_of(7, 2, 1_000_000)[..3], &[510510, 570570, 690690]);
+        // k×Pn: 5 × the primes, and 2 × the odd primes when distinct
+        assert_eq!(&seq_mods_with(10, 1000, Seq::Semi2p, 1, [5, 0])[..5], &[10, 15, 25, 35, 55]);
+        assert_eq!(&seq_mods_with(6, 1000, Seq::Semi2p, 1, [2, 1])[..4], &[6, 10, 14, 22]);
+        // the 3×Pn preset is the same family at k 3, distinct
+        assert_eq!(seq_mods_with(6, 1000, Seq::Semi2p, 1, [3, 1]), seq_mods(6, 1000, Seq::Semi3p, 1));
+        // a start off the first term shifts the whole walk
+        assert_eq!(&seq_mods_with(5, 1000, Seq::Semi2p, 1, [2, 0])[..4], &[5, 7, 11, 15]);
+        assert_eq!(&seq_mods_with(2, 100, Seq::PrimeSemi, 1, [3, 0])[..8], &[2, 3, 5, 6, 7, 9, 11, 13]);
+        assert_eq!(&seq_mods_with(2, 1000, Seq::SemiFull, 1, [4, 0])[..2], &[210, 330]);
+        // Lucas numbers from seeds 2, 1 (the 1 is below every modulus), cubes, base 3
+        assert_eq!(&seq_mods_with(2, 1000, Seq::Fib, 1, [2, 1])[..5], &[3, 4, 7, 11, 18]);
+        assert_eq!(&seq_mods_with(2, 1000, Seq::Square, 1, [3, 0])[..4], &[2, 3, 11, 38]);
+        assert_eq!(&seq_mods_with(2, 1000, Seq::Pow2, 1, [3, 0])[..4], &[2, 3, 6, 15]);
+        assert_eq!(&seq_mods_with(2, 1000, Seq::Prime, 1, [2, 0])[..4], &[2, 6, 12, 22]);
+        // every preset's standard knobs reproduce it, and every list ascends
+        for q in Seq::ALL {
+            assert_eq!(seq_mods_with(4, 5000, q, 3, q.standard()), seq_mods(4, 5000, q, 3), "{q:?}");
+            assert_eq!(q.describe(q.standard()), q.label());
+            for kn in q.knobs() {
+                assert!((kn.lo..=kn.hi).contains(&kn.standard), "{q:?} {}", kn.name);
+            }
+            for knobs in [[1, 0], [7, 1], [3, 1]] {
+                let l = seq_mods_with(4, 5000, q, 3, knobs);
+                assert!(l.windows(2).all(|w| w[0] < w[1]), "{q:?} {knobs:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn choosing_a_preset_again_resets_its_knobs() {
+        let mut s = Sweep { mode: ModMode::Interval, ..Default::default() };
+        s.choose_seq(Seq::Semi2p);
+        assert_eq!((s.knobs(), s.start), ([2, 0], 4));
+        s.set_knobs([5, 0]);
+        assert_eq!((s.seq_name().as_str(), s.start), ("5×Pn", 10));
+        assert_eq!(s.snap(24), 25);
+        // the start moved by hand shifts the walk; the knobs stay
+        s.start = 11;
+        assert_eq!(s.knobs(), [5, 0]);
+        // the same preset again: back to the standard 2×Pn, on its first term
+        s.choose_seq(Seq::Semi2p);
+        assert!(s.standard_knobs());
+        assert_eq!((s.seq_name().as_str(), s.start), ("2×Pn", 4));
+        assert_eq!(s.snap(25), 26);
+        // knobs belong to their sequence: another one runs at its own standard values
+        s.set_knobs([7, 1]);
+        s.seq = Seq::Sphenic;
+        assert_eq!(s.knobs(), [3, 0]);
+        // out-of-range knobs are clamped
+        s.set_knobs([99, 0]);
+        assert_eq!(s.knobs(), [7, 0]);
     }
 
     #[test]
