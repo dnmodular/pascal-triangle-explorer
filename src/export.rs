@@ -74,7 +74,7 @@ pub fn preset_colors(rows: u32, md: &Modulus, palette: &Palette, layers: &LayerS
             .map(|n| {
                 (0..=n)
                     .map(|k| match preset {
-                        Preset::Residue => palette.residue_color_mapped(md.binom(n, k), md.m, &map),
+                        Preset::Residue => palette.residue_color_scaled(md.scaled(n, k), md.m, if style.phase { 1 } else { md.q }, &map),
                         Preset::Mask => {
                             if md.binom(n, k) != 0 {
                                 LIGHT

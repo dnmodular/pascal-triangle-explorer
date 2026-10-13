@@ -70,6 +70,36 @@ enum WaveSelect {
     Active((u32, u32), (u32, u32)),
 }
 
+/// How a fraction μ = P/Q colors its cells (see `CanvasStyle::phase`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum FracColors {
+    /// By the residue's value C mod μ: continuous in μ, but below μ ≈ 3 nearly one color.
+    Value,
+    /// By phase: the scaled residue Q·(C mod μ) colored as mod P colors it.
+    Phase,
+    /// Phase below μ = 3, value from there.
+    #[default]
+    Auto,
+}
+
+impl FracColors {
+    const ALL: [FracColors; 3] = [FracColors::Auto, FracColors::Value, FracColors::Phase];
+    fn label(self) -> &'static str {
+        match self {
+            FracColors::Value => "value",
+            FracColors::Phase => "phase",
+            FracColors::Auto => "auto",
+        }
+    }
+    fn tip(self) -> &'static str {
+        match self {
+            FracColors::Value => "Fractions are colored by the residue's value x = C mod μ along the ramp: continuous as μ glides, but below μ ≈ 3 the values crowd one end of the ramp, so the picture is nearly one color (10/7 and 10/9 look alike)",
+            FracColors::Phase => "Fractions μ = P/Q are colored by phase: the cell's Q·(C mod μ), a whole number below P, colored as mod P colors it. Every fraction with numerator P then uses mod P's colors, shuffled by Q (10/7 and 10/9 differ)",
+            FracColors::Auto => "Phase below μ = 3, where the value colors run out of range; value from 3 up",
+        }
+    }
+}
+
 /// Everything the user can change.
 struct Model {
     /// The whole modulus the sweep is at, and how far past it a decimal modulus is:
@@ -94,6 +124,7 @@ struct Model {
     palette: Palette,
     /// Color offset and cell decorations (outlines, glow around zeros).
     style: CanvasStyle,
+    frac_colors: FracColors,
     /// The offset cycles on its own while this is on: one full turn per period.
     offset_playing: bool,
     offset_period: f32,
@@ -163,6 +194,7 @@ impl Model {
             scheme: Scheme::Spectral,
             palette: Palette::new(Scheme::Spectral),
             style: CanvasStyle::default(),
+            frac_colors: FracColors::default(),
             offset_playing: false,
             offset_period: 4.0,
             offset_editing: false,
@@ -208,8 +240,8 @@ impl Model {
         self.set_pos(m, 0, follow);
     }
 
-    /// Go to μ = p/q exactly (lowest terms taken; p/q ≥ 1, p within MOD_CAP), off the
-    /// sweep's grid; with `follow`, linked rows follow it.
+    /// Go to μ = p/q exactly (lowest terms taken; p ≥ 1 within MOD_CAP, so μ > 0), off
+    /// the sweep's grid; with `follow`, linked rows follow it.
     fn set_fraction(&mut self, p: u32, q: u32, follow: bool) {
         let md = Modulus::decimal(p, q.max(1));
         let changed = (md.m, md.q) != (self.modulus.m, self.modulus.q) || self.morph.is_some();
@@ -232,6 +264,10 @@ impl Model {
         let Some(&(p, q)) = list.get(i.min(list.len().saturating_sub(1))) else { return };
         self.sp_index = i.min(list.len() - 1);
         self.set_fraction(p, q, follow);
+        if (self.modulus.m, self.modulus.q) != (p, q) {
+            // an unreduced fraction of the walk: shown as listed (10/4 draws 5/2)
+            self.m_text = format!("{p}/{q}");
+        }
     }
 
     /// The walk is a list of fractions (super primes, or mode All by numerator).
@@ -242,10 +278,16 @@ impl Model {
     /// Go to μ = m + sub·10⁻ᵈ; with `follow`, linked rows follow it. A μ whose
     /// numerator would pass MOD_CAP falls back to the whole m.
     fn set_pos(&mut self, m: u32, sub: u64, follow: bool) {
-        let m = m.clamp(1, MOD_CAP);
         let d = self.sweep.decimals;
         let sub = if d == 0 { 0 } else { sub };
-        let morphing = self.sweep.morph && sub > 0;
+        // below 1 the position is 0.sub (μ = 0 itself is no modulus: C mod 0 is C)
+        let (m, sub) = match (m.min(MOD_CAP), sub) {
+            (0, 0) if d > 0 => (0, 1),
+            (0, 0) => (1, 0),
+            x => x,
+        };
+        // (a morph runs between whole moduli: below 1 there is none to start from)
+        let morphing = self.sweep.morph && sub > 0 && m >= 1;
         if sub == 0 || morphing {
             self.rounded = false;
         }
@@ -291,6 +333,17 @@ impl Model {
         self.m as f64 + self.sub as f64 / self.sweep.fine_units() as f64
     }
 
+    /// The style the frame is drawn in: the canvas style with the fraction colors
+    /// resolved for this μ.
+    fn frame_style(&self) -> CanvasStyle {
+        let phase = match self.frac_colors {
+            FracColors::Value => false,
+            FracColors::Phase => true,
+            FracColors::Auto => self.modulus.mu() < 3.0,
+        };
+        CanvasStyle { phase: phase && self.modulus.is_decimal(), ..self.style }
+    }
+
     /// What the frame morphs to, for the renderer.
     fn morph_target(&self) -> Option<(&Modulus, f32)> {
         self.morph.as_ref().map(|(b, t)| (&**b, *t))
@@ -306,7 +359,7 @@ impl Model {
             let (Ok(a), Ok(b)) = (a.trim().parse::<u64>(), b.trim().parse::<u64>()) else { return false };
             let g = { let (mut x, mut y) = (a, b); while y != 0 { (x, y) = (y, x % y); } x.max(1) };
             let (p, q) = (a / g, b / g);
-            if q == 0 || p < q || p > MOD_CAP as u64 {
+            if q == 0 || p == 0 || p > MOD_CAP as u64 {
                 return false;
             }
             if self.super_mode() {
@@ -321,14 +374,15 @@ impl Model {
             // a number in the super-prime walk: its nearest super prime
             let Ok(v) = t.parse::<f64>() else { return false };
             let q = 1_000_000u32;
-            let Some(i) = self.sweep.super_nearest((v.max(1.0) * q as f64).round().min(u32::MAX as f64) as u32, q) else { return false };
+            let Some(i) = self.sweep.super_nearest((v.max(0.0) * q as f64).round().min(u32::MAX as f64) as u32, q) else { return false };
             self.set_super(i, true);
             return true;
         }
         let (ip, fp) = t.split_once('.').unwrap_or((t, ""));
         let (Ok(whole), true) = (ip.parse::<i64>(), fp.chars().all(|c| c.is_ascii_digit())) else { return false };
         let fp = fp.trim_end_matches('0');
-        let m = self.sweep.snap(whole);
+        // 0.x: below 1, under every mode's first modulus
+        let m = if whole == 0 && !fp.is_empty() { 0 } else { self.sweep.snap(whole) };
         if fp.is_empty() || (m as i64) != whole {
             self.set_m(m);
             return true;
@@ -696,6 +750,10 @@ fn main() {
                 i += 1;
                 continue;
             }
+            "--fraction-colors" => {
+                let v = next();
+                model.frac_colors = FracColors::ALL.into_iter().find(|f| f.label() == v).unwrap_or_default();
+            }
             "--outlines" | "--glow" => {
                 if args[i] == "--outlines" {
                     model.style.outlines = true;
@@ -837,7 +895,7 @@ fn headless_export(mut model: Model, size: (u32, u32), path: &std::path::Path) {
     let mut renderer = Renderer::new(gpu.device.clone(), gpu.queue.clone());
     model.fit(size.0 as f64, size.1 as f64);
     let grid = GridSpec::new(&model.view, size.0, size.1, model.ss, renderer.max_texels());
-    renderer.render_blocking(&FrameInput { grid, modulus: &model.modulus, palette: &model.palette, layers: &model.layers, advance: true, tween: Tween::Off, style: model.style, morph: model.morph_target() });
+    renderer.render_blocking(&FrameInput { grid, modulus: &model.modulus, palette: &model.palette, layers: &model.layers, advance: true, tween: Tween::Off, style: model.frame_style(), morph: model.morph_target() });
     let (w, h, rgba) = renderer.read_output_rgba();
     match export::write_png(path, w, h, &rgba) {
         Ok(()) => eprintln!("wrote {}×{} px to {}", w, h, path.display()),
@@ -1082,7 +1140,7 @@ impl App {
         let grid = GridSpec::new(&model.view, canvas_px.0, canvas_px.1, model.ss, gfx.renderer.max_texels());
         // a fitted view draws its rows only
         model.style.row_limit = if model.auto_fit { model.fit_rows.round().clamp(1.0, u32::MAX as f64) as u32 } else { 0 };
-        let inputs = ((model.modulus.m, model.modulus.q, model.morph.as_ref().map_or((0, 0), |(b, t)| (b.m, t.to_bits()))), model.scheme, model.style, model.layers.clone(), model.view, model.ss, canvas_px);
+        let inputs = ((model.modulus.m, model.modulus.q, model.morph.as_ref().map_or((0, 0), |(b, t)| (b.m, t.to_bits()))), model.scheme, model.frame_style(), model.layers.clone(), model.view, model.ss, canvas_px);
         let changed = self.last_inputs.as_ref() != Some(&inputs);
         // a new color offset alone recolors the same frame: the history layers (temporal
         // AVERAGE, AFTERIMAGE) must not count it as a new one
@@ -1119,7 +1177,7 @@ impl App {
             }
         }
         if render_canvas {
-            gfx.renderer.render(&mut encoder, &FrameInput { grid, modulus: &model.modulus, palette: &model.palette, layers: &model.layers, advance, tween, style: model.style, morph: model.morph_target() });
+            gfx.renderer.render(&mut encoder, &FrameInput { grid, modulus: &model.modulus, palette: &model.palette, layers: &model.layers, advance, tween, style: model.frame_style(), morph: model.morph_target() });
             gfx.renderer.flush_pass_params();
         }
         // After a change, render once more without advancing: the history layers
@@ -1169,7 +1227,7 @@ impl App {
         if model.pending_export {
             model.pending_export = false;
             // Render the true frame (no tween) with the same pipeline, then read it back.
-            gfx.renderer.render_blocking(&FrameInput { grid, modulus: &model.modulus, palette: &model.palette, layers: &model.layers, advance: false, tween: Tween::Off, style: model.style, morph: model.morph_target() });
+            gfx.renderer.render_blocking(&FrameInput { grid, modulus: &model.modulus, palette: &model.palette, layers: &model.layers, advance: false, tween: Tween::Off, style: model.frame_style(), morph: model.morph_target() });
             self.tween_t0 = None;
             let (w, h, rgba) = gfx.renderer.read_output_rgba();
             let rows = model.shown_rows(h as f64).unwrap_or((0, 0));
@@ -1479,6 +1537,15 @@ fn panel_ui(ui: &mut egui::Ui, model: &mut Model, canvas_px: (u32, u32), _frame_
             ui.checkbox(&mut model.style.outlines, "outlines").on_hover_text("A faint outline around each cell once cells are a few pixels wide");
             ui.checkbox(&mut model.style.glow, "glow").on_hover_text("A soft halo around zero cells — where m divides C(n,k) — once cells are a few pixels wide");
         });
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("fractions by").color(ui.visuals().weak_text_color()));
+            let fc = &mut model.frac_colors;
+            egui::ComboBox::from_id_salt("frac colors").width(70.0).selected_text(fc.label()).show_ui(ui, |ui| {
+                for x in FracColors::ALL {
+                    ui.selectable_value(fc, x, x.label()).on_hover_text(x.tip());
+                }
+            }).response.on_hover_text(fc.tip());
+        });
     });
 
     section(ui, "Layers", |ui| {
@@ -1713,6 +1780,7 @@ fn fraction_controls(ui: &mut egui::Ui, sw: &mut Sweep, super_primes: bool) {
         bar_label(ui, "Q ≤");
         bar_drag(ui, 44.0, &mut sp.qmax, 1..=10_000u32, 0.1);
     }
+    ui.checkbox(&mut sp.unreduced, "unreduced").on_hover_text("Also list the fractions not in lowest terms: 10/2, 10/4, 10/6, 10/8 beside 10/3, 10/7, 10/9. Each is the same μ as its lowest terms (10/4 = 5/2) and draws the same picture, so every numerator shows all its denominators");
     if super_primes {
         egui::ComboBox::from_id_salt("sp order").width(100.0).selected_text(sp.order.label()).show_ui(ui, |ui| {
             for o in SpOrder::ALL {
@@ -1838,7 +1906,7 @@ fn sweep_bar(ui: &mut egui::Ui, model: &mut Model) {
         });
         bar_sep(ui);
         bar_label(ui, "range");
-        bar_drag(ui, 70.0, &mut sw.start, 1..=MOD_CAP, 1.0);
+        bar_drag(ui, 70.0, &mut sw.start, 0..=MOD_CAP, 1.0);
         bar_label(ui, "to");
         bar_drag(ui, 70.0, &mut sw.end, 1..=MOD_CAP, 1.0);
     });
@@ -1900,9 +1968,9 @@ fn sweep_bar(ui: &mut egui::Ui, model: &mut Model) {
             model.set_super(i, !model.link_hold_sweep);
         }
         Some(0) => {
-            let (lo, hi) = model.sweep.bounds();
-            let v = if model.sweep.dir > 0 { lo } else { hi };
-            model.set_m(v);
+            let hi = model.sweep.bounds().1;
+            let (m, sub) = if model.sweep.dir > 0 { model.sweep.first_pos() } else { (hi, 0) };
+            model.set_pos(m, sub, true);
         }
         Some(n) => {
             // the sweep's own frame steps, like playback, leave held rows alone
@@ -2098,7 +2166,7 @@ fn canvas_overlays(ui: &mut egui::Ui, model: &mut Model, rect: Rect, ppp: f32, h
                     let Some(text) = model.cell_value(n, k) else { break };
                     let r = model.modulus.scaled(n, k);
                     let (rgb, show) = match model.layers.preset() {
-                        Some(Preset::Residue) => (model.palette.residue_color_scaled(r, model.modulus.m, model.modulus.q, &level_map), r != 0),
+                        Some(Preset::Residue) => (model.palette.residue_color_scaled(r, model.modulus.m, if model.frame_style().phase { 1 } else { model.modulus.q }, &level_map), r != 0),
                         Some(Preset::Mask) => (pascal::palette::LIGHT, r != 0),
                         Some(Preset::Valuation) => {
                             let nu = math::carries(n, k, model.modulus.p) as f64;
@@ -2343,6 +2411,7 @@ fn system_fonts() -> egui::FontDefinitions {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pascal::sweep::SuperPrimes;
 
     fn model() -> Model {
         let mut m = Model::new();
@@ -2627,8 +2696,10 @@ mod tests {
         assert!(md.goto_text("23/3"));
         assert_eq!((md.m_text.as_str(), md.m), ("23/3", 7));
         assert!(md.goto_text("74/10") && md.m_text == "7.4");
-        assert!(!md.goto_text("3/5"), "below 1");
+        assert!(md.goto_text("3/5") && md.m_text == "0.6", "below 1");
+        assert!(!md.goto_text("0/5"));
         assert!(!md.goto_text("5/0"));
+        assert!(md.goto_text("23/3"));
         // a step leaves the fraction for the grid
         md.step(1);
         assert!(!md.modulus.is_decimal() && md.m_text == "8");
@@ -2763,5 +2834,66 @@ mod tests {
         md.link_factor = 3.0;
         md.reset(980.0, 736.0);
         assert!(!md.link_rows && md.link_factor == 1.0 && md.fit_rows == 128.0);
+    }
+
+    #[test]
+    fn below_one_phase_colors_and_unreduced_fractions() {
+        let mut md = Model::new();
+        // 10/7 and 10/9: by value nearly one color, by phase mod 10's colors reshuffled
+        assert!(md.goto_text("10/7"));
+        assert!(md.frame_style().phase, "auto: phase below 3");
+        let colors = |md: &Model| {
+            let st = md.frame_style();
+            let map = md.palette.level_map(md.modulus.m, st.offset);
+            let q = if st.phase { 1 } else { md.modulus.q };
+            (0..md.modulus.m).map(|s| md.palette.residue_color_scaled(s, md.modulus.m, q, &map)).collect::<Vec<_>>()
+        };
+        let a = colors(&md);
+        assert!(md.goto_text("10/9"));
+        let b = colors(&md);
+        // one table, mod 10's colors by s; a cell with C ≡ 3 (mod 10) has s = 7·3 mod 10
+        // = 1 in 10/7, s = 9·3 mod 10 = 7 in 10/9: different colors
+        assert_eq!(a, b);
+        assert_ne!(a[3 * 7 % 10], b[3 * 9 % 10]);
+        md.frac_colors = FracColors::Value;
+        assert!(!md.frame_style().phase);
+        let v = colors(&md);
+        let distinct = |c: &[[u8; 3]]| { let mut c = c.to_vec(); c.sort(); c.dedup(); c.len() };
+        assert!(distinct(&v) <= 3, "by value below 2: void, white, one ramp color");
+        assert_eq!(distinct(&a), 10);
+        md.frac_colors = FracColors::Auto;
+        assert!(md.goto_text("37/5") && !md.frame_style().phase, "auto: value from 3");
+        assert!(md.goto_text("7") && !md.frame_style().phase, "whole moduli are the same either way");
+
+        // decimals from 0: 0.7 = 7/10, and the walk's first frame is 0.1
+        md.sweep.decimals = 1;
+        md.sweep.start = 0;
+        md.sweep.end = 3;
+        assert!(md.goto_text("0.7"));
+        assert_eq!((md.m, md.sub, md.modulus.m, md.modulus.q, md.m_text.as_str()), (0, 7, 7, 10, "0.7"));
+        md.step(-6);
+        assert_eq!((md.m, md.sub), (0, 1));
+        md.step(-1);
+        assert_eq!((md.m, md.sub), (0, 1), "μ = 0 is no modulus");
+        md.set_pos(0, 0, false);
+        assert_eq!((md.m, md.sub), (0, 1));
+        md.step(9);
+        assert_eq!((md.m, md.sub, md.m_text.as_str()), (1, 0, "1"));
+        // a morph below 1 draws the exact residue (no whole modulus to morph from)
+        md.sweep.morph = true;
+        md.set_pos(0, 5, false);
+        assert!(md.morph.is_none() && md.modulus.label() == "0.5");
+
+        // unreduced: numerator 10 shows every Q; 10/4 draws 5/2 and says 10/4
+        md.sweep.morph = false;
+        md.sweep.mode = ModMode::All;
+        md.sweep.all_order = SpOrder::Numerator;
+        md.sweep.super_primes = SuperPrimes { denoms: SpDenoms::Any, qmax: 12, order: SpOrder::Numerator, unreduced: true };
+        md.sweep.start = 0;
+        md.sweep.end = 128;
+        let i = md.sweep.super_list().iter().position(|&f| f == (10, 4)).unwrap();
+        md.set_super(i, false);
+        assert_eq!((md.modulus.m, md.modulus.q, md.m_text.as_str()), (5, 2, "10/4"));
+        assert!(md.goto_text(&md.m_text.clone()) && md.modulus.label() == "2.5");
     }
 }

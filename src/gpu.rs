@@ -578,6 +578,12 @@ pub struct CanvasStyle {
     /// Rows at or past this are drawn as background (0 = every row): a fitted view shows
     /// exactly its rows even on a canvas narrower than the triangle.
     pub row_limit: u32,
+    /// A fraction μ = P/Q is colored by phase: each cell by its scaled residue
+    /// s = Q·(C mod μ) as the whole modulus P colors s, so the colors run once round
+    /// the ramp per P (a permutation of mod P's). Off: by the residue's value x = s/Q
+    /// itself, which below μ ≈ 3 leaves the ramp almost one color. Whole moduli are
+    /// the same either way.
+    pub phase: bool,
 }
 
 /// `style_flags` bits.
@@ -1053,9 +1059,11 @@ impl Renderer {
         self.grid = Some(*grid);
     }
 
-    fn ensure_modulus(&mut self, md: &Modulus, b: Option<&Modulus>, spectral: bool) {
+    fn ensure_modulus(&mut self, md: &Modulus, b: Option<&Modulus>, spectral: bool, phase: bool) {
+        // phase colors: the scaled residue as the whole numerator colors it
+        let cq = if phase { 1 } else { md.q };
         let mb = b.map_or(0, |b| b.m);
-        if self.uploaded_m == Some((md.m, md.q, mb, spectral)) {
+        if self.uploaded_m == Some((md.m, cq, mb, spectral)) {
             return;
         }
         if self.uploaded_m.map(|(m, _, b, _)| (m, b)) != Some((md.m, mb)) {
@@ -1070,7 +1078,7 @@ impl Renderer {
         }
         // the morph's second modulus's levels follow, from a residue index that is a whole
         // number of words in
-        let mut levels = residue_levels_scaled(md.m, md.q, spectral);
+        let mut levels = residue_levels_scaled(md.m, cq, spectral);
         self.levels_b_off = levels.len() as u32 * 4;
         if let Some(b) = b {
             levels.extend(residue_levels_scaled(b.m, b.q, spectral));
@@ -1081,7 +1089,7 @@ impl Renderer {
             self.rebuild_bg0();
         }
         self.queue.write_buffer(&self.levels_buf, 0, lb);
-        self.uploaded_m = Some((md.m, md.q, mb, spectral));
+        self.uploaded_m = Some((md.m, cq, mb, spectral));
     }
 
     fn ensure_palette(&mut self, pal: &Palette) {
@@ -1209,7 +1217,7 @@ impl Renderer {
         };
         let work_elem = if variant == 0 { 4 } else { 16 };
         self.ensure_grid(&input.grid, work_elem);
-        self.ensure_modulus(input.modulus, input.morph.map(|(b, _)| b), input.palette.scheme == Scheme::Spectral);
+        self.ensure_modulus(input.modulus, input.morph.map(|(b, _)| b), input.palette.scheme == Scheme::Spectral, input.style.phase);
         self.ensure_palette(input.palette);
         self.ensure_level_map(input.palette.level_map(input.modulus.m, input.style.offset));
         self.pass_params.clear();

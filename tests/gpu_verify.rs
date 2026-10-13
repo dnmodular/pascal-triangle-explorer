@@ -1070,10 +1070,10 @@ fn offset_outlines_and_glow_match_cpu() {
     let (w, h) = (180u32, 150u32);
     let layers = LayerState::default();
     let styles = [
-        CanvasStyle { offset: 0.3, outlines: false, glow: false, row_limit: 0 },
-        CanvasStyle { offset: 0.0, outlines: true, glow: false, row_limit: 0 },
-        CanvasStyle { offset: 0.0, outlines: false, glow: true, row_limit: 0 },
-        CanvasStyle { offset: -0.62, outlines: true, glow: true, row_limit: 0 },
+        CanvasStyle { offset: 0.3, outlines: false, glow: false, row_limit: 0, phase: false },
+        CanvasStyle { offset: 0.0, outlines: true, glow: false, row_limit: 0, phase: false },
+        CanvasStyle { offset: 0.0, outlines: false, glow: true, row_limit: 0, phase: false },
+        CanvasStyle { offset: -0.62, outlines: true, glow: true, row_limit: 0, phase: false },
     ];
     let mut checked = 0usize;
     let mut decorated = [0usize; 4];
@@ -1116,7 +1116,7 @@ fn offset_outlines_and_glow_match_cpu() {
     let md = Modulus::new(7);
     r.render_blocking(&FrameInput { grid, modulus: &md, palette: &pal, layers: &layers, advance: true, tween: pascal::gpu::Tween::Off, style: CanvasStyle::default(), morph: None });
     let (_, _, plain) = r.read_output_rgba();
-    r.render_blocking(&FrameInput { grid, modulus: &md, palette: &pal, layers: &layers, advance: true, tween: pascal::gpu::Tween::Off, style: CanvasStyle { offset: 0.0, outlines: true, glow: true, row_limit: 0 }, morph: None });
+    r.render_blocking(&FrameInput { grid, modulus: &md, palette: &pal, layers: &layers, advance: true, tween: pascal::gpu::Tween::Off, style: CanvasStyle { offset: 0.0, outlines: true, glow: true, row_limit: 0, phase: false }, morph: None });
     let (_, _, styled) = r.read_output_rgba();
     assert_eq!(plain, styled, "2 px cells: no outlines or glow");
 }
@@ -1136,7 +1136,7 @@ fn svg_colors_match_the_gpu() {
     let md = Modulus::new(3);
     for (scheme, offset) in [(Scheme::Viridis, 0.17f32), (Scheme::Spectral, -0.4)] {
         let pal = Palette::new(scheme);
-        let style = CanvasStyle { offset, outlines: false, glow: false, row_limit: 0 };
+        let style = CanvasStyle { offset, outlines: false, glow: false, row_limit: 0, phase: false };
         let mut layers = LayerState::default();
         for preset in 0..3 {
             match preset {
@@ -1173,6 +1173,55 @@ fn svg_colors_match_the_gpu() {
             }
         }
     }
+}
+
+#[test]
+fn fractions_color_by_value_or_by_phase() {
+    // the resolve pass paints fractions (below 1 too) as the CPU does, by value or by
+    // phase; by phase 10/7 and 10/9 differ, by value they are nearly one color
+    use pascal::gpu::CanvasStyle;
+    let (_gpu, mut r) = device();
+    let rows = 60u32;
+    let (w, h) = (900u32, 700u32);
+    let view = View::fit(w as f64, h as f64, rows as f64);
+    let grid = GridSpec::new(&view, w, h, 1, 1 << 26);
+    let pal = Palette::new(Scheme::Spectral);
+    let mut layers = LayerState::default();
+    layers.preset_residue();
+    let mut images = Vec::new();
+    for (p, q) in [(10u32, 7u32), (10, 9), (7, 10), (23, 3), (37, 5)] {
+        let md = Modulus::decimal(p, q);
+        for phase in [false, true] {
+            let style = CanvasStyle { phase, ..Default::default() };
+            r.render_blocking(&FrameInput { grid, modulus: &md, palette: &pal, layers: &layers, advance: true, tween: pascal::gpu::Tween::Off, style, morph: None });
+            let colors = pascal::export::preset_colors(rows, &md, &pal, &layers, &style, None).expect("a preset");
+            let (_, _, rgba) = r.read_output_rgba();
+            let mut checked = 0;
+            for py in 0..h {
+                for px in 0..w {
+                    let (cx, cy) = (px as f64 + 0.5, py as f64 + 0.5);
+                    let Some((n, k)) = view.cell_at(cx, cy) else { continue };
+                    let (x, y, cw, ch) = view.cell_rect(n, k);
+                    if n >= rows || (cx - x).min(x + cw - cx).min(cy - y).min(y + ch - cy) < 1e-3 {
+                        continue;
+                    }
+                    let o = ((py * w + px) * 4) as usize;
+                    assert_eq!(&rgba[o..o + 3], &colors[n as usize][k as usize], "{p}/{q} phase {phase} cell ({n},{k})");
+                    checked += 1;
+                }
+            }
+            assert!(checked > 10_000);
+            let mut distinct: Vec<[u8; 3]> = colors.iter().flatten().copied().collect();
+            distinct.sort();
+            distinct.dedup();
+            images.push(((p, q, phase), rgba, distinct.len()));
+        }
+    }
+    let find = |f: (u32, u32, bool)| images.iter().find(|x| x.0 == f).unwrap();
+    assert_ne!(find((10, 7, true)).1, find((10, 9, true)).1, "by phase 10/7 and 10/9 differ");
+    assert!(find((10, 7, false)).2 <= 3 && find((10, 9, false)).2 <= 3, "by value below 2: void, white, one color");
+    assert_eq!(find((10, 7, true)).2, 10, "by phase all ten of mod 10's colors");
+    assert!(find((7, 10, true)).2 == 7, "0.7 by phase: mod 7's colors");
 }
 
 #[test]

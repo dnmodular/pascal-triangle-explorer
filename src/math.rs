@@ -341,7 +341,7 @@ impl Modulus {
         let units = (whole as u64).checked_mul(q)?.checked_add(sub)?;
         let g = gcd_u64(units, q);
         let (m, q) = (units / g, q / g);
-        (m >= 2 && m <= cap as u64).then(|| Modulus::decimal(m as u32, q as u32))
+        (m >= 1 && m <= cap as u64).then(|| Modulus::decimal(m as u32, q as u32))
     }
 
     /// The decimal modulus whole + sub·10⁻ᵈ, or where its numerator would pass `cap`
