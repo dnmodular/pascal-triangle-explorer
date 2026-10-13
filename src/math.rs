@@ -281,9 +281,16 @@ pub fn carries(n: u32, k: u32, p: u32) -> u32 {
 
 /// Everything about one modulus: its factorization, the tables for each prime power and
 /// the discrete-log table for the smallest prime (what DLOG colors by).
+///
+/// A decimal modulus μ = m/q (lowest terms, q a divisor of a power of 10) keeps the
+/// whole m's tables: C mod μ = C − μ⌊C/μ⌋ = (q·C mod m)/q, so [`Modulus::scaled`] is
+/// q·(C mod m) mod m, exact at any row, and the residue is that over q. q = 1 is the
+/// whole modulus.
 #[derive(Clone, Debug)]
 pub struct Modulus {
     pub m: u32,
+    /// The decimal modulus's denominator (μ = m / q); 1 for a whole modulus.
+    pub q: u32,
     pub factors: Vec<PrimePowerTables>,
     /// Smallest prime factor.
     pub p: u32,
@@ -312,7 +319,55 @@ impl Modulus {
                 x = x * root as u64 % p as u64;
             }
         }
-        Self { m, factors, p, root, dlog }
+        Self { m, q: 1, factors, p, root, dlog }
+    }
+
+    /// The decimal modulus μ = m / q; reduced to lowest terms (m = 21, q = 2 is 10.5).
+    pub fn decimal(m: u32, q: u32) -> Self {
+        let g = gcd_u32(m, q.max(1));
+        let (m, q) = (m / g, q.max(1) / g);
+        Self { q, ..Modulus::new(m) }
+    }
+
+    /// The decimal modulus whole + sub·10⁻ᵈ (sub < 10ᵈ·gap), if its numerator fits
+    /// `cap`.
+    pub fn from_decimal(whole: u32, sub: u64, d: u32, cap: u32) -> Option<Self> {
+        let q = 10u64.checked_pow(d)?;
+        let units = (whole as u64).checked_mul(q)?.checked_add(sub)?;
+        let g = gcd_u64(units, q);
+        let (m, q) = (units / g, q / g);
+        (m >= 2 && m <= cap as u64).then(|| Modulus::decimal(m as u32, q as u32))
+    }
+
+    /// μ itself.
+    pub fn mu(&self) -> f64 {
+        self.m as f64 / self.q as f64
+    }
+
+    /// A decimal modulus (q > 1).
+    pub fn is_decimal(&self) -> bool {
+        self.q > 1
+    }
+
+    /// q·(C(n,k) mod m) mod m: C mod μ times q, a whole number below m (C mod m for a
+    /// whole modulus). It is 0 exactly when μ divides C (m and q are coprime).
+    pub fn scaled(&self, n: u32, k: u32) -> u32 {
+        let r = self.binom(n, k);
+        if self.q == 1 {
+            r
+        } else {
+            (r as u64 * (self.q % self.m) as u64 % self.m as u64) as u32
+        }
+    }
+
+    /// C(n,k) mod μ, the real residue in [0, μ).
+    pub fn residue(&self, n: u32, k: u32) -> f64 {
+        self.scaled(n, k) as f64 / self.q as f64
+    }
+
+    /// μ as text: exact (q divides a power of 10, so the expansion ends).
+    pub fn label(&self) -> String {
+        decimal_text(self.m as u64, self.q as u64)
     }
 
     pub fn is_prime(&self) -> bool {
@@ -343,6 +398,36 @@ impl Modulus {
     pub fn valuations(&self, n: u32, k: u32) -> Vec<u32> {
         self.factors.iter().map(|t| carries(n, k, t.f.p)).collect()
     }
+}
+
+fn gcd_u64(mut a: u64, mut b: u64) -> u64 {
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a
+}
+
+fn gcd_u32(a: u32, b: u32) -> u32 {
+    gcd_u64(a as u64, b as u64) as u32
+}
+
+/// a / q in decimal, exactly, for q of the form 2^i·5^j (trailing zeros trimmed).
+pub fn decimal_text(a: u64, q: u64) -> String {
+    let q = q.max(1);
+    let (ip, mut rem) = (a / q, a % q);
+    if rem == 0 {
+        return ip.to_string();
+    }
+    let mut s = format!("{ip}.");
+    for _ in 0..40 {
+        if rem == 0 {
+            break;
+        }
+        rem *= 10;
+        s.push(char::from(b'0' + (rem / q) as u8));
+        rem %= q;
+    }
+    s
 }
 
 // ---------------------------------------------------------------------------------------
@@ -512,4 +597,32 @@ mod tests {
             assert_eq!(modpow(md.root as u64, md.dlog[x as usize] as u64, 7), x as u64);
         }
     }
+
+    #[test]
+    fn decimal_moduli_are_exact() {
+        // μ = 10.5 = 21/2 in lowest terms; C mod μ = C − μ⌊C/μ⌋ = (2C mod 21)/2
+        let md = Modulus::from_decimal(10, 5, 1, MOD_CAP).unwrap();
+        assert_eq!((md.m, md.q, md.label().as_str()), (21, 2, "10.5"));
+        assert_eq!(Modulus::from_decimal(10, 50, 2, MOD_CAP).unwrap().m, 21, "10.50 is 10.5");
+        assert_eq!(Modulus::from_decimal(7, 0, 3, MOD_CAP).unwrap().q, 1, "7.000 is whole");
+        assert!(Modulus::from_decimal(5000, 1, 3, MOD_CAP).is_none(), "5000.001 needs 5000001 > the cap");
+        for (whole, sub, d) in [(10u32, 5u64, 1u32), (3, 7, 1), (12, 37, 2), (2, 1, 3), (99, 99, 2)] {
+            let md = Modulus::from_decimal(whole, sub, d, MOD_CAP).unwrap();
+            let (p, q) = (md.m as u128, md.q as u128);
+            for n in 0..=60u32 {
+                for k in 0..=n {
+                    let c = binom_exact(n, k).unwrap();
+                    // exact: C − (p/q)·⌊C·q/p⌋, times q
+                    let want = c * q - p * (c * q / p);
+                    assert_eq!(md.scaled(n, k) as u128, want, "C({n},{k}) mod {}", md.label());
+                    let r = md.residue(n, k);
+                    assert!((0.0..md.mu()).contains(&r));
+                }
+            }
+        }
+        assert_eq!(decimal_text(1037, 100), "10.37");
+        assert_eq!(decimal_text(21, 2), "10.5");
+        assert_eq!(decimal_text(8, 1), "8");
+    }
+
 }

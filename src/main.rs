@@ -72,7 +72,11 @@ enum WaveSelect {
 
 /// Everything the user can change.
 struct Model {
+    /// The whole modulus the sweep is at, and how far past it a decimal modulus is:
+    /// μ = m + sub·10⁻ᵈ (d = the sweep's decimals; sub = 0 for a whole modulus).
     m: u32,
+    sub: u64,
+    /// μ's closed form: the whole m, or the decimal μ = P/Q (see `Modulus::decimal`).
     /// Shared with the wave overlay, which reads long rows through the same closed form.
     modulus: Arc<Modulus>,
     m_text: String,
@@ -139,6 +143,7 @@ impl Model {
         let m = 7;
         Model {
             m,
+            sub: 0,
             modulus: Arc::new(Modulus::new(m)),
             m_text: m.to_string(),
             scheme: Scheme::Spectral,
@@ -184,18 +189,58 @@ impl Model {
         self.set_m_with(m, true);
     }
 
-    /// Set the modulus; with `follow`, linked rows follow it.
+    /// Set the (whole) modulus; with `follow`, linked rows follow it.
     fn set_m_with(&mut self, m: u32, follow: bool) {
+        self.set_pos(m, 0, follow);
+    }
+
+    /// Go to μ = m + sub·10⁻ᵈ; with `follow`, linked rows follow it. A μ whose
+    /// numerator would pass MOD_CAP falls back to the whole m.
+    fn set_pos(&mut self, m: u32, sub: u64, follow: bool) {
         let m = m.clamp(2, MOD_CAP);
-        let changed = m != self.m;
+        let d = self.sweep.decimals;
+        let sub = if d == 0 { 0 } else { sub };
+        let changed = (m, sub) != (self.m, self.sub) || (sub == 0 && self.modulus.is_decimal());
         if changed {
             self.m = m;
-            self.modulus = Arc::new(Modulus::new(m));
+            self.sub = sub;
+            let md = if sub == 0 { None } else { Modulus::from_decimal(m, sub, d, MOD_CAP) };
+            self.modulus = Arc::new(md.unwrap_or_else(|| Modulus::new(m)));
         }
-        self.m_text = m.to_string();
+        self.m_text = self.modulus.label();
         if changed && follow {
             self.apply_link();
         }
+    }
+
+    /// A typed modulus, maybe decimal ("10.37"): the whole part snaps to the selection
+    /// mode, extra digits raise the decimals (within what the range allows), and the
+    /// fraction is kept within the gap to the next visited modulus.
+    fn goto_text(&mut self, text: &str) -> bool {
+        let t = text.trim();
+        let (ip, fp) = t.split_once('.').unwrap_or((t, ""));
+        let (Ok(whole), true) = (ip.parse::<i64>(), fp.chars().all(|c| c.is_ascii_digit())) else { return false };
+        let fp = fp.trim_end_matches('0');
+        let m = self.sweep.snap(whole);
+        if fp.is_empty() || (m as i64) != whole {
+            self.set_m(m);
+            return true;
+        }
+        let want = fp.len() as u32;
+        let max = self.sweep.max_decimals();
+        if want > self.sweep.decimals {
+            self.sweep.decimals = want.min(max);
+        }
+        let d = self.sweep.decimals;
+        if d == 0 {
+            self.set_m(m);
+            return true;
+        }
+        let digits: String = fp.chars().chain(std::iter::repeat('0')).take(d as usize).collect();
+        let sub = digits.parse::<u64>().unwrap_or(0);
+        let top = self.sweep.gap_after(m) as u64 * self.sweep.fine_units();
+        self.set_pos(m, sub.min(top - 1), true);
+        true
     }
 
     /// The rows drawn on a canvas `h` px tall: the visible ones, and while fitted none
@@ -211,7 +256,7 @@ impl Model {
 
     /// The row count the link gives for the current modulus.
     fn linked_rows(&self) -> f64 {
-        (self.m as f64 * self.link_factor).round().clamp(2.0, 1.0e9)
+        (self.modulus.mu() * self.link_factor).round().clamp(2.0, 1.0e9)
     }
 
     /// With rows linked, set them from the modulus and refit. A view the user zoomed
@@ -277,8 +322,8 @@ impl Model {
     /// `n` steps through the active selection mode (sign = direction); stops playback.
     fn step(&mut self, n: i32) {
         self.sweep.playing = false;
-        let v = self.sweep.step_by(self.m, n);
-        self.set_m(v);
+        let (m, sub) = self.sweep.step_fine_by((self.m, self.sub), n);
+        self.set_pos(m, sub, true);
     }
 
     /// Advance the play timer; true when the modulus moved.
@@ -292,10 +337,10 @@ impl Model {
             return false;
         }
         self.last_step = Some(now);
-        let v = self.sweep.tick(self.m);
-        let moved = v != self.m;
-        self.set_m_with(v, !self.link_hold_sweep);
-        moved
+        let before = (self.m, self.sub);
+        let (m, sub) = self.sweep.tick_fine(before);
+        self.set_pos(m, sub, !self.link_hold_sweep);
+        (m, sub) != before
     }
 
     /// Turn the color offset by `dt` seconds' worth while it plays. The offset is cyclic
@@ -340,7 +385,7 @@ impl Model {
     /// The key an inspector line or in-cell number shows for a cell.
     fn cell_value(&self, n: u32, k: u32) -> Option<String> {
         match self.layers.preset() {
-            Some(Preset::Residue) | Some(Preset::Mask) => Some(self.modulus.binom(n, k).to_string()),
+            Some(Preset::Residue) | Some(Preset::Mask) => Some(math::decimal_text(self.modulus.scaled(n, k) as u64, self.modulus.q as u64)),
             Some(Preset::Valuation) => Some(math::carries(n, k, self.modulus.p).to_string()),
             None => None,
         }
@@ -356,6 +401,13 @@ impl Model {
                 let e = lg.floor();
                 lines.push(format!("C(n,k) ≈ {:.2}e{}", 10f64.powf(lg - e), e as i64));
             }
+        }
+        if md.is_decimal() {
+            // μ = P/Q: C mod μ = (Q·C mod P)/Q, exact; μ divides C exactly when P does
+            let s = md.scaled(n, k);
+            lines.push(format!("C mod {} = {}{}", md.label(), math::decimal_text(s as u64, md.q as u64), if s == 0 { "   μ divides C" } else { "" }));
+            lines.push(format!("μ = {}/{}: C mod μ = ({}·C mod {})/{}", md.m, md.q, md.q, md.m, md.q));
+            return lines.join("\n");
         }
         let r = md.binom(n, k);
         lines.push(format!("C mod {} = {}{}", md.m, r, if r == 0 { "   m divides C" } else { "" }));
@@ -393,7 +445,7 @@ struct Gfx {
 
 /// Everything that changes what the GPU renders: modulus, palette, style, layers, camera,
 /// supersampling and canvas size.
-type FrameKey = (u32, Scheme, CanvasStyle, LayerState, View, u32, (u32, u32));
+type FrameKey = ((u32, u32), Scheme, CanvasStyle, LayerState, View, u32, (u32, u32));
 
 struct App {
     gfx: Option<Gfx>,
@@ -406,7 +458,7 @@ struct App {
     surface_errors: u32,
     fatal: bool,
     /// Modulus of the last rendered frame, and when the running tween began.
-    last_m: u32,
+    last_m: (u32, u32),
     tween_t0: Option<Instant>,
     /// The display texture holds the settled true frame of `last_inputs` (no tween, not
     /// the advancing render), so a redraw that changes none of them (overlay animation,
@@ -426,7 +478,7 @@ struct App {
 }
 
 const USAGE: &str = "pascal-triangle-explorer [options]
-  --m N              modulus (default 7)
+  --m N              modulus (whole, or decimal like 10.5) (default 7)
   --rows R           rows to fit (default 128)
   --palette NAME     spectral | viridis | magma | inferno | turbo | cividis | coolwarm | mono
                      | ember | ocean | moss
@@ -455,7 +507,13 @@ fn main() {
     while i < args.len() {
         let next = || args.get(i + 1).cloned().unwrap_or_default();
         match args[i].as_str() {
-            "--m" => model.set_m(next().parse().unwrap_or(7)),
+            "--m" => {
+                // a whole or decimal modulus ("10.5")
+                let text = next();
+                if !model.goto_text(&text) {
+                    model.set_m(7);
+                }
+            }
             "--rows" => model.fit_rows = next().parse::<f64>().unwrap_or(128.0).max(2.0),
             "--palette" => {
                 if let Some(s) = Scheme::ALL.iter().find(|s| s.id() == next()) {
@@ -553,7 +611,7 @@ fn main() {
     }
     let event_loop = EventLoop::new().expect("event loop");
     event_loop.set_control_flow(ControlFlow::Wait);
-    let mut app = App { gfx: None, model, last_inputs: None, frame_ms: 0.0, frame_nr: 0, surface_errors: 0, fatal: false, last_m: 0, tween_t0: None, canvas_current: false, last_frame: None, continuous: false, fps_frames: 0, fps_t0: None, repaint_at: None, fullscreen_applied: false };
+    let mut app = App { gfx: None, model, last_inputs: None, frame_ms: 0.0, frame_nr: 0, surface_errors: 0, fatal: false, last_m: (0, 1), tween_t0: None, canvas_current: false, last_frame: None, continuous: false, fps_frames: 0, fps_t0: None, repaint_at: None, fullscreen_applied: false };
     event_loop.run_app(&mut app).expect("run");
 }
 
@@ -879,7 +937,7 @@ impl App {
         let grid = GridSpec::new(&model.view, canvas_px.0, canvas_px.1, model.ss, gfx.renderer.max_texels());
         // a fitted view draws its rows only
         model.style.row_limit = if model.auto_fit { model.fit_rows.round().clamp(1.0, u32::MAX as f64) as u32 } else { 0 };
-        let inputs = (model.m, model.scheme, model.style, model.layers.clone(), model.view, model.ss, canvas_px);
+        let inputs = ((model.modulus.m, model.modulus.q), model.scheme, model.style, model.layers.clone(), model.view, model.ss, canvas_px);
         let changed = self.last_inputs.as_ref() != Some(&inputs);
         // a new color offset alone recolors the same frame: the history layers (temporal
         // AVERAGE, AFTERIMAGE) must not count it as a new one
@@ -891,7 +949,7 @@ impl App {
         let tween = if model.sweep.tween_ms == 0 {
             self.tween_t0 = None;
             Tween::Off
-        } else if model.m != self.last_m && self.last_m != 0 {
+        } else if (model.modulus.m, model.modulus.q) != self.last_m && self.last_m.0 != 0 {
             self.tween_t0 = Some(now);
             Tween::Start(0.0)
         } else if let Some(t0) = self.tween_t0 {
@@ -903,7 +961,7 @@ impl App {
         } else {
             Tween::Off
         };
-        self.last_m = model.m;
+        self.last_m = (model.modulus.m, model.modulus.q);
         let mut encoder = gfx.gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
         let tween_off = matches!(tween, Tween::Off);
         let render_canvas = changed || !tween_off || !self.canvas_current;
@@ -1074,9 +1132,9 @@ fn panel_ui(ui: &mut egui::Ui, model: &mut Model, canvas_px: (u32, u32), _frame_
             ui.label(egui::RichText::new("m").color(ui.visuals().weak_text_color()));
             let resp = ui.add(egui::TextEdit::singleline(&mut model.m_text).font(FontId::monospace(12.0)).desired_width(90.0));
             if resp.lost_focus() || (resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
-                match model.m_text.trim().parse::<i64>() {
-                    Ok(v) => model.goto(v),
-                    Err(_) => model.m_text = model.m.to_string(),
+                let text = model.m_text.clone();
+                if !model.goto_text(&text) {
+                    model.m_text = model.modulus.label();
                 }
             }
             if ui.add(egui::Button::new("◀").small()).on_hover_text("One step back in the selection mode (←)").clicked() {
@@ -1096,7 +1154,14 @@ fn panel_ui(ui: &mut egui::Ui, model: &mut Model, canvas_px: (u32, u32), _frame_
             model.goto(m as i64);
         }
         let fs = &model.modulus.factors.iter().map(|t| t.f).collect::<Vec<_>>();
-        let info = if model.modulus.is_prime() { format!("{} is prime", model.m) } else { format!("{} = {}", model.m, math::factor_string(fs)) };
+        let md = &model.modulus;
+        let info = if md.is_decimal() {
+            format!("μ = {} = {}/{}", md.label(), md.m, md.q)
+        } else if md.is_prime() {
+            format!("{} is prime", model.m)
+        } else {
+            format!("{} = {}", model.m, math::factor_string(fs))
+        };
         // one fixed line, so nothing below moves while the modulus changes
         mono_line(ui, &info).on_hover_text("Zeros are where every prime-power factor of m divides C(n,k); the CRT layer shows which ones do.");
     });
@@ -1517,7 +1582,7 @@ fn bar_sep(ui: &mut egui::Ui) {
 fn sweep_bar(ui: &mut egui::Ui, model: &mut Model) {
     let sw = &mut model.sweep;
     let mut action: Option<i32> = None; // Some(0) = jump to start, Some(n) = step n frames
-    let before = (sw.mode, sw.prime_order, sw.seq, sw.step, sw.knobs(), sw.start);
+    let before = (sw.mode, sw.prime_order, sw.seq, sw.step, sw.knobs(), sw.start, sw.decimals);
     ui.spacing_mut().item_spacing = Vec2::new(4.0, 6.0);
 
     // ---- row 1: transport · selection mode · mode options · range ----
@@ -1592,6 +1657,14 @@ fn sweep_bar(ui: &mut egui::Ui, model: &mut Model) {
         bar_drag(ui, 56.0, &mut sw.tween_ms, 0..=3000u32, 5.0).on_hover_text("Display-only transition between moduli: fields morph, plain residue coloring cross-dissolves. Exports, layer history and the inspector use the true frames. 0 = hard cuts. With rows following m the view changes too, so frames cross-fade rather than morph.");
         bar_label(ui, "ms");
         bar_sep(ui);
+        bar_label(ui, "decimals");
+        let max = sw.max_decimals();
+        sw.decimals = sw.decimals.min(max);
+        bar_drag(ui, 36.0, &mut sw.decimals, 0..=max, 0.05).on_hover_text(format!(
+            "Steps between the visited moduli: with d decimals each step moves μ by 10⁻ᵈ through the gap to the next one, an analog glide from modulus to modulus (C mod μ = C − μ⌊C/μ⌋, exact at any row). Shallow rows slide smoothly; deeper ones turn faster, about C(n,k)·10⁻ᵈ/μ² a step. 0 = whole moduli. At most {max} here: μ·10ᵈ must stay within {}.",
+            group(MOD_CAP as u64)
+        ));
+        bar_sep(ui);
         let preview = sw.preview(8);
         let frames = sw.frames_in_range(100_000);
         let mut pv: Vec<String> = preview.iter().map(|v| v.to_string()).collect();
@@ -1602,7 +1675,7 @@ fn sweep_bar(ui: &mut egui::Ui, model: &mut Model) {
         mono_line(ui, &text);
     });
 
-    let changed = before != (sw.mode, sw.prime_order, sw.seq, sw.step, sw.knobs(), sw.start);
+    let changed = before != (sw.mode, sw.prime_order, sw.seq, sw.step, sw.knobs(), sw.start, sw.decimals);
     match action {
         Some(0) => {
             let (lo, hi) = model.sweep.bounds();
@@ -1612,12 +1685,13 @@ fn sweep_bar(ui: &mut egui::Ui, model: &mut Model) {
         Some(n) => {
             // the sweep's own frame steps, like playback, leave held rows alone
             model.sweep.playing = false;
-            let v = model.sweep.step_by(model.m, n);
-            model.set_m_with(v, !model.link_hold_sweep);
+            let (m, sub) = model.sweep.step_fine_by((model.m, model.sub), n);
+            model.set_pos(m, sub, !model.link_hold_sweep);
         }
         None => {}
     }
-    // re-snap when the mode or its parameters changed, as the reference does
+    // re-snap when the mode or its parameters changed, as the reference does (a new
+    // number of decimals lands on the whole modulus)
     if changed {
         model.goto(model.m as i64);
     }
@@ -1785,16 +1859,16 @@ fn canvas_overlays(ui: &mut egui::Ui, model: &mut Model, rect: Rect, ppp: f32, h
             let pt = ((model.view.ppc * 0.34).min(model.view.ppc * ROW_H * 0.55) / ppp as f64).clamp(4.0, NUMBERS_MAX_PT);
             let font = FontId::monospace(((pt.log2() * 4.0).round() / 4.0).exp2() as f32);
             let x1 = model.view.x0 + cw / model.view.ppc;
-            let level_map = model.palette.level_map(model.m, model.style.offset);
+            let level_map = model.palette.level_map(model.modulus.m, model.style.offset);
             for n in n_lo..=n_hi {
                 let k_lo = (model.view.x0 + n as f64 / 2.0 - 0.5).ceil().max(0.0) as i64;
                 let k_hi = (x1 + n as f64 / 2.0 + 0.5).floor().min(n as f64) as i64;
                 for k in k_lo..=k_hi {
                     let k = k as u32;
                     let Some(text) = model.cell_value(n, k) else { break };
-                    let r = model.modulus.binom(n, k);
+                    let r = model.modulus.scaled(n, k);
                     let (rgb, show) = match model.layers.preset() {
-                        Some(Preset::Residue) => (model.palette.residue_color_mapped(r, model.m, &level_map), r != 0),
+                        Some(Preset::Residue) => (model.palette.residue_color_scaled(r, model.modulus.m, model.modulus.q, &level_map), r != 0),
                         Some(Preset::Mask) => (pascal::palette::LIGHT, r != 0),
                         Some(Preset::Valuation) => {
                             let nu = math::carries(n, k, model.modulus.p) as f64;
@@ -1868,7 +1942,7 @@ fn canvas_overlays(ui: &mut egui::Ui, model: &mut Model, rect: Rect, ppp: f32, h
 /// The status bar under the canvas: modulus, the rows and cells in view, timings.
 fn status_bar(ui: &mut egui::Ui, model: &Model, gpu_ms: Option<f32>, frame_ms: f32) {
     let (cw, ch) = model.canvas;
-    let mut parts = vec![format!("m = {}", model.m)];
+    let mut parts = vec![if model.modulus.is_decimal() { format!("μ = {}", model.modulus.label()) } else { format!("m = {}", model.m) }];
     if let Some((a, b)) = model.shown_rows(ch) {
         parts.push(format!("rows {}–{}", group(a as u64), group(b as u64)));
     }
@@ -1904,12 +1978,14 @@ fn wave_overlay(ui: &mut egui::Ui, model: &mut Model, rect: Rect, ppp: f32, dt: 
         model.wave_row = row;
         model.wave.share_closed_form(&model.modulus);
         model.wave.set_ghost(model.ghost.source());
+        // (the modulus given is μ's numerator; a decimal μ = P/Q scales by Q)
+        model.wave.set_scale(model.modulus.q as u64);
         if let WaveSelect::Active(a, b) = model.wave_select {
             // (whole rows for now: the marked cells pick the rows, every cell of them counts)
-            model.wave.set_rows(model.m as u64, a.0 as u64, b.0 as u64);
+            model.wave.set_rows(model.modulus.m as u64, a.0 as u64, b.0 as u64);
         } else {
             let (k_lo, k_hi) = model.view.visible_k(row, cw);
-            model.wave.set_source(row as u64, model.m as u64, (k_lo as u64, k_hi as u64));
+            model.wave.set_source(row as u64, model.modulus.m as u64, (k_lo as u64, k_hi as u64));
         }
         model.wave.set_pinned(model.pinned_row.is_some());
         model.wave.set_viewport(rect, ui.ctx().viewport_rect().size(), ppp);
@@ -2213,6 +2289,52 @@ mod tests {
         md.offset_playing = false;
         md.advance_offset(1.0);
         assert!((md.style.offset - 0.2).abs() < 1e-5);
+    }
+
+    #[test]
+    fn decimals_glide_the_modulus_between_visited_ones() {
+        let mut md = Model::new();
+        md.set_m(10);
+        md.sweep.decimals = 2;
+        md.step(1);
+        assert_eq!((md.m, md.sub, md.m_text.as_str()), (10, 1, "10.01"));
+        assert_eq!((md.modulus.m, md.modulus.q), (1001, 100));
+        md.step(49);
+        assert_eq!((md.m_text.as_str(), md.modulus.m, md.modulus.q), ("10.5", 21, 2), "10.50 in lowest terms");
+        md.step(50);
+        assert_eq!((md.m, md.sub, md.m_text.as_str()), (11, 0, "11"), "the glide lands on the next modulus");
+        assert!(!md.modulus.is_decimal());
+        md.step(-1);
+        assert_eq!(md.m_text, "10.99");
+        // typed: the whole part snaps, extra digits raise the decimals
+        assert!(md.goto_text("12.375"));
+        assert_eq!((md.sweep.decimals, md.m_text.as_str()), (3, "12.375"));
+        assert!(md.goto_text("7"));
+        assert_eq!(md.m_text, "7");
+        assert!(!md.goto_text("7.x"));
+        // primes: 13.9 → 14 is not a stop; the gap runs on to 17
+        md.sweep.mode = ModMode::Prime;
+        md.sweep.decimals = 1;
+        md.set_m(13);
+        md.step(39);
+        assert_eq!(md.m_text, "16.9");
+        md.step(1);
+        assert_eq!(md.m_text, "17");
+        // playback through a gap, and the rows follow μ
+        md.sweep.playing = true;
+        md.sweep.speed_ms = 16;
+        let t0 = std::time::Instant::now();
+        assert!(md.play_tick(t0));
+        assert_eq!(md.m_text, "17.1");
+    }
+
+    #[test]
+    fn the_tetra_stack_keeps_whole_moduli() {
+        // its own sweep never glides: a decimal setting there changes nothing
+        let mut c = pascal::tetra::TetraConfig::default();
+        let whole = pascal::tetra::selected_moduli(&c.sweep);
+        c.sweep.decimals = 3;
+        assert_eq!(pascal::tetra::selected_moduli(&c.sweep), whole);
     }
 
     #[test]

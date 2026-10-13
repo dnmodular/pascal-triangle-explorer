@@ -318,6 +318,26 @@ pub struct WaveOverlay {
     ghost: Option<Box<WaveOverlay>>,
     /// This overlay is someone's ghost (violet line, no fill, its own label text).
     is_ghost: bool,
+    /// A decimal modulus μ = m/q (see [`WaveOverlay::set_scale`]); 1 for a whole one.
+    q: u64,
+}
+
+/// A residue r = C mod m as the coefficient of a decimal modulus μ = m/q: C mod μ =
+/// (q·r mod m)/q (r itself when q = 1).
+#[derive(Clone, Copy)]
+struct Scale {
+    q: u64,
+    m: u64,
+}
+
+impl Scale {
+    fn of(&self, r: u64) -> f32 {
+        if self.q <= 1 || self.m == 0 {
+            r as f32
+        } else {
+            ((r as u128 * (self.q % self.m) as u128 % self.m as u128) as f64 / self.q as f64) as f32
+        }
+    }
 }
 
 impl Default for WaveOverlay {
@@ -365,6 +385,7 @@ impl WaveOverlay {
             settled: false,
             ghost: None,
             is_ghost: false,
+            q: 1,
         }
     }
 
@@ -492,6 +513,22 @@ impl WaveOverlay {
         self.ghost.as_ref().map(|g| g.samples.as_slice())
     }
 
+    /// Play a decimal modulus μ = m/q: the modulus given to [`WaveOverlay::set_source`]
+    /// (or set_rows) is the numerator m, and each coefficient C mod μ = (q·C mod m)/q.
+    /// q = 1 is the whole modulus. Cheap and idempotent.
+    pub fn set_scale(&mut self, q: u64) {
+        let q = q.max(1);
+        if q != self.q {
+            self.q = q;
+            self.dirty = true;
+        }
+    }
+
+    /// The modulus as text: μ = m/q exactly.
+    fn mod_text(&self, m: u64) -> String {
+        if self.q <= 1 { group(m) } else { crate::math::decimal_text(m, self.q) }
+    }
+
     /// Lend the overlay the app's closed form for the current modulus, so long rows do not
     /// build a second copy of its tables. Cheap (an Arc clone when it changed).
     pub fn share_closed_form(&mut self, md: &Arc<Modulus>) {
@@ -524,9 +561,9 @@ impl WaveOverlay {
             self.label.clear();
             let rows = if n_lo == n_hi { format!("row {}", group(n_lo)) } else { format!("rows {}–{}", group(n_lo), group(n_hi)) };
             if self.is_ghost {
-                let _ = write!(self.label, "ghost: {rows} · mod {}", group(m));
+                let _ = write!(self.label, "ghost: {rows} · mod {}", self.mod_text(m));
             } else {
-                let _ = write!(self.label, "{rows} · mod {} · selection", group(m));
+                let _ = write!(self.label, "{rows} · mod {} · selection", self.mod_text(m));
             }
             self.note.clear();
             let st = self.region_stats;
@@ -546,7 +583,7 @@ impl WaveOverlay {
         }
         let Source::Row { row: n, modulus: m, k_lo, k_hi } = src else { return };
         self.label.clear();
-        let _ = write!(self.label, "row {} · mod {}", group(n), group(m));
+        let _ = write!(self.label, "row {} · mod {}", group(n), self.mod_text(m));
         if self.pinned {
             self.label.push_str(" · pinned");
         }
@@ -576,12 +613,13 @@ impl WaveOverlay {
             // every residue mod 1 is 0: an empty target, so the wave eases to a flat line
             return true;
         }
+        let sc = Scale { q: self.q, m };
         let ni = n as i64;
         if n <= PASCAL_MAX_ROW {
             let row = self.pascal.get(n, m);
             for (k, &r) in row.iter().enumerate() {
                 if r != 0 {
-                    self.target.insert(ni - 2 * k as i64, r as f32);
+                    self.target.insert(ni - 2 * k as i64, sc.of(r));
                 }
             }
         } else if m <= MOD_CAP as u64 && n <= u32::MAX as u64 {
@@ -593,7 +631,7 @@ impl WaveOverlay {
             for k in k_lo..=k_hi {
                 let r = md.binom(n as u32, k as u32);
                 if r != 0 {
-                    self.target.insert(ni - 2 * k as i64, r as f32);
+                    self.target.insert(ni - 2 * k as i64, sc.of(r as u64));
                 }
             }
         } else {
@@ -622,6 +660,7 @@ impl WaveOverlay {
     /// Only rows longer than ROW_ENUM_CAP are thinned, each starting one cell further
     /// on, so the thinning does not comb out the same frequencies every row.
     fn rebuild_region(&mut self, m: u64, n_lo: u64, n_hi: u64, x2_lo: i64, x2_hi: i64) -> bool {
+        let sc = Scale { q: self.q, m };
         let mut stats = RegionStats { cells: 0, total: 0, row_step: 1, cell_step: 1 };
         let in_range = m <= 1 || n_hi <= PASCAL_MAX_ROW || (m <= MOD_CAP as u64 && n_hi <= u32::MAX as u64);
         if !in_range {
@@ -656,7 +695,7 @@ impl WaveOverlay {
                     let x2 = x0 + 2 * i as i64;
                     let r = row[((x2 + n as i64) / 2) as usize];
                     if r != 0 {
-                        *self.target.entry(-x2).or_insert(0.0) += r as f32;
+                        *self.target.entry(-x2).or_insert(0.0) += sc.of(r);
                     }
                 }
             }
@@ -691,7 +730,7 @@ impl WaveOverlay {
                             let x2 = x0 + 2 * i as i64;
                             let r = md.binom(n as u32, ((x2 + n as i64) / 2) as u32);
                             if r != 0 {
-                                *self.target.entry(-x2).or_insert(0.0) += r as f32 * weight;
+                                *self.target.entry(-x2).or_insert(0.0) += sc.of(r as u64) * weight;
                             }
                         }
                     }
@@ -724,6 +763,7 @@ impl WaveOverlay {
     /// `region_cone` with every cell counted `weight` times, within `budget` additions.
     #[allow(clippy::too_many_arguments)] // the region's bounds, and how to count it
     fn region_cone_weighted(&mut self, m: u64, n_lo: u64, n_hi: u64, x2_lo: i64, x2_hi: i64, weight: f32, budget: u64, stats: &mut RegionStats) -> bool {
+        let sc = Scale { q: self.q, m };
         let rows = n_hi - n_lo + 1;
         let k_first = |n: u64| ((x2_lo + n as i64 + 1).div_euclid(2)).max(0) as u64; // ⌈(x2_lo + n)/2⌉
         let k_last = |n: u64| ((x2_hi + n as i64).div_euclid(2)).min(n as i64); // ⌊(x2_hi + n)/2⌋
@@ -771,7 +811,7 @@ impl WaveOverlay {
                     let r = seg[(k - lo) as usize];
                     stats.cells += 1;
                     if r != 0 {
-                        *self.target.entry(n as i64 - 2 * k as i64).or_insert(0.0) += r as f32 * weight;
+                        *self.target.entry(n as i64 - 2 * k as i64).or_insert(0.0) += sc.of(r) * weight;
                     }
                 }
             }
@@ -1788,6 +1828,42 @@ mod tests {
         assert!(w.is_animating(), "it scrolls");
         w.set_ghost(None);
         assert!(w.ghost_label().is_none());
+    }
+
+
+    #[test]
+    fn decimal_moduli_play_their_real_residues() {
+        // μ = 10.5 = 21/2: each coefficient is C mod 10.5 = (2C mod 21)/2
+        let mu = 10.5f64;
+        let exact = |n: u32, k: u32| {
+            let c = binom_exact(n, k).unwrap() as f64;
+            c - mu * (c / mu).floor()
+        };
+        let mut w = overlay();
+        w.set_scale(2);
+        w.set_source(12, 21, (0, 12));
+        w.update(1.0 / 60.0);
+        for k in 0..=12u32 {
+            assert!((w.target(12 - 2 * k as i64) as f64 - exact(12, k)).abs() < 1e-4, "C(12,{k}) mod 10.5");
+        }
+        assert_eq!(w.label(), "row 12 · mod 10.5");
+        // whole rows: the sum of the cells' real residues by frequency
+        w.set_rows(21, 0, 9);
+        w.update(1.0 / 60.0);
+        let mut want: HashMap<i64, f64> = HashMap::new();
+        for n in 0..=9u32 {
+            for k in 0..=n {
+                *want.entry(n as i64 - 2 * k as i64).or_default() += exact(n, k);
+            }
+        }
+        for f in -9..=9i64 {
+            assert!((w.target(f) as f64 - want.get(&f).copied().unwrap_or(0.0)).abs() < 1e-3, "f = {f}");
+        }
+        // back to whole: the residues mod 21 themselves
+        w.set_scale(1);
+        w.set_source(5, 21, (0, 5));
+        w.update(1.0 / 60.0);
+        assert_eq!(w.target(5 - 2), 5.0, "C(5,1) mod 21");
     }
 
 }

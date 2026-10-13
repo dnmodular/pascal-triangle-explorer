@@ -9,6 +9,9 @@ use std::sync::OnceLock;
 
 use crate::math::MOD_CAP;
 
+/// Most decimal places between moduli.
+pub const MAX_DECIMALS: u32 = 5;
+
 /// Most moduli one sequence enumerates, and the iteration guard while accumulating.
 const SEQ_MAX: usize = 5000;
 const SEQ_STEP_GUARD: usize = 100_000;
@@ -491,6 +494,10 @@ pub struct Sweep {
     pub dir: i32,
     /// Display-only transition between frames, 0 = hard cuts.
     pub tween_ms: u32,
+    /// Decimal places between visited moduli (0 = whole moduli only): a step then moves
+    /// 10⁻ᵈ through the gap to the next visited modulus, μ = m + sub·10⁻ᵈ, an analog
+    /// glide from modulus to modulus (see [`Sweep::step_fine`]).
+    pub decimals: u32,
     /// Cached walk lists, rebuilt when the mode parameters change.
     cache: Option<(PoolKey, Vec<u32>)>,
 }
@@ -510,6 +517,7 @@ impl Default for Sweep {
             playing: false,
             dir: 1,
             tween_ms: 0,
+            decimals: 0,
             cache: None,
         }
     }
@@ -592,6 +600,84 @@ impl Sweep {
         self.cache.as_ref().map(|c| c.1.as_slice())
     }
 
+
+    /// 10^decimals: the sub-steps per unit of modulus.
+    pub fn fine_units(&self) -> u64 {
+        10u64.pow(self.decimals.min(MAX_DECIMALS))
+    }
+
+    /// The most decimal places the range allows: a decimal modulus μ = P/10ᵈ needs its
+    /// numerator P within MOD_CAP (the closed form's tables are built for P).
+    pub fn max_decimals(&mut self) -> u32 {
+        let (_, hi) = self.bounds();
+        let top = hi as u64 + self.gap_after(hi) as u64;
+        (0..=MAX_DECIMALS).rev().find(|&d| top * 10u64.pow(d) <= MOD_CAP as u64).unwrap_or(0)
+    }
+
+    /// The whole moduli from `m` to the next visited one (1 past the last: its decimals
+    /// lead nowhere, so a sub-step there is a whole step).
+    pub fn gap_after(&mut self, m: u32) -> u32 {
+        let next = self.next_in_dir(m, 1);
+        if next > m { next - m } else { 1 }
+    }
+
+    /// One step from μ = m + sub·10⁻ᵈ (`pos` = (m, sub)) in direction `dir`, through the
+    /// gaps between visited moduli in 10⁻ᵈ steps: forward from m to its next visited
+    /// modulus m' takes (m' − m)·10ᵈ steps, the last one landing on m' itself. With no
+    /// decimals it is the whole step [`Sweep::next_in_dir`].
+    pub fn step_fine(&mut self, pos: (u32, u64), dir: i32) -> (u32, u64) {
+        let (m, sub) = pos;
+        if self.decimals == 0 {
+            return (self.next_in_dir(m, dir), 0);
+        }
+        let units = self.fine_units();
+        if dir > 0 {
+            if sub + 1 < self.gap_after(m) as u64 * units {
+                return (m, sub + 1);
+            }
+            return (self.next_in_dir(m, 1), 0);
+        }
+        if sub > 0 {
+            return (m, sub - 1);
+        }
+        let prev = self.next_in_dir(m, -1);
+        if prev < m {
+            (prev, (m - prev) as u64 * units - 1)
+        } else {
+            (prev, 0) // wrapped: land on the whole modulus
+        }
+    }
+
+    /// `n` fine steps (sign = direction).
+    pub fn step_fine_by(&mut self, pos: (u32, u64), n: i32) -> (u32, u64) {
+        let mut p = pos;
+        for _ in 0..n.unsigned_abs() {
+            p = self.step_fine(p, n.signum());
+        }
+        p
+    }
+
+    /// One frame of playback from `pos`: a fine step in the play direction, wrapping at
+    /// the range ends (looping) or stopping there; the range ends are whole moduli. With
+    /// no decimals it is [`Sweep::tick`].
+    pub fn tick_fine(&mut self, pos: (u32, u64)) -> (u32, u64) {
+        if self.decimals == 0 {
+            return (self.tick(pos.0), 0);
+        }
+        let (lo, hi) = self.bounds();
+        let dir = self.dir;
+        let next = self.step_fine(pos, dir);
+        let past = if dir > 0 { next.0 > hi || (next.0 == hi && next.1 > 0) || next.0 < pos.0 } else { next.0 < lo || next.0 > pos.0 };
+        if !past {
+            return next;
+        }
+        if self.looping {
+            (if dir > 0 { lo } else { hi }, 0)
+        } else {
+            self.playing = false;
+            (if dir > 0 { hi } else { lo }, 0)
+        }
+    }
 
     /// The modulus nearest to `v` that the active mode allows (`snapMod`).
     pub fn snap(&mut self, v: i64) -> u32 {
@@ -905,4 +991,35 @@ mod tests {
         v = s.tick(v);
         assert_eq!((v, s.playing), (10, false));
     }
+
+    #[test]
+    fn decimals_glide_through_the_gaps() {
+        // primes, one decimal: 7 → 7.1 → … → 10.9 → 11
+        let mut s = Sweep { mode: ModMode::Prime, decimals: 1, start: 2, end: 30, ..Default::default() };
+        assert_eq!(s.step_fine((7, 0), 1), (7, 1));
+        assert_eq!(s.step_fine((7, 39), 1), (11, 0), "7 + 3.9 is the last step before 11");
+        assert_eq!(s.step_fine_by((7, 0), 40), (11, 0));
+        assert_eq!(s.step_fine((11, 0), -1), (7, 39));
+        assert_eq!(s.step_fine((7, 5), -1), (7, 4));
+        // playback stops (or loops) at the range end, a whole modulus
+        s.looping = false;
+        s.playing = true;
+        assert_eq!(s.tick_fine((29, 0)), (29, 0));
+        assert!(!s.playing);
+        s.looping = true;
+        assert_eq!(s.tick_fine((29, 0)), (2, 0));
+        s.dir = -1;
+        assert_eq!(s.tick_fine((2, 0)), (29, 0));
+        assert_eq!(s.tick_fine((3, 0)), (2, 9));
+        // whole steps without decimals
+        s.decimals = 0;
+        s.dir = 1;
+        assert_eq!(s.step_fine((7, 0), 1), (11, 0));
+        // the range bounds the decimal places: P = (hi + gap)·10ᵈ within MOD_CAP
+        let mut s = Sweep { end: 128, ..Default::default() };
+        assert_eq!(s.max_decimals(), 3);
+        s.end = 50_000;
+        assert_eq!(s.max_decimals(), 1);
+    }
+
 }

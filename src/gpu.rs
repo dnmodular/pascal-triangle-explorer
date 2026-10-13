@@ -23,7 +23,7 @@ use wgpu::util::DeviceExt;
 
 use crate::layers::{AvgMode, FieldColorMode, LayerId, LayerState, MeasureRun, ValueStyle};
 use crate::math::{to_mont, Modulus, MAX_FACTORS};
-use crate::palette::{residue_levels_packed, Palette, Scheme};
+use crate::palette::{residue_levels_scaled, Palette, Scheme};
 use crate::view::GridSpec;
 
 const WG: u32 = 16;
@@ -90,7 +90,9 @@ pub struct GpuParams {
     pub field_active: u32,
     pub field_stride: u32,
     pub signed_mask: u32,
-    pub pad_d: u32,
+    /// The decimal modulus's scale q mod m (μ = m/q; the value pass stores q·r mod m);
+    /// 1 for a whole modulus.
+    pub qscale: u32,
     pub style_flags: u32,
     pub glow_rgb: u32,
     pub row_limit: u32,
@@ -686,7 +688,7 @@ pub struct Renderer {
     hist_next: u32,
     hist_len: u32,
     adapt_valid: bool,
-    uploaded_m: Option<(u32, bool)>,
+    uploaded_m: Option<(u32, u32, bool)>,
     uploaded_level_map: Option<[u8; 256]>,
     uploaded_scheme: Option<Scheme>,
     modulus_data: Option<ModulusGpuData>,
@@ -1017,10 +1019,10 @@ impl Renderer {
     }
 
     fn ensure_modulus(&mut self, md: &Modulus, spectral: bool) {
-        if self.uploaded_m == Some((md.m, spectral)) {
+        if self.uploaded_m == Some((md.m, md.q, spectral)) {
             return;
         }
-        if self.uploaded_m.map(|(m, _)| m) != Some(md.m) {
+        if self.uploaded_m.map(|(m, _, _)| m) != Some(md.m) {
             let data = ModulusGpuData::new(md);
             let bytes = bytemuck::cast_slice::<u32, u8>(&data.tables);
             if (bytes.len() as u64) > self.tables_buf.size() {
@@ -1030,14 +1032,14 @@ impl Renderer {
             self.queue.write_buffer(&self.tables_buf, 0, bytes);
             self.modulus_data = Some(data);
         }
-        let levels = residue_levels_packed(md.m, spectral);
+        let levels = residue_levels_scaled(md.m, md.q, spectral);
         let lb = bytemuck::cast_slice::<u32, u8>(&levels);
         if (lb.len() as u64) > self.levels_buf.size() {
             self.levels_buf = buffer(&self.device, "levels", round_up(lb.len() as u64, 4096) * 2, STORAGE_RW);
             self.rebuild_bg0();
         }
         self.queue.write_buffer(&self.levels_buf, 0, lb);
-        self.uploaded_m = Some((md.m, spectral));
+        self.uploaded_m = Some((md.m, md.q, spectral));
     }
 
     fn ensure_palette(&mut self, pal: &Palette) {
@@ -1189,6 +1191,7 @@ impl Renderer {
             cells_per_px: g.cells_per_px,
             rows_per_px: g.rows_per_px,
             m: input.modulus.m,
+            qscale: input.modulus.q % input.modulus.m,
             p: input.modulus.p,
             dlog_off: md.dlog_off,
             lnf_off: md.lnf_off,

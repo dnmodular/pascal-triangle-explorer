@@ -45,7 +45,7 @@ struct Params {
   field_active: u32, // the field pipeline ran: resolve reads the working field
   field_stride: u32, // elements per field slot
   signed_mask: u32,  // bit s set when measure slot s is signed (normalized around 0.5)
-  pad_d: u32,
+  qscale: u32,     // a decimal modulus μ = m/q: q mod m (cells hold q·r mod m); 1 when whole
 
   style_flags: u32,  // resolve decorations: bit 0 cell outlines, bit 1 glow around zeros
   glow_rgb: u32,     // 0xRRGGBB of the glow (the palette ramp at 0.8)

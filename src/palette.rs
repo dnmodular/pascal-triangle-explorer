@@ -217,6 +217,38 @@ pub fn level_map_words(map: &[u8; 256]) -> [u32; 64] {
 }
 
 /// Level of every residue `0..m`, packed four per u32 for the GPU.
+/// The levels of a decimal modulus μ = m/q, by scaled residue s = q·(C mod μ) in
+/// 0..m: the reference's coloring that is continuous in μ, at x = s/q (0 void, x = 1
+/// white under spectral, else the ramp at (x − 2)/(μ − 3) or x/(μ − 1)). q = 1 is
+/// [`residue_level`] itself.
+pub fn residue_level_scaled(s: u32, m: u32, q: u32, spectral: bool) -> u8 {
+    if q <= 1 {
+        return residue_level(s, m, spectral);
+    }
+    if s == 0 {
+        return 0;
+    }
+    let (x, mu) = (s as f64 / q as f64, m as f64 / q as f64);
+    let t = if spectral {
+        if s == q {
+            return 1;
+        }
+        (x - 2.0) / f64::max(1.0, mu - 3.0)
+    } else {
+        x / (mu - 1.0)
+    };
+    2 + js_round(253.0 * t.clamp(0.0, 1.0)) as u8
+}
+
+/// [`residue_level_scaled`] for every s in 0..m, packed four per word.
+pub fn residue_levels_scaled(m: u32, q: u32, spectral: bool) -> Vec<u32> {
+    let mut out = vec![0u32; (m as usize).div_ceil(4)];
+    for r in 0..m {
+        out[(r / 4) as usize] |= (residue_level_scaled(r, m, q, spectral) as u32) << (8 * (r % 4));
+    }
+    out
+}
+
 pub fn residue_levels_packed(m: u32, spectral: bool) -> Vec<u32> {
     let mut out = vec![0u32; (m as usize).div_ceil(4)];
     for r in 0..m {
@@ -303,6 +335,12 @@ impl Palette {
     /// The same through a color offset's [`level_map`].
     pub fn residue_color_mapped(&self, r: u32, m: u32, map: &[u8; 256]) -> [u8; 3] {
         self.res[map[residue_level(r, m, self.scheme == Scheme::Spectral) as usize] as usize]
+    }
+
+    /// [`Palette::residue_color_mapped`] for a decimal modulus μ = m/q, by scaled
+    /// residue s (q = 1: the whole modulus m).
+    pub fn residue_color_scaled(&self, s: u32, m: u32, q: u32, map: &[u8; 256]) -> [u8; 3] {
+        self.res[map[residue_level_scaled(s, m, q, self.scheme == Scheme::Spectral) as usize] as usize]
     }
 
     /// The level map of `offset` for this palette and modulus `m`.

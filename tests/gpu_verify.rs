@@ -114,6 +114,58 @@ fn deep_rows_match_cpu_closed_form() {
     }
 }
 
+#[test]
+fn decimal_moduli_match_the_exact_rational_residue() {
+    // μ = m/q: the value pass stores q·(C mod μ) = q·C mod m, and the color levels read
+    // it as the reference's coloring continuous in μ. Shallow rows (checked against the
+    // exact rational residue) and deep ones (against the CPU closed form).
+    let (_gpu, mut r) = device();
+    let pal = Palette::new(Scheme::Spectral);
+    let layers = LayerState::default();
+    let rows = 120u32;
+    let (_, grid) = cell_grid(rows);
+    for (whole, sub, d) in [(10u32, 5u64, 1u32), (3, 7, 1), (12, 37, 2), (2, 1, 3), (99, 99, 2), (999, 999, 3)] {
+        let md = Modulus::from_decimal(whole, sub, d, pascal::math::MOD_CAP).unwrap();
+        assert!(md.is_decimal());
+        r.render_blocking(&frame(grid, &md, &pal, &layers));
+        let cells = r.read_cells();
+        let dp = triangle_dp(rows as usize, md.m);
+        for j in 0..grid.h {
+            for i in 0..grid.w {
+                let c = cells[(j * grid.w + i) as usize];
+                if let Some((n, k)) = grid.cell_of(i, j) {
+                    if n >= rows {
+                        continue;
+                    }
+                    // q·(C mod m) mod m, from the additive rule mod m
+                    let want = (dp[(n * (n + 1) / 2 + k) as usize] as u64 * md.q as u64 % md.m as u64) as u32;
+                    assert_eq!(c[0], want, "C({n},{k}) mod {}", md.label());
+                    assert_eq!(c[0], md.scaled(n, k));
+                }
+            }
+        }
+    }
+    // deep rows: the shader against the CPU closed form
+    let md = Modulus::from_decimal(30, 25, 2, pascal::math::MOD_CAP).unwrap();
+    let rows = 64u32;
+    for n0 in [1_000_000u32, 999_999_900] {
+        let view = View { x0: -40.0, y0: n0 as f64, ppc: 2.0 };
+        let grid = GridSpec::new(&view, rows * 2, (rows as f64 * ROW_H * 2.0).ceil() as u32 + 2, 1, 1 << 26);
+        r.render_blocking(&frame(grid, &md, &pal, &layers));
+        let cells = r.read_cells();
+        let mut seen = 0;
+        for j in 0..grid.h {
+            for i in 0..grid.w {
+                if let Some((n, k)) = grid.cell_of(i, j) {
+                    assert_eq!(cells[(j * grid.w + i) as usize][0], md.scaled(n, k), "C({n},{k}) mod 30.25");
+                    seen += 1;
+                }
+            }
+        }
+        assert!(seen > 500);
+    }
+}
+
 // ---------------------------------------------------------------------------------
 // CPU twins of the field passes, on the same grid, for the layer pipeline tests.
 // ---------------------------------------------------------------------------------

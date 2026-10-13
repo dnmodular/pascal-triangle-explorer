@@ -524,6 +524,21 @@ while the modulus or the mode changes:
   apply typed values on Enter (or when they lose focus), so a half-typed number never
   drives the sweep; dragging them is live. Looping wraps at the range
   ends; with loop off, playback stops on the last frame.
+* **Decimals:** decimal moduli between the visited ones, after
+  `reference/pascal-core.html`. With d decimals each step moves μ by 10⁻ᵈ through
+  the gap to the next visited modulus (primes, one decimal: 7, 7.1, …, 10.9, 11), and
+  playback glides the same way; the m field also takes a decimal typed in ("10.37"
+  raises the decimals to 2), and so does `--m` on the command line. The residue is
+  the real one, C mod μ = C − μ⌊C/μ⌋, and it is exact at any row: with μ = P/Q in
+  lowest terms (10.5 = 21/2), C mod μ = (Q·C mod P)/Q, so the GPU runs the whole
+  modulus P through the usual closed form and the value pass stores Q·r mod P (one
+  multiply-mod; P stays within MOD_CAP, which bounds d for the range). Colors follow
+  the reference's coloring continuous in μ (the ramp at x/(μ − 1) for x = C mod μ);
+  the inspector, the in-cell numbers and the wave overlay show the real residues.
+  What it looks like: μ divides C exactly when P does, so the zero holes belong to P
+  and jump from step to step (10.25 = 41/4 shows mod 41's), and a cell's residue
+  turns by about C·10⁻ᵈ/μ² a step, so the top rows glide smoothly while deeper rows,
+  where C is huge, turn over every step. The tetra stack keeps whole moduli.
 * **Tween (ms):** a display-only transition. When consecutive frames run the same
   field pipeline on the same view, the field morphs (smoothstep lerp, as in the
   reference); otherwise the picture cross-dissolves. The resolve pass still writes
@@ -732,8 +747,7 @@ PALETTE BLEND beyond a smoke test (its colors are not compared against the
 reference's JavaScript output).
 
 Deviations from the reference worth knowing: PgUp/PgDn take ten sweep steps
-(the reference's "whole step" belongs to its decimal-modulus mode, which is out
-of scope for v1); the tween cross-dissolves in color where the reference fades
+(the reference's "whole step" for its decimal moduli is not ported); the tween cross-dissolves in color where the reference fades
 the canvas; in-cell numbers are drawn by the UI over the live view only,
 not into exports; frame history for temporal AVERAGE and AFTERIMAGE lives in
 screen space, so panning smears it rather than following cells.
