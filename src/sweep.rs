@@ -442,8 +442,9 @@ pub fn seq_mods_with(start: u32, hi: u32, seq: Seq, fixed: u32, knobs: [u32; 2])
     out
 }
 
+/// Moduli run from 1 (where every residue is 0) to MOD_CAP.
 fn clamp_mod(v: i64) -> u32 {
-    v.clamp(2, MOD_CAP as i64) as u32
+    v.clamp(1, MOD_CAP as i64) as u32
 }
 
 /// Nearest value of an ascending list to `target`; ties go to the lower one.
@@ -498,6 +499,10 @@ pub struct Sweep {
     /// 10⁻ᵈ through the gap to the next visited modulus, μ = m + sub·10⁻ᵈ, an analog
     /// glide from modulus to modulus (see [`Sweep::step_fine`]).
     pub decimals: u32,
+    /// How a decimal μ between two visited moduli is drawn: the exact real residue
+    /// C mod μ (false), or a morph from the lower whole modulus to the next one, each
+    /// cell's color sliding between its two residues' colors (true).
+    pub morph: bool,
     /// Cached walk lists, rebuilt when the mode parameters change.
     cache: Option<(PoolKey, Vec<u32>)>,
 }
@@ -518,6 +523,7 @@ impl Default for Sweep {
             dir: 1,
             tween_ms: 0,
             decimals: 0,
+            morph: false,
             cache: None,
         }
     }
@@ -609,6 +615,9 @@ impl Sweep {
     /// The most decimal places the range allows: a decimal modulus μ = P/10ᵈ needs its
     /// numerator P within MOD_CAP (the closed form's tables are built for P).
     pub fn max_decimals(&mut self) -> u32 {
+        if self.morph {
+            return MAX_DECIMALS; // (a morph only ever uses the whole moduli)
+        }
         let (_, hi) = self.bounds();
         let top = hi as u64 + self.gap_after(hi) as u64;
         (0..=MAX_DECIMALS).rev().find(|&d| top * 10u64.pow(d) <= MOD_CAP as u64).unwrap_or(0)

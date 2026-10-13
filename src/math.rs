@@ -301,7 +301,12 @@ pub struct Modulus {
 
 impl Modulus {
     pub fn new(m: u32) -> Self {
-        assert!(m >= 2, "modulus must be at least 2");
+        assert!(m >= 1, "modulus must be at least 1");
+        if m == 1 {
+            // mod 1: no prime factors, every residue 0 (Garner over nothing). The smallest
+            // prime is a placeholder 2, so carry-counting code stays finite.
+            return Self { m: 1, q: 1, factors: Vec::new(), p: 2, root: 1, dlog: vec![0, 0] };
+        }
         let fs = factorize(m);
         let mut factors = Vec::with_capacity(fs.len());
         let mut garner_q = 1u32;
@@ -372,6 +377,11 @@ impl Modulus {
 
     pub fn is_prime(&self) -> bool {
         self.factors.len() == 1 && self.factors[0].f.e == 1
+    }
+
+    /// Mod 1: every residue is 0.
+    pub fn is_one(&self) -> bool {
+        self.m == 1
     }
 
     /// `C(n,k) mod m`: per-factor residues recombined by Garner's algorithm.

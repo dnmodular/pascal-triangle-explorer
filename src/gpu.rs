@@ -97,8 +97,16 @@ pub struct GpuParams {
     pub glow_rgb: u32,
     pub row_limit: u32,
     pub pad_f: u32,
+    /// A morph between two whole moduli (0 factors: none): the second modulus's factor
+    /// count and value, how far the frame is from the first to it (0..1), and where its
+    /// residue levels start in the levels table (a residue index).
+    pub nfactors_b: u32,
+    pub m_b: u32,
+    pub morph_t: f32,
+    pub levels_b_off: u32,
     pub dparams: [[u32; 4]; 8],
     pub factors: [GpuFactor; MAX_FACTORS],
+    pub factors_b: [GpuFactor; MAX_FACTORS],
 }
 
 #[repr(C)]
@@ -122,6 +130,9 @@ pub struct PassParams {
 pub struct ModulusGpuData {
     pub factors: [GpuFactor; MAX_FACTORS],
     pub nfactors: u32,
+    /// A morph's second modulus (its factor tables after the first's), if any.
+    pub factors_b: [GpuFactor; MAX_FACTORS],
+    pub nfactors_b: u32,
     pub tables: Vec<u32>,
     pub dlog_off: u32,
     pub lnf_off: u32,
@@ -147,37 +158,18 @@ pub fn ln_factorial_table() -> &'static [f32] {
 
 impl ModulusGpuData {
     pub fn new(md: &Modulus) -> Self {
-        let mut factors = [GpuFactor::default(); MAX_FACTORS];
+        Self::pair(md, None)
+    }
+
+    /// The tables of `md` and, for a morph, of a second modulus `b` (its factor tables
+    /// appended, the descriptors pointing at them).
+    pub fn pair(md: &Modulus, b: Option<&Modulus>) -> Self {
         let mut tables = Vec::new();
-        for (i, t) in md.factors.iter().enumerate() {
-            let q = t.f.q;
-            let odd = t.f.p != 2;
-            let conv = |x: u32| if odd { to_mont(x, q) } else { x };
-            let tab_off = tables.len() as u32;
-            tables.extend(t.fp.iter().map(|&x| conv(x)));
-            tables.extend(t.ifp.iter().map(|&x| conv(x)));
-            // p^t mod q for t < e, so the shader never loops to form a power
-            let ppow_off = tables.len() as u32;
-            let mut pw = 1u64;
-            for _ in 0..t.f.e {
-                tables.push(conv(pw as u32));
-                pw = pw * t.f.p as u64 % q as u64;
-            }
-            factors[i] = GpuFactor {
-                p: t.f.p,
-                e: t.f.e,
-                q,
-                qinv: t.qinv,
-                one: conv(1),
-                p_mont: conv(t.f.p % q),
-                tab_off,
-                minus_one: t.minus_one as u32,
-                garner_q: t.garner_q,
-                garner_inv: conv(t.garner_inv),
-                ppow_off,
-                pad1: 0,
-            };
-        }
+        let factors = factor_tables(md, &mut tables);
+        let (factors_b, nfactors_b) = match b {
+            Some(b) => (factor_tables(b, &mut tables), b.factors.len() as u32),
+            None => ([GpuFactor::default(); MAX_FACTORS], 0),
+        };
         let dlog_off = tables.len() as u32;
         tables.extend_from_slice(&md.dlog);
         // ln(i!) for i < LNF_TABLE, as f32 bits (MAGNITUDE)
@@ -190,8 +182,43 @@ impl ModulusGpuData {
         if tables.len() % 4 != 0 {
             tables.resize(tables.len() + 4 - tables.len() % 4, 0);
         }
-        Self { factors, nfactors: md.factors.len() as u32, tables, dlog_off, lnf_off, prank_off }
+        Self { factors, nfactors: md.factors.len() as u32, factors_b, nfactors_b, tables, dlog_off, lnf_off, prank_off }
     }
+}
+
+/// The prime-power tables of `md`, appended to `tables`, and their descriptors.
+fn factor_tables(md: &Modulus, tables: &mut Vec<u32>) -> [GpuFactor; MAX_FACTORS] {
+    let mut factors = [GpuFactor::default(); MAX_FACTORS];
+    for (i, t) in md.factors.iter().enumerate() {
+        let q = t.f.q;
+        let odd = t.f.p != 2;
+        let conv = |x: u32| if odd { to_mont(x, q) } else { x };
+        let tab_off = tables.len() as u32;
+        tables.extend(t.fp.iter().map(|&x| conv(x)));
+        tables.extend(t.ifp.iter().map(|&x| conv(x)));
+        // p^t mod q for t < e, so the shader never loops to form a power
+        let ppow_off = tables.len() as u32;
+        let mut pw = 1u64;
+        for _ in 0..t.f.e {
+            tables.push(conv(pw as u32));
+            pw = pw * t.f.p as u64 % q as u64;
+        }
+        factors[i] = GpuFactor {
+            p: t.f.p,
+            e: t.f.e,
+            q,
+            qinv: t.qinv,
+            one: conv(1),
+            p_mont: conv(t.f.p % q),
+            tab_off,
+            minus_one: t.minus_one as u32,
+            garner_q: t.garner_q,
+            garner_inv: conv(t.garner_inv),
+            ppow_off,
+            pad1: 0,
+        };
+    }
+    factors
 }
 
 /// Adapter, device and queue.
@@ -531,6 +558,9 @@ pub struct FrameInput<'a> {
     pub tween: Tween,
     /// Color offset and cell decorations (part of the true frame: exports include them).
     pub style: CanvasStyle,
+    /// A morph from `modulus` to a second whole modulus, t of the way (0..1): each cell
+    /// is colored between its two residues' colors (see `morph` in the resolve pass).
+    pub morph: Option<(&'a Modulus, f32)>,
 }
 
 /// How the resolve pass colors and decorates cells: the appearance options of
@@ -656,6 +686,8 @@ pub struct Renderer {
     palette_buf: wgpu::Buffer,
     maxbuf: wgpu::Buffer,
     cells_buf: wgpu::Buffer,
+    /// Where the morph's second residue levels start in the levels table.
+    levels_b_off: u32,
     fields_buf: wgpu::Buffer,
     /// AUX_FIELDS scalar fields of `stride` elements each.
     scratch_buf: wgpu::Buffer,
@@ -688,7 +720,8 @@ pub struct Renderer {
     hist_next: u32,
     hist_len: u32,
     adapt_valid: bool,
-    uploaded_m: Option<(u32, u32, bool)>,
+    /// (m, q, the morph's second m or 0, spectral) last uploaded.
+    uploaded_m: Option<(u32, u32, u32, bool)>,
     uploaded_level_map: Option<[u8; 256]>,
     uploaded_scheme: Option<Scheme>,
     modulus_data: Option<ModulusGpuData>,
@@ -853,6 +886,7 @@ impl Renderer {
             pass_buf,
             tables_buf,
             levels_buf,
+            levels_b_off: 0,
             palette_buf,
             maxbuf,
             cells_buf,
@@ -995,7 +1029,8 @@ impl Renderer {
             self.stride = stride;
             let d = &self.device;
             if dims_changed {
-                self.cells_buf = buffer(d, "cells", texels * 8, STORAGE_RW);
+                // (the second half holds a morph's second residues)
+                self.cells_buf = buffer(d, "cells", texels * 16, STORAGE_RW);
                 self.fields_buf = buffer(d, "fields", MAX_MEASURE_SLOTS as u64 * stride as u64 * 4, STORAGE_RW);
                 self.scratch_buf = buffer(d, "scratch", AUX_FIELDS * stride as u64 * 4, STORAGE_RW);
                 self.tmp_buf = buffer(d, "tmp", stride as u64 * 4, STORAGE_RW);
@@ -1018,12 +1053,13 @@ impl Renderer {
         self.grid = Some(*grid);
     }
 
-    fn ensure_modulus(&mut self, md: &Modulus, spectral: bool) {
-        if self.uploaded_m == Some((md.m, md.q, spectral)) {
+    fn ensure_modulus(&mut self, md: &Modulus, b: Option<&Modulus>, spectral: bool) {
+        let mb = b.map_or(0, |b| b.m);
+        if self.uploaded_m == Some((md.m, md.q, mb, spectral)) {
             return;
         }
-        if self.uploaded_m.map(|(m, _, _)| m) != Some(md.m) {
-            let data = ModulusGpuData::new(md);
+        if self.uploaded_m.map(|(m, _, b, _)| (m, b)) != Some((md.m, mb)) {
+            let data = ModulusGpuData::pair(md, b);
             let bytes = bytemuck::cast_slice::<u32, u8>(&data.tables);
             if (bytes.len() as u64) > self.tables_buf.size() {
                 self.tables_buf = buffer(&self.device, "tables", round_up(bytes.len() as u64, 4096) * 2, STORAGE_RW);
@@ -1032,14 +1068,20 @@ impl Renderer {
             self.queue.write_buffer(&self.tables_buf, 0, bytes);
             self.modulus_data = Some(data);
         }
-        let levels = residue_levels_scaled(md.m, md.q, spectral);
+        // the morph's second modulus's levels follow, from a residue index that is a whole
+        // number of words in
+        let mut levels = residue_levels_scaled(md.m, md.q, spectral);
+        self.levels_b_off = levels.len() as u32 * 4;
+        if let Some(b) = b {
+            levels.extend(residue_levels_scaled(b.m, b.q, spectral));
+        }
         let lb = bytemuck::cast_slice::<u32, u8>(&levels);
         if (lb.len() as u64) > self.levels_buf.size() {
             self.levels_buf = buffer(&self.device, "levels", round_up(lb.len() as u64, 4096) * 2, STORAGE_RW);
             self.rebuild_bg0();
         }
         self.queue.write_buffer(&self.levels_buf, 0, lb);
-        self.uploaded_m = Some((md.m, md.q, spectral));
+        self.uploaded_m = Some((md.m, md.q, mb, spectral));
     }
 
     fn ensure_palette(&mut self, pal: &Palette) {
@@ -1167,7 +1209,7 @@ impl Renderer {
         };
         let work_elem = if variant == 0 { 4 } else { 16 };
         self.ensure_grid(&input.grid, work_elem);
-        self.ensure_modulus(input.modulus, input.palette.scheme == Scheme::Spectral);
+        self.ensure_modulus(input.modulus, input.morph.map(|(b, _)| b), input.palette.scheme == Scheme::Spectral);
         self.ensure_palette(input.palette);
         self.ensure_level_map(input.palette.level_map(input.modulus.m, input.style.offset));
         self.pass_params.clear();
@@ -1211,6 +1253,11 @@ impl Renderer {
                 (r as u32) << 16 | (g as u32) << 8 | b as u32
             },
             factors: md.factors,
+            nfactors_b: md.nfactors_b,
+            m_b: input.morph.map_or(0, |(b, _)| b.m),
+            morph_t: input.morph.map_or(0.0, |(_, t)| t.clamp(0.0, 1.0)),
+            levels_b_off: self.levels_b_off,
+            factors_b: md.factors_b,
             ..Default::default()
         };
         for d in crate::layers::REGISTRY {
@@ -1563,6 +1610,13 @@ impl Renderer {
         let g = self.grid.expect("rendered");
         let bytes = self.read_buffer(&self.cells_buf, 0, g.texels() * 8);
         bytemuck::cast_slice::<u8, [u32; 2]>(&bytes).to_vec()
+    }
+
+    /// The morph's second residues (the cell buffer's second half), one per texel.
+    pub fn read_cells_b(&self) -> Vec<u32> {
+        let g = self.grid.expect("rendered");
+        let bytes = self.read_buffer(&self.cells_buf, g.texels() * 8, g.texels() * 8);
+        bytemuck::cast_slice::<u8, [u32; 2]>(&bytes).iter().map(|c| c[0]).collect()
     }
 
     /// Measure field `slot` (raw, before normalization).

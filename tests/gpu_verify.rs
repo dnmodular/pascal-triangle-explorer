@@ -8,7 +8,7 @@
 use pascal::gpu::{FrameInput, Gpu, Renderer};
 use pascal::layers::{AvgMode, BlendMode, FieldColorMode, LayerId, LayerState};
 use pascal::math::{carries, triangle_dp, Modulus};
-use pascal::palette::{Palette, Scheme};
+use pascal::palette::{residue_level, Palette, Scheme};
 use pascal::view::{GridSpec, View, ROW_H};
 
 fn device() -> (Gpu, Renderer) {
@@ -29,7 +29,7 @@ fn cell_grid(rows: u32) -> (View, GridSpec) {
 }
 
 fn frame<'a>(grid: GridSpec, md: &'a Modulus, pal: &'a Palette, layers: &'a LayerState) -> FrameInput<'a> {
-    FrameInput { grid, modulus: md, palette: pal, layers, advance: true, tween: pascal::gpu::Tween::Off, style: Default::default() }
+    FrameInput { grid, modulus: md, palette: pal, layers, advance: true, tween: pascal::gpu::Tween::Off, style: Default::default(), morph: None }
 }
 
 const MODULI: &[u32] = &[
@@ -124,7 +124,7 @@ fn decimal_moduli_match_the_exact_rational_residue() {
     let layers = LayerState::default();
     let rows = 120u32;
     let (_, grid) = cell_grid(rows);
-    for (whole, sub, d) in [(10u32, 5u64, 1u32), (3, 7, 1), (12, 37, 2), (2, 1, 3), (99, 99, 2), (999, 999, 3)] {
+    for (whole, sub, d) in [(10u32, 5u64, 1u32), (3, 7, 1), (12, 37, 2), (2, 1, 3), (99, 99, 2), (999, 999, 3), (1, 5, 1), (1, 1, 2), (1, 999, 3)] {
         let md = Modulus::from_decimal(whole, sub, d, pascal::math::MOD_CAP).unwrap();
         assert!(md.is_decimal());
         r.render_blocking(&frame(grid, &md, &pal, &layers));
@@ -145,6 +145,21 @@ fn decimal_moduli_match_the_exact_rational_residue() {
             }
         }
     }
+    // mod 1: every cell valid, every residue 0
+    let one = Modulus::new(1);
+    r.render_blocking(&frame(grid, &one, &pal, &layers));
+    let cells = r.read_cells();
+    let mut seen = 0;
+    for j in 0..grid.h {
+        for i in 0..grid.w {
+            if grid.cell_of(i, j).is_some() {
+                let c = cells[(j * grid.w + i) as usize];
+                assert!(c[1] & 0x8000_0000 != 0 && c[0] == 0);
+                seen += 1;
+            }
+        }
+    }
+    assert!(seen > 1000);
     // deep rows: the shader against the CPU closed form
     let md = Modulus::from_decimal(30, 25, 2, pascal::math::MOD_CAP).unwrap();
     let rows = 64u32;
@@ -163,6 +178,65 @@ fn decimal_moduli_match_the_exact_rational_residue() {
             }
         }
         assert!(seen > 500);
+    }
+}
+
+#[test]
+fn morphs_slide_each_cell_between_its_two_colors() {
+    // m = 10 → m′ = 11: the second residues are C mod 11, t = 0 and t = 1 are the plain
+    // frames exactly, and in between each cell is the CPU twin of the blend
+    let (_gpu, mut r) = device();
+    let rows = 48u32;
+    let (view, grid) = cell_grid(rows);
+    let layers = LayerState::default();
+    let (a, b) = (Modulus::new(10), Modulus::new(11));
+    for scheme in [Scheme::Spectral, Scheme::Turbo] {
+        let pal = Palette::new(scheme);
+        let spectral = scheme == Scheme::Spectral;
+        let shot = |r: &mut Renderer, md: &Modulus, morph: Option<(&Modulus, f32)>| {
+            r.render_blocking(&FrameInput { morph, ..frame(grid, md, &pal, &layers) });
+            r.read_output_rgba().2
+        };
+        let plain_a = shot(&mut r, &a, None);
+        let plain_b = shot(&mut r, &b, None);
+        assert_eq!(shot(&mut r, &a, Some((&b, 0.0))), plain_a, "{scheme:?}: t = 0 is mod 10");
+        let rb = r.read_cells_b();
+        for j in 0..grid.h {
+            for i in 0..grid.w {
+                if let Some((n, k)) = grid.cell_of(i, j) {
+                    assert_eq!(rb[(j * grid.w + i) as usize], b.binom(n, k), "C({n},{k}) mod 11");
+                }
+            }
+        }
+        let at_one = shot(&mut r, &a, Some((&b, 1.0)));
+        let off = at_one.iter().zip(&plain_b).filter(|(x, y)| x.abs_diff(**y) > 1).count();
+        assert_eq!(off, 0, "{scheme:?}: t = 1 is mod 11");
+        // in between: the ramp walked between the two levels, or a fade at a zero / the 1s
+        let t = 0.3f32;
+        let mid = shot(&mut r, &a, Some((&b, t)));
+        let w = grid.canvas_w;
+        let mut checked = 0;
+        for py in 0..grid.canvas_h {
+            for px in 0..w {
+                let Some((n, k)) = view.cell_at(px as f64 + 0.5, py as f64 + 0.5) else { continue };
+                let (la, lb) = (residue_level(a.binom(n, k), 10, spectral), residue_level(b.binom(n, k), 11, spectral));
+                let c = |l: u8| pal.res[l as usize].map(|v| v as f32);
+                let want: [f32; 3] = if la < 2 || lb < 2 {
+                    std::array::from_fn(|i| c(la)[i] + (c(lb)[i] - c(la)[i]) * t)
+                } else {
+                    let l = la as f32 + (lb as f32 - la as f32) * t;
+                    let (l0, f) = (l.floor() as u8, l - l.floor());
+                    let l1 = (l0 as u16 + 1).min(255) as u8;
+                    std::array::from_fn(|i| c(l0)[i] + (c(l1)[i] - c(l0)[i]) * f)
+                };
+                let o = ((py * w + px) * 4) as usize;
+                for ch in 0..3 {
+                    assert!((mid[o + ch] as f32 - want[ch]).abs() <= 1.5, "{scheme:?} ({n},{k}) ch {ch}: {} vs {}", mid[o + ch], want[ch]);
+                }
+                checked += 1;
+            }
+        }
+        assert!(checked > 1000);
     }
 }
 
@@ -737,7 +811,7 @@ fn resolve_colors_match_palette_tables() {
 }
 
 fn tween_frame<'a>(grid: GridSpec, md: &'a Modulus, pal: &'a Palette, layers: &'a LayerState, tween: pascal::gpu::Tween) -> FrameInput<'a> {
-    FrameInput { grid, modulus: md, palette: pal, layers, advance: false, tween, style: Default::default() }
+    FrameInput { grid, modulus: md, palette: pal, layers, advance: false, tween, style: Default::default(), morph: None }
 }
 
 fn assert_rgba_close(a: &[u8], b: &[u8], tol: u8, what: &str) {
@@ -993,7 +1067,7 @@ fn offset_outlines_and_glow_match_cpu() {
             for m in [2u32, 3, 7] {
                 let md = Modulus::new(m);
                 for (si, style) in styles.into_iter().enumerate() {
-                    r.render_blocking(&FrameInput { grid, modulus: &md, palette: &pal, layers: &layers, advance: true, tween: pascal::gpu::Tween::Off, style });
+                    r.render_blocking(&FrameInput { grid, modulus: &md, palette: &pal, layers: &layers, advance: true, tween: pascal::gpu::Tween::Off, style, morph: None });
                     let (_, _, rgba) = r.read_output_rgba();
                     for py in 0..h {
                         for px in 0..w {
@@ -1022,9 +1096,9 @@ fn offset_outlines_and_glow_match_cpu() {
     let (_, grid) = cell_grid(rows);
     let pal = Palette::new(Scheme::Spectral);
     let md = Modulus::new(7);
-    r.render_blocking(&FrameInput { grid, modulus: &md, palette: &pal, layers: &layers, advance: true, tween: pascal::gpu::Tween::Off, style: CanvasStyle::default() });
+    r.render_blocking(&FrameInput { grid, modulus: &md, palette: &pal, layers: &layers, advance: true, tween: pascal::gpu::Tween::Off, style: CanvasStyle::default(), morph: None });
     let (_, _, plain) = r.read_output_rgba();
-    r.render_blocking(&FrameInput { grid, modulus: &md, palette: &pal, layers: &layers, advance: true, tween: pascal::gpu::Tween::Off, style: CanvasStyle { offset: 0.0, outlines: true, glow: true, row_limit: 0 } });
+    r.render_blocking(&FrameInput { grid, modulus: &md, palette: &pal, layers: &layers, advance: true, tween: pascal::gpu::Tween::Off, style: CanvasStyle { offset: 0.0, outlines: true, glow: true, row_limit: 0 }, morph: None });
     let (_, _, styled) = r.read_output_rgba();
     assert_eq!(plain, styled, "2 px cells: no outlines or glow");
 }
@@ -1052,7 +1126,7 @@ fn svg_colors_match_the_gpu() {
                 1 => layers.preset_mask(),
                 _ => layers.preset_valuation(),
             }
-            r.render_blocking(&FrameInput { grid, modulus: &md, palette: &pal, layers: &layers, advance: true, tween: pascal::gpu::Tween::Off, style });
+            r.render_blocking(&FrameInput { grid, modulus: &md, palette: &pal, layers: &layers, advance: true, tween: pascal::gpu::Tween::Off, style, morph: None });
             let vmax = (preset == 2).then(|| r.read_max()[0]);
             let colors = pascal::export::preset_colors(rows, &md, &pal, &layers, &style, vmax).expect("a preset");
             let (_, _, rgba) = r.read_output_rgba();
@@ -1096,7 +1170,7 @@ fn row_limit_draws_the_fitted_rows_only() {
     let md = Modulus::new(7);
     let layers = LayerState::default();
     let frame = |r: &mut Renderer, row_limit| {
-        r.render_blocking(&FrameInput { grid, modulus: &md, palette: &pal, layers: &layers, advance: true, tween: pascal::gpu::Tween::Off, style: CanvasStyle { row_limit, ..Default::default() } });
+        r.render_blocking(&FrameInput { grid, modulus: &md, palette: &pal, layers: &layers, advance: true, tween: pascal::gpu::Tween::Off, style: CanvasStyle { row_limit, ..Default::default() }, morph: None });
         r.read_output_rgba().2
     };
     let all = frame(&mut r, 0);

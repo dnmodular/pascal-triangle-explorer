@@ -52,8 +52,14 @@ struct Params {
   row_limit: u32,    // rows at or past this are not drawn (the fitted view's last row + 1; 0 = all)
   pad_f: u32,
 
+  nfactors_b: u32,   // a morph to a second whole modulus m_b (m_b = 0: no morph): its factors,
+  m_b: u32,
+  morph_t: f32,      // how far the frame is from m to m_b, 0..1
+  levels_b_off: u32, // its residue levels at levels[levels_b_off + r]
+
   dparams: array<vec4<u32>, 8>, // per-layer values derived on the CPU (LayerDef::derive / dslot)
   factors: array<Factor, 9>,
+  factors_b: array<Factor, 9>,
 };
 
 @group(0) @binding(0) var<uniform> P: Params;
@@ -118,6 +124,26 @@ fn residue_info(n: u32, k: u32, want_nu: bool) -> ResidueInfo {
     if (res.nu >= F.e) { mask = mask | (1u << f); }
   }
   return ResidueInfo(x, nu0, mask);
+}
+
+// C(n,k) mod m_b, the morph's second modulus (factors_b, the same Garner recombination).
+fn residue_b(n: u32, k: u32) -> u32 {
+  var x = 0u;
+  for (var f = 0u; f < MAX_FACTORS; f = f + 1u) {
+    if (f >= P.nfactors_b) { break; }
+    let F = P.factors_b[f];
+    let res = binom_mod_prime_power(n, k, F, false);
+    if (f == 0u) {
+      x = res.r;
+    } else {
+      let xq = x % F.q;
+      let t = res.r + F.q - xq;
+      let diff = select(t, t - F.q, t >= F.q);
+      let cc = mm(diff, F.garner_inv, F);
+      x = x + F.garner_q * cc;
+    }
+  }
+  return x;
 }
 
 // C(n,k) mod m (0 outside the triangle).

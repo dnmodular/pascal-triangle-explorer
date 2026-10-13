@@ -145,6 +145,16 @@ enum Source {
     Region { modulus: u64, n_lo: u64, n_hi: u64, x2_lo: i64, x2_hi: i64 },
 }
 
+impl Source {
+    /// The same source in another modulus.
+    fn with_modulus(self, m: u64) -> Source {
+        match self {
+            Source::Row { row, k_lo, k_hi, .. } => Source::Row { row, modulus: m, k_lo, k_hi },
+            Source::Region { n_lo, n_hi, x2_lo, x2_hi, .. } => Source::Region { modulus: m, n_lo, n_hi, x2_lo, x2_hi },
+        }
+    }
+}
+
 /// How a region was sampled: cells used, the region's (estimated) size, and the
 /// largest row / cell strides.
 #[derive(Clone, Copy, Default, Debug)]
@@ -320,6 +330,12 @@ pub struct WaveOverlay {
     is_ghost: bool,
     /// A decimal modulus μ = m/q (see [`WaveOverlay::set_scale`]); 1 for a whole one.
     q: u64,
+    /// A morph toward a second modulus (see [`WaveOverlay::set_morph`]): its value and
+    /// how far along, and the two ends' coefficients, built once per source and blended
+    /// as t moves (`reblend`).
+    morph: Option<(u64, f32)>,
+    ends: Option<(HashMap<i64, f32>, HashMap<i64, f32>)>,
+    reblend: bool,
 }
 
 /// A residue r = C mod m as the coefficient of a decimal modulus μ = m/q: C mod μ =
@@ -386,6 +402,9 @@ impl WaveOverlay {
             ghost: None,
             is_ghost: false,
             q: 1,
+            morph: None,
+            ends: None,
+            reblend: false,
         }
     }
 
@@ -522,6 +541,22 @@ impl WaveOverlay {
             self.q = q;
             self.dirty = true;
         }
+    }
+
+    /// Morph toward modulus `m_b`, t of the way (0..1): every coefficient is
+    /// (1 − t)·(its value mod m) + t·(its value mod m_b), the wave of each end weighted.
+    /// None plays the source's own modulus. A new t only reblends the two ends.
+    pub fn set_morph(&mut self, morph: Option<(u64, f32)>) {
+        match (self.morph, morph) {
+            (Some((a, ta)), Some((b, tb))) if a == b => {
+                if ta != tb {
+                    self.reblend = true;
+                }
+            }
+            (None, None) => {}
+            _ => self.dirty = true,
+        }
+        self.morph = morph;
     }
 
     /// The modulus as text: μ = m/q exactly.
@@ -929,11 +964,36 @@ impl WaveOverlay {
         }
         if self.dirty {
             self.dirty = false;
+            self.ends = None;
             if let Some(src) = self.source {
                 self.in_range = self.rebuild_target(src);
+                if let Some((mb, _)) = self.morph {
+                    // the second end, the same source in modulus m_b
+                    let a = std::mem::take(&mut self.target);
+                    let ok = self.rebuild_target(src.with_modulus(mb));
+                    self.in_range &= ok;
+                    let b = std::mem::take(&mut self.target);
+                    self.ends = Some((a, b));
+                    self.reblend = true;
+                }
             }
             self.texts_dirty = true;
             self.settled = false;
+        }
+        if std::mem::take(&mut self.reblend) {
+            if let (Some((a, b)), Some((_, t))) = (&self.ends, self.morph) {
+                self.target.clear();
+                for (&f, &v) in a {
+                    *self.target.entry(f).or_insert(0.0) += (1.0 - t) * v;
+                }
+                for (&f, &v) in b {
+                    *self.target.entry(f).or_insert(0.0) += t * v;
+                }
+                for &f in self.target.keys() {
+                    self.displayed.entry(f).or_insert(0.0);
+                }
+                self.settled = false;
+            }
         }
         if self.texts_dirty {
             self.texts_dirty = false;
@@ -1864,6 +1924,38 @@ mod tests {
         w.set_source(5, 21, (0, 5));
         w.update(1.0 / 60.0);
         assert_eq!(w.target(5 - 2), 5.0, "C(5,1) mod 21");
+    }
+
+
+    #[test]
+    fn morphs_blend_the_two_ends_waves() {
+        // rows 0–9, mod 10 → mod 11, 30% of the way: (1 − t)·wave mod 10 + t·wave mod 11
+        let (mut a, mut b) = (overlay(), overlay());
+        a.set_rows(10, 0, 9);
+        b.set_rows(11, 0, 9);
+        a.update(1.0 / 60.0);
+        b.update(1.0 / 60.0);
+        let mut w = overlay();
+        w.set_rows(10, 0, 9);
+        w.set_morph(Some((11, 0.3)));
+        w.update(1.0 / 60.0);
+        for f in -9..=9i64 {
+            let want = 0.7 * a.target(f) + 0.3 * b.target(f);
+            assert!((w.target(f) - want).abs() < 1e-4, "f = {f}");
+        }
+        // a new t reblends the cached ends (no rebuild); the ends are exact
+        w.set_morph(Some((11, 1.0)));
+        assert!(!w.dirty && w.reblend);
+        w.update(1.0 / 60.0);
+        for f in -9..=9i64 {
+            assert!((w.target(f) - b.target(f)).abs() < 1e-4);
+        }
+        // mod 1 at one end: every residue 0, so t = 0 is a flat wave
+        let mut z = overlay();
+        z.set_rows(1, 0, 9);
+        z.set_morph(Some((2, 0.0)));
+        z.update(1.0 / 60.0);
+        assert!((-9..=9).all(|f| z.target(f) == 0.0));
     }
 
 }

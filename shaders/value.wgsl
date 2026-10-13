@@ -22,6 +22,10 @@ fn value_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   var x = r.x;
   if (P.qscale > 1u) { x = mulmod20(r.x, P.qscale, P.m); }
   cells[idx] = vec2<u32>(x, CELL_VALID | (r.mask << 8u) | min(r.nu0, 255u));
+  // a morph: the second modulus's residue, in the buffer's second half
+  if (P.m_b != 0u) {
+    cells[P.grid_w * P.grid_h + idx] = vec2<u32>(residue_b(c.n, c.k), 0u);
+  }
 }
 
 // a·b mod m for a, b < m ≤ 2^20 in 32-bit steps: b split into 10-bit halves, every

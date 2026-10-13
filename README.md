@@ -539,6 +539,20 @@ while the modulus or the mode changes:
   and jump from step to step (10.25 = 41/4 shows mod 41's), and a cell's residue
   turns by about C·10⁻ᵈ/μ² a step, so the top rows glide smoothly while deeper rows,
   where C is huge, turn over every step. The tetra stack keeps whole moduli.
+* **Morph** (beside decimals): the decimal steps drawn as a true tween instead. At
+  μ = m + t·(m′ − m), between the visited moduli m and m′, each cell's color slides
+  along the palette ramp from its color mod m to its color mod m′, through the colors
+  between (a cell that is a zero, or spectral's white 1, at either end fades), and
+  the wave overlay blends the two ends' waves, (1 − t)·w_m + t·w_m′. The ends are
+  exactly mod m and mod m′, and every frame between is a frame of its own, to stop
+  on, play or export (`--m 10.3 --morph`); unlike *tween*, which only dissolves on
+  screen. The GPU computes both residues per cell (the second modulus's tables follow
+  the first's; its residues fill the cell buffer's second half); the layer measures
+  read the lower modulus.
+* **Mod 1** and the decimals above it: moduli start at 1, where every residue is 0
+  (the canvas is all zeros). Decimals from there reach 1.25 = 5/4 (zeros where 5
+  divides C), 1.5 = 3/2 (residues 0, ½ and 1), …; a morph from 1 to 2 grows the
+  Sierpinski triangle out of nothing.
 * **Tween (ms):** a display-only transition. When consecutive frames run the same
   field pipeline on the same view, the field morphs (smoothstep lerp, as in the
   reference); otherwise the picture cross-dissolves. The resolve pass still writes

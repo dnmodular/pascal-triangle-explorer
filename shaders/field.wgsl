@@ -251,6 +251,8 @@ fn sample_color(px: f32, py: f32) -> vec3<f32> {
     var f = fa[idx];
     if ((PP.flag & 1u) != 0u) { f = mix(fc[idx], fa[idx], PP.f0); }
     col = ft_resolve_color(f);
+  } else if (P.m_b != 0u) {
+    col = morph_color(c.x, cells[P.grid_w * P.grid_h + idx].x);
   } else if (P.value_style == 1u) {
     col = select(BG_COLOR, LIGHT_COLOR, c.x != 0u);
   } else {
@@ -260,6 +262,28 @@ fn sample_color(px: f32, py: f32) -> vec3<f32> {
     col = decorate(col, px, py, t);
   }
   return col;
+}
+
+// A morph from m to m_b, t = morph_t of the way: a cell whose residue is colored on the
+// ramp at both ends slides along the ramp between its two colors (through the colors
+// in between: the analog part), and one that is a zero (or spectral's white 1) at
+// either end fades between the two colors. The zero / nonzero mask fades.
+fn morph_color(ra: u32, rb: u32) -> vec3<f32> {
+  let t = P.morph_t;
+  if (P.value_style == 1u) {
+    return mix(select(BG_COLOR, LIGHT_COLOR, ra != 0u), select(BG_COLOR, LIGHT_COLOR, rb != 0u), t);
+  }
+  let la = shift_level(level_of(ra));
+  let lb = shift_level(level_of(P.levels_b_off + rb));
+  let ca = unpack_rgb(palette[la]);
+  let cb = unpack_rgb(palette[lb]);
+  if (la < 2u || lb < 2u) {
+    return mix(ca, cb, t);
+  }
+  let l = mix(f32(la), f32(lb), t);
+  let l0 = u32(floor(l));
+  let l1 = min(l0 + 1u, 255u);
+  return mix(unpack_rgb(palette[l0]), unpack_rgb(palette[l1]), l - f32(l0));
 }
 
 // ---------------------------------------------------------------------------

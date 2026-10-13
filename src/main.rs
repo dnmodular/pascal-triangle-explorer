@@ -76,6 +76,9 @@ struct Model {
     /// μ = m + sub·10⁻ᵈ (d = the sweep's decimals; sub = 0 for a whole modulus).
     m: u32,
     sub: u64,
+    /// A morph's second end: the next visited whole modulus and how far μ is from m to
+    /// it (the sweep's morph mode, between two whole moduli).
+    morph: Option<(Arc<Modulus>, f32)>,
     /// μ's closed form: the whole m, or the decimal μ = P/Q (see `Modulus::decimal`).
     /// Shared with the wave overlay, which reads long rows through the same closed form.
     modulus: Arc<Modulus>,
@@ -144,6 +147,7 @@ impl Model {
         Model {
             m,
             sub: 0,
+            morph: None,
             modulus: Arc::new(Modulus::new(m)),
             m_text: m.to_string(),
             scheme: Scheme::Spectral,
@@ -197,20 +201,52 @@ impl Model {
     /// Go to μ = m + sub·10⁻ᵈ; with `follow`, linked rows follow it. A μ whose
     /// numerator would pass MOD_CAP falls back to the whole m.
     fn set_pos(&mut self, m: u32, sub: u64, follow: bool) {
-        let m = m.clamp(2, MOD_CAP);
+        let m = m.clamp(1, MOD_CAP);
         let d = self.sweep.decimals;
         let sub = if d == 0 { 0 } else { sub };
-        let changed = (m, sub) != (self.m, self.sub) || (sub == 0 && self.modulus.is_decimal());
+        let morphing = self.sweep.morph && sub > 0;
+        let changed = (m, sub) != (self.m, self.sub) || (sub == 0 && (self.modulus.is_decimal() || self.morph.is_some())) || (sub > 0 && morphing != self.morph.is_some());
         if changed {
             self.m = m;
             self.sub = sub;
-            let md = if sub == 0 { None } else { Modulus::from_decimal(m, sub, d, MOD_CAP) };
-            self.modulus = Arc::new(md.unwrap_or_else(|| Modulus::new(m)));
+            if morphing {
+                // from the whole m to the next visited modulus, t of the way
+                let gap = self.sweep.gap_after(m);
+                let t = sub as f64 / (gap as u64 * self.sweep.fine_units()) as f64;
+                self.morph = Some((Arc::new(Modulus::new((m + gap).min(MOD_CAP))), t as f32));
+                if self.modulus.m != m || self.modulus.is_decimal() {
+                    self.modulus = Arc::new(Modulus::new(m));
+                }
+            } else {
+                self.morph = None;
+                let md = if sub == 0 { None } else { Modulus::from_decimal(m, sub, d, MOD_CAP) };
+                self.modulus = Arc::new(md.unwrap_or_else(|| Modulus::new(m)));
+            }
         }
-        self.m_text = self.modulus.label();
+        self.m_text = self.mu_text();
         if changed && follow {
             self.apply_link();
         }
+    }
+
+    /// μ as text: the decimal modulus exactly, or a morph's position m + sub·10⁻ᵈ.
+    fn mu_text(&self) -> String {
+        if self.morph.is_some() {
+            let u = self.sweep.fine_units();
+            math::decimal_text(self.m as u64 * u + self.sub, u)
+        } else {
+            self.modulus.label()
+        }
+    }
+
+    /// μ's value (the decimal modulus, or a morph's position).
+    fn mu(&self) -> f64 {
+        self.m as f64 + self.sub as f64 / self.sweep.fine_units() as f64
+    }
+
+    /// What the frame morphs to, for the renderer.
+    fn morph_target(&self) -> Option<(&Modulus, f32)> {
+        self.morph.as_ref().map(|(b, t)| (&**b, *t))
     }
 
     /// A typed modulus, maybe decimal ("10.37"): the whole part snaps to the selection
@@ -256,7 +292,7 @@ impl Model {
 
     /// The row count the link gives for the current modulus.
     fn linked_rows(&self) -> f64 {
-        (self.modulus.mu() * self.link_factor).round().clamp(2.0, 1.0e9)
+        (self.mu() * self.link_factor).round().clamp(2.0, 1.0e9)
     }
 
     /// With rows linked, set them from the modulus and refit. A view the user zoomed
@@ -402,11 +438,21 @@ impl Model {
                 lines.push(format!("C(n,k) ≈ {:.2}e{}", 10f64.powf(lg - e), e as i64));
             }
         }
+        if let Some((b, t)) = &self.morph {
+            let (ra, rb) = (md.binom(n, k), b.binom(n, k));
+            lines.push(format!("μ = {}: a morph {:.0}% of the way from mod {} to mod {}", self.mu_text(), t * 100.0, md.m, b.m));
+            lines.push(format!("C mod {} = {ra}   →   C mod {} = {rb}", md.m, b.m));
+            return lines.join("\n");
+        }
         if md.is_decimal() {
             // μ = P/Q: C mod μ = (Q·C mod P)/Q, exact; μ divides C exactly when P does
             let s = md.scaled(n, k);
             lines.push(format!("C mod {} = {}{}", md.label(), math::decimal_text(s as u64, md.q as u64), if s == 0 { "   μ divides C" } else { "" }));
             lines.push(format!("μ = {}/{}: C mod μ = ({}·C mod {})/{}", md.m, md.q, md.q, md.m, md.q));
+            return lines.join("\n");
+        }
+        if md.is_one() {
+            lines.push("C mod 1 = 0   (1 divides everything)".into());
             return lines.join("\n");
         }
         let r = md.binom(n, k);
@@ -445,7 +491,7 @@ struct Gfx {
 
 /// Everything that changes what the GPU renders: modulus, palette, style, layers, camera,
 /// supersampling and canvas size.
-type FrameKey = ((u32, u32), Scheme, CanvasStyle, LayerState, View, u32, (u32, u32));
+type FrameKey = ((u32, u32, (u32, u32)), Scheme, CanvasStyle, LayerState, View, u32, (u32, u32));
 
 struct App {
     gfx: Option<Gfx>,
@@ -478,7 +524,8 @@ struct App {
 }
 
 const USAGE: &str = "pascal-triangle-explorer [options]
-  --m N              modulus (whole, or decimal like 10.5) (default 7)
+  --m N              modulus (whole, or decimal like 10.5; 1 and up) (default 7)
+  --morph            draw a decimal --m as a morph between the whole moduli around it
   --rows R           rows to fit (default 128)
   --palette NAME     spectral | viridis | magma | inferno | turbo | cividis | coolwarm | mono
                      | ember | ocean | moss
@@ -503,16 +550,17 @@ fn main() {
     let mut export: Option<PathBuf> = None;
     let mut svg: Option<PathBuf> = None;
     let mut size = (1600u32, 1000u32);
+    let mut m_text: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         let next = || args.get(i + 1).cloned().unwrap_or_default();
         match args[i].as_str() {
-            "--m" => {
-                // a whole or decimal modulus ("10.5")
-                let text = next();
-                if !model.goto_text(&text) {
-                    model.set_m(7);
-                }
+            // a whole or decimal modulus ("10.5"), applied once every flag is read
+            "--m" => m_text = Some(next()),
+            "--morph" => {
+                model.sweep.morph = true;
+                i += 1;
+                continue;
             }
             "--rows" => model.fit_rows = next().parse::<f64>().unwrap_or(128.0).max(2.0),
             "--palette" => {
@@ -585,6 +633,11 @@ fn main() {
             }
         }
         i += 2;
+    }
+    if let Some(text) = m_text {
+        if !model.goto_text(&text) {
+            model.set_m(7);
+        }
     }
     model.apply_link();
     if let Some(path) = svg {
@@ -692,7 +745,7 @@ fn headless_export(mut model: Model, size: (u32, u32), path: &std::path::Path) {
     let mut renderer = Renderer::new(gpu.device.clone(), gpu.queue.clone());
     model.fit(size.0 as f64, size.1 as f64);
     let grid = GridSpec::new(&model.view, size.0, size.1, model.ss, renderer.max_texels());
-    renderer.render_blocking(&FrameInput { grid, modulus: &model.modulus, palette: &model.palette, layers: &model.layers, advance: true, tween: Tween::Off, style: model.style });
+    renderer.render_blocking(&FrameInput { grid, modulus: &model.modulus, palette: &model.palette, layers: &model.layers, advance: true, tween: Tween::Off, style: model.style, morph: model.morph_target() });
     let (w, h, rgba) = renderer.read_output_rgba();
     match export::write_png(path, w, h, &rgba) {
         Ok(()) => eprintln!("wrote {}×{} px to {}", w, h, path.display()),
@@ -937,7 +990,7 @@ impl App {
         let grid = GridSpec::new(&model.view, canvas_px.0, canvas_px.1, model.ss, gfx.renderer.max_texels());
         // a fitted view draws its rows only
         model.style.row_limit = if model.auto_fit { model.fit_rows.round().clamp(1.0, u32::MAX as f64) as u32 } else { 0 };
-        let inputs = ((model.modulus.m, model.modulus.q), model.scheme, model.style, model.layers.clone(), model.view, model.ss, canvas_px);
+        let inputs = ((model.modulus.m, model.modulus.q, model.morph.as_ref().map_or((0, 0), |(b, t)| (b.m, t.to_bits()))), model.scheme, model.style, model.layers.clone(), model.view, model.ss, canvas_px);
         let changed = self.last_inputs.as_ref() != Some(&inputs);
         // a new color offset alone recolors the same frame: the history layers (temporal
         // AVERAGE, AFTERIMAGE) must not count it as a new one
@@ -974,7 +1027,7 @@ impl App {
             }
         }
         if render_canvas {
-            gfx.renderer.render(&mut encoder, &FrameInput { grid, modulus: &model.modulus, palette: &model.palette, layers: &model.layers, advance, tween, style: model.style });
+            gfx.renderer.render(&mut encoder, &FrameInput { grid, modulus: &model.modulus, palette: &model.palette, layers: &model.layers, advance, tween, style: model.style, morph: model.morph_target() });
             gfx.renderer.flush_pass_params();
         }
         // After a change, render once more without advancing: the history layers
@@ -1024,7 +1077,7 @@ impl App {
         if model.pending_export {
             model.pending_export = false;
             // Render the true frame (no tween) with the same pipeline, then read it back.
-            gfx.renderer.render_blocking(&FrameInput { grid, modulus: &model.modulus, palette: &model.palette, layers: &model.layers, advance: false, tween: Tween::Off, style: model.style });
+            gfx.renderer.render_blocking(&FrameInput { grid, modulus: &model.modulus, palette: &model.palette, layers: &model.layers, advance: false, tween: Tween::Off, style: model.style, morph: model.morph_target() });
             self.tween_t0 = None;
             let (w, h, rgba) = gfx.renderer.read_output_rgba();
             let rows = model.shown_rows(h as f64).unwrap_or((0, 0));
@@ -1146,7 +1199,7 @@ fn panel_ui(ui: &mut egui::Ui, model: &mut Model, canvas_px: (u32, u32), _frame_
         });
         let mut m = model.m;
         ui.spacing_mut().slider_width = ui.available_width() - 8.0;
-        let slider = ui.add(egui::Slider::new(&mut m, 2..=MOD_CAP).logarithmic(true).show_value(false));
+        let slider = ui.add(egui::Slider::new(&mut m, 1..=MOD_CAP).logarithmic(true).show_value(false));
         if slider.drag_started() {
             model.sweep.playing = false;
         }
@@ -1155,8 +1208,12 @@ fn panel_ui(ui: &mut egui::Ui, model: &mut Model, canvas_px: (u32, u32), _frame_
         }
         let fs = &model.modulus.factors.iter().map(|t| t.f).collect::<Vec<_>>();
         let md = &model.modulus;
-        let info = if md.is_decimal() {
+        let info = if let Some((b, t)) = &model.morph {
+            format!("μ = {}: morph {} → {}, {:.0}%", model.mu_text(), model.m, b.m, t * 100.0)
+        } else if md.is_decimal() {
             format!("μ = {} = {}/{}", md.label(), md.m, md.q)
+        } else if md.is_one() {
+            "mod 1: every residue is 0".to_string()
         } else if md.is_prime() {
             format!("{} is prime", model.m)
         } else {
@@ -1582,7 +1639,7 @@ fn bar_sep(ui: &mut egui::Ui) {
 fn sweep_bar(ui: &mut egui::Ui, model: &mut Model) {
     let sw = &mut model.sweep;
     let mut action: Option<i32> = None; // Some(0) = jump to start, Some(n) = step n frames
-    let before = (sw.mode, sw.prime_order, sw.seq, sw.step, sw.knobs(), sw.start, sw.decimals);
+    let before = (sw.mode, sw.prime_order, sw.seq, sw.step, sw.knobs(), sw.start, sw.decimals, sw.morph);
     ui.spacing_mut().item_spacing = Vec2::new(4.0, 6.0);
 
     // ---- row 1: transport · selection mode · mode options · range ----
@@ -1637,9 +1694,9 @@ fn sweep_bar(ui: &mut egui::Ui, model: &mut Model) {
         });
         bar_sep(ui);
         bar_label(ui, "range");
-        bar_drag(ui, 70.0, &mut sw.start, 2..=MOD_CAP, 1.0);
+        bar_drag(ui, 70.0, &mut sw.start, 1..=MOD_CAP, 1.0);
         bar_label(ui, "to");
-        bar_drag(ui, 70.0, &mut sw.end, 2..=MOD_CAP, 1.0);
+        bar_drag(ui, 70.0, &mut sw.end, 1..=MOD_CAP, 1.0);
     });
 
     // ---- row 2: frame speed · loop · tween · what the range visits ----
@@ -1664,6 +1721,7 @@ fn sweep_bar(ui: &mut egui::Ui, model: &mut Model) {
             "Steps between the visited moduli: with d decimals each step moves μ by 10⁻ᵈ through the gap to the next one, an analog glide from modulus to modulus (C mod μ = C − μ⌊C/μ⌋, exact at any row). Shallow rows slide smoothly; deeper ones turn faster, about C(n,k)·10⁻ᵈ/μ² a step. 0 = whole moduli. At most {max} here: μ·10ᵈ must stay within {}.",
             group(MOD_CAP as u64)
         ));
+        ui.checkbox(&mut sw.morph, "morph").on_hover_text("How the decimal steps between two visited moduli are drawn. Off: the exact real residue C mod μ (zeros jump with μ's numerator, deep rows turn over every step). On: a morph from the lower modulus to the next, each cell's color sliding along the palette from its color mod m to its color mod m′ (through the colors between), zeros fading in and out, the wave blended the same way: every in-between frame is its own, to stop on, play or export.");
         bar_sep(ui);
         let preview = sw.preview(8);
         let frames = sw.frames_in_range(100_000);
@@ -1675,7 +1733,7 @@ fn sweep_bar(ui: &mut egui::Ui, model: &mut Model) {
         mono_line(ui, &text);
     });
 
-    let changed = before != (sw.mode, sw.prime_order, sw.seq, sw.step, sw.knobs(), sw.start, sw.decimals);
+    let changed = before != (sw.mode, sw.prime_order, sw.seq, sw.step, sw.knobs(), sw.start, sw.decimals, sw.morph);
     match action {
         Some(0) => {
             let (lo, hi) = model.sweep.bounds();
@@ -1942,7 +2000,13 @@ fn canvas_overlays(ui: &mut egui::Ui, model: &mut Model, rect: Rect, ppp: f32, h
 /// The status bar under the canvas: modulus, the rows and cells in view, timings.
 fn status_bar(ui: &mut egui::Ui, model: &Model, gpu_ms: Option<f32>, frame_ms: f32) {
     let (cw, ch) = model.canvas;
-    let mut parts = vec![if model.modulus.is_decimal() { format!("μ = {}", model.modulus.label()) } else { format!("m = {}", model.m) }];
+    let mut parts = vec![if model.morph.is_some() {
+        format!("μ = {} (morph)", model.mu_text())
+    } else if model.modulus.is_decimal() {
+        format!("μ = {}", model.modulus.label())
+    } else {
+        format!("m = {}", model.m)
+    }];
     if let Some((a, b)) = model.shown_rows(ch) {
         parts.push(format!("rows {}–{}", group(a as u64), group(b as u64)));
     }
@@ -1980,6 +2044,7 @@ fn wave_overlay(ui: &mut egui::Ui, model: &mut Model, rect: Rect, ppp: f32, dt: 
         model.wave.set_ghost(model.ghost.source());
         // (the modulus given is μ's numerator; a decimal μ = P/Q scales by Q)
         model.wave.set_scale(model.modulus.q as u64);
+        model.wave.set_morph(model.morph.as_ref().map(|(b, t)| (b.m as u64, *t)));
         if let WaveSelect::Active(a, b) = model.wave_select {
             // (whole rows for now: the marked cells pick the rows, every cell of them counts)
             model.wave.set_rows(model.modulus.m as u64, a.0 as u64, b.0 as u64);
@@ -2326,6 +2391,58 @@ mod tests {
         let t0 = std::time::Instant::now();
         assert!(md.play_tick(t0));
         assert_eq!(md.m_text, "17.1");
+    }
+
+    #[test]
+    fn morphs_run_between_the_whole_moduli() {
+        let mut md = Model::new();
+        md.sweep.morph = true;
+        md.sweep.decimals = 1;
+        md.set_m(10);
+        md.step(3);
+        let (b, t) = md.morph.clone().expect("a morph");
+        assert_eq!((md.m_text.as_str(), md.modulus.m, md.modulus.q, b.m), ("10.3", 10, 1, 11));
+        assert!((t - 0.3).abs() < 1e-6);
+        assert!(md.inspector_text(5, 2).contains("C mod 10 = 0   →   C mod 11 = 10"));
+        md.step(7);
+        assert!(md.morph.is_none(), "it lands on 11");
+        assert_eq!(md.m_text, "11");
+        // primes: 7.5 is a quarter of the way from 7 to 11
+        md.sweep.mode = ModMode::Prime;
+        md.set_m(7);
+        md.step(10);
+        let (b, t) = md.morph.clone().unwrap();
+        assert_eq!((b.m, md.m_text.as_str()), (11, "8"));
+        assert!((t - 0.25).abs() < 1e-6);
+        // switching the mode off draws the exact decimal again
+        md.sweep.morph = false;
+        md.set_pos(7, 5, true);
+        assert!(md.morph.is_none() && md.modulus.is_decimal());
+    }
+
+    #[test]
+    fn mod_one_and_its_decimals() {
+        let mut md = Model::new();
+        md.set_m(1);
+        assert_eq!((md.m, md.modulus.binom(9, 4), md.m_text.as_str()), (1, 0, "1"));
+        assert!(md.inspector_text(9, 4).contains("C mod 1 = 0"));
+        // 1.5 = 3/2: C mod 1.5 is 0, 0.5 or 1
+        assert!(md.goto_text("1.5"));
+        assert_eq!((md.modulus.m, md.modulus.q), (3, 2));
+        for n in 0..30 {
+            for k in 0..=n {
+                let r = md.modulus.residue(n, k);
+                assert!([0.0, 0.5, 1.0].contains(&r), "C({n},{k}) mod 1.5 = {r}");
+            }
+        }
+        assert!(md.goto_text("1.25") && md.m_text == "1.25");
+        // a morph from mod 1 (all zeros) to mod 2
+        md.sweep.morph = true;
+        md.sweep.decimals = 1;
+        md.set_m(1);
+        md.step(5);
+        assert_eq!(md.morph.as_ref().map(|(b, _)| b.m), Some(2));
+        assert!(md.modulus.is_one());
     }
 
     #[test]
