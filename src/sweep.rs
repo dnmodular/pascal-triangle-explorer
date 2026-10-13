@@ -134,10 +134,14 @@ pub enum ModMode {
     Even,
     Odd,
     Interval,
+    /// Fractions P/Q with a prime numerator (see [`SuperPrimes`]); the 2D sweep only.
+    SuperPrime,
 }
 
 impl ModMode {
-    pub const ALL: [ModMode; 6] = [ModMode::All, ModMode::Prime, ModMode::Composite, ModMode::Even, ModMode::Odd, ModMode::Interval];
+    pub const ALL: [ModMode; 7] = [ModMode::All, ModMode::Prime, ModMode::Composite, ModMode::Even, ModMode::Odd, ModMode::Interval, ModMode::SuperPrime];
+    /// The modes over whole moduli (the tetra stack's).
+    pub const WHOLE: [ModMode; 6] = [ModMode::All, ModMode::Prime, ModMode::Composite, ModMode::Even, ModMode::Odd, ModMode::Interval];
     pub fn label(self) -> &'static str {
         match self {
             ModMode::All => "all",
@@ -146,6 +150,7 @@ impl ModMode {
             ModMode::Even => "even",
             ModMode::Odd => "odd",
             ModMode::Interval => "interval",
+            ModMode::SuperPrime => "super primes",
         }
     }
     pub fn note(self) -> &'static str {
@@ -156,6 +161,7 @@ impl ModMode {
             ModMode::Even => "Even moduli only; every frame keeps the mod-2 Sierpinski skeleton.",
             ModMode::Odd => "Odd moduli only. Steps skip by 2.",
             ModMode::Interval => "Walks a sequence of moduli from the range start: fixed steps, or the increment and landing sequences below.",
+            ModMode::SuperPrime => "Fractions μ = P/Q in the range whose numerator P is prime (lowest terms): 37/5 = 7.4, 59/8 = 7.375, … C mod μ = (Q·C mod P)/Q, so μ divides C exactly when P does: the picture has prime P's clean Lucas structure (blocks of P rows), the denominator only reshuffling its colors. Denominators: the decimal ones of the decimals setting (Q dividing 10ᵈ), or every Q up to a bound. Ordered by value (the number line) or by numerator (each prime with its cousins P/Q, all to its left, smallest P, the strongest structure, first).",
         }
     }
 }
@@ -503,6 +509,9 @@ pub struct Sweep {
     /// C mod μ (false), or a morph from the lower whole modulus to the next one, each
     /// cell's color sliding between its two residues' colors (true).
     pub morph: bool,
+    /// The super-prime walk's settings (mode SuperPrime).
+    pub super_primes: SuperPrimes,
+    sp_cache: Option<(SpKey, Vec<(u32, u32)>)>,
     /// Cached walk lists, rebuilt when the mode parameters change.
     cache: Option<(PoolKey, Vec<u32>)>,
 }
@@ -524,9 +533,85 @@ impl Default for Sweep {
             tween_ms: 0,
             decimals: 0,
             morph: false,
+            super_primes: SuperPrimes::default(),
+            sp_cache: None,
             cache: None,
         }
     }
+}
+
+/// Which denominators the super-prime walk takes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum SpDenoms {
+    /// Q dividing 10ᵈ (d = the decimals setting, at least 1): the decimal fractions.
+    Decimal,
+    /// Every Q up to `qmax`.
+    Any,
+}
+
+/// How the super-prime walk is ordered.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum SpOrder {
+    /// By value: the number line.
+    Value,
+    /// By numerator, then denominator: each prime P with its cousins P/Q.
+    Numerator,
+}
+
+impl SpOrder {
+    pub const ALL: [SpOrder; 2] = [SpOrder::Value, SpOrder::Numerator];
+    pub fn label(self) -> &'static str {
+        match self {
+            SpOrder::Value => "by value",
+            SpOrder::Numerator => "by numerator",
+        }
+    }
+}
+
+/// The super-prime walk: fractions μ = P/Q in lowest terms with P prime, in the range.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SuperPrimes {
+    pub denoms: SpDenoms,
+    /// Largest denominator for [`SpDenoms::Any`].
+    pub qmax: u32,
+    pub order: SpOrder,
+}
+
+impl Default for SuperPrimes {
+    fn default() -> Self {
+        SuperPrimes { denoms: SpDenoms::Decimal, qmax: 12, order: SpOrder::Value }
+    }
+}
+
+/// Most fractions one super-prime walk lists.
+pub const SP_MAX: usize = 200_000;
+
+/// What a super-prime walk is built from: range, settings, decimals.
+type SpKey = (u32, u32, SuperPrimes, u32);
+
+/// The super primes P/Q with lo ≤ P/Q ≤ hi, P prime and P ≤ MOD_CAP, P not dividing Q
+/// (so the fraction is in lowest terms), for each denominator Q of `denoms`, ordered.
+pub fn super_primes(lo: u32, hi: u32, denoms: &[u32], order: SpOrder) -> Vec<(u32, u32)> {
+    let pr = &prime_tables().primes;
+    let mut out = Vec::new();
+    for &q in denoms {
+        let (a, b) = (lo as u64 * q as u64, (hi as u64 * q as u64).min(MOD_CAP as u64));
+        let i0 = pr.partition_point(|&p| (p as u64) < a);
+        for &p in &pr[i0..] {
+            if p as u64 > b || out.len() >= SP_MAX {
+                break;
+            }
+            if q % p != 0 {
+                out.push((p, q));
+            }
+        }
+    }
+    match order {
+        // P/Q against P'/Q' without division: P·Q' vs P'·Q
+        SpOrder::Value => out.sort_by(|x, y| (x.0 as u64 * y.1 as u64).cmp(&(y.0 as u64 * x.1 as u64)).then(x.1.cmp(&y.1))),
+        SpOrder::Numerator => out.sort(),
+    }
+    out
 }
 
 /// What a walk list is built from: mode, prime order, sequence, step, knobs, anchor.
@@ -606,6 +691,75 @@ impl Sweep {
         self.cache.as_ref().map(|c| c.1.as_slice())
     }
 
+
+    /// The super-prime walk for the range and settings (cached).
+    pub fn super_list(&mut self) -> &[(u32, u32)] {
+        let (lo, hi) = {
+            let (mut a, mut b) = (clamp_mod(self.start as i64), clamp_mod(self.end as i64));
+            if a > b {
+                std::mem::swap(&mut a, &mut b);
+            }
+            (a, b)
+        };
+        let d = self.decimals.clamp(1, MAX_DECIMALS);
+        let key: SpKey = (lo, hi, self.super_primes, d);
+        if self.sp_cache.as_ref().is_none_or(|(k, _)| *k != key) {
+            let sp = self.super_primes;
+            let denoms: Vec<u32> = match sp.denoms {
+                // the divisors of 10ᵈ: 2^i·5^j, i, j ≤ d
+                SpDenoms::Decimal => {
+                    let mut v: Vec<u32> = (0..=d).flat_map(|i| (0..=d).map(move |j| 2u32.pow(i) * 5u32.pow(j))).collect();
+                    v.sort_unstable();
+                    v
+                }
+                SpDenoms::Any => (1..=sp.qmax.clamp(1, 10_000)).collect(),
+            };
+            self.sp_cache = Some((key, super_primes(lo, hi, &denoms, sp.order)));
+        }
+        &self.sp_cache.as_ref().expect("built").1
+    }
+
+    /// The super prime at or nearest μ = p/q (by value; in numerator order the same
+    /// fraction if listed, else the nearest by value).
+    pub fn super_nearest(&mut self, p: u32, q: u32) -> Option<usize> {
+        let list = self.super_list();
+        if list.is_empty() {
+            return None;
+        }
+        if let Some(i) = list.iter().position(|&x| x == (p, q)) {
+            return Some(i);
+        }
+        let mu = p as f64 / q as f64;
+        list.iter().enumerate().min_by(|a, b| {
+            let da = (a.1 .0 as f64 / a.1 .1 as f64 - mu).abs();
+            let db = (b.1 .0 as f64 / b.1 .1 as f64 - mu).abs();
+            da.total_cmp(&db)
+        }).map(|(i, _)| i)
+    }
+
+    /// One frame of super-prime playback from index `i`: the next in the play
+    /// direction, looping or stopping at the ends.
+    pub fn super_tick(&mut self, i: usize) -> usize {
+        let n = self.super_list().len();
+        if n == 0 {
+            return 0;
+        }
+        let next = i as i64 + self.dir as i64;
+        if next < 0 || next >= n as i64 {
+            if self.looping {
+                return if self.dir > 0 { 0 } else { n - 1 };
+            }
+            self.playing = false;
+            return i.min(n - 1);
+        }
+        next as usize
+    }
+
+    /// `k` super-prime steps from index `i` (clamped to the walk).
+    pub fn super_step(&mut self, i: usize, k: i32) -> usize {
+        let n = self.super_list().len();
+        (i as i64 + k as i64).clamp(0, n.saturating_sub(1) as i64) as usize
+    }
 
     /// 10^decimals: the sub-steps per unit of modulus.
     pub fn fine_units(&self) -> u64 {
@@ -775,7 +929,7 @@ impl Sweep {
                 v.clamp(4, MOD_CAP as i64) as u32
             }
             ModMode::Interval => clamp_mod(cur as i64 + dir as i64 * step),
-            ModMode::All => clamp_mod(cur as i64 + dir as i64),
+            ModMode::All | ModMode::SuperPrime => clamp_mod(cur as i64 + dir as i64),
             _ => clamp_mod(cur as i64 + dir as i64 * 2),
         }
     }
@@ -1029,6 +1183,42 @@ mod tests {
         assert_eq!(s.max_decimals(), 3);
         s.end = 50_000;
         assert_eq!(s.max_decimals(), 1);
+    }
+
+
+    #[test]
+    fn super_primes_are_prime_numerator_fractions() {
+        // around 7, decimals: 7, 29/4 = 7.25, 59/8 = 7.375, 37/5 = 7.4, … and the user's
+        // list is in it (7.3 = 73/10, 7.39 = 739/100, 7.388 = 1847/250, …)
+        let mut s = Sweep { mode: ModMode::SuperPrime, start: 7, end: 8, decimals: 3, ..Default::default() };
+        let list = s.super_list().to_vec();
+        for f in [(7, 1), (37, 5), (59, 8), (73, 10), (739, 100), (1847, 250), (3697, 500), (7393, 1000), (29, 4)] {
+            assert!(list.contains(&f), "{f:?}");
+        }
+        assert!(list.iter().all(|&(p, q)| prime_tables().is_prime(p) && q % p != 0 && p >= 7 * q && p <= 8 * q));
+        // by value: ascending, starting 7, 29/4 before 59/8 before 37/5
+        assert_eq!(list[0], (7, 1));
+        assert!(list.windows(2).all(|w| (w[0].0 as u64 * w[1].1 as u64) <= (w[1].0 as u64 * w[0].1 as u64)));
+        let pos = |f| list.iter().position(|&x| x == f).unwrap();
+        assert!(pos((29, 4)) < pos((59, 8)) && pos((59, 8)) < pos((37, 5)));
+        // by numerator: the smallest numerators first
+        s.super_primes.order = SpOrder::Numerator;
+        let by_p = s.super_list().to_vec();
+        assert_eq!(&by_p[..4], &[(7, 1), (29, 4), (31, 4), (37, 5)]);
+        // any denominator: 22/3 is out (22 is not prime), 23/3 in, 37/5 still in
+        s.super_primes = SuperPrimes { denoms: SpDenoms::Any, qmax: 6, order: SpOrder::Value };
+        let any = s.super_list().to_vec();
+        assert!(any.contains(&(23, 3)) && any.contains(&(37, 5)) && any.contains(&(43, 6)) && !any.contains(&(59, 8)));
+        // the cousins of 37 lie to its left: 37/2, 37/4, 37/5, …
+        let mut c = Sweep { mode: ModMode::SuperPrime, start: 1, end: 40, decimals: 1, ..Default::default() };
+        c.super_primes.order = SpOrder::Numerator;
+        let l = c.super_list().to_vec();
+        let cousins: Vec<(u32, u32)> = l.iter().copied().filter(|f| f.0 == 37).collect();
+        assert_eq!(cousins, vec![(37, 1), (37, 2), (37, 5), (37, 10)]);
+        // stepping and the nearest fraction
+        assert_eq!(s.super_nearest(37, 5).map(|i| s.super_list()[i]), Some((37, 5)));
+        let i = s.super_nearest(74, 10).unwrap();
+        assert_eq!(s.super_list()[i], (37, 5), "7.4 itself is 37/5");
     }
 
 }

@@ -145,6 +145,24 @@ fn decimal_moduli_match_the_exact_rational_residue() {
             }
         }
     }
+    // fractions with any denominator (super primes 23/3, 43/6; 22/7): exact too
+    for (p, q) in [(23u32, 3u32), (43, 6), (22, 7)] {
+        let md = Modulus::decimal(p, q);
+        r.render_blocking(&frame(grid, &md, &pal, &layers));
+        let cells = r.read_cells();
+        for j in 0..grid.h {
+            for i in 0..grid.w {
+                if let Some((n, k)) = grid.cell_of(i, j) {
+                    if n < 60 {
+                        // q·C − p·⌊q·C/p⌋, from the exact binomial
+                        let c = pascal::math::binom_exact(n, k).unwrap();
+                        let want = (c * q as u128 - p as u128 * (c * q as u128 / p as u128)) as u32;
+                        assert_eq!(cells[(j * grid.w + i) as usize][0], want, "C({n},{k}) mod {p}/{q}");
+                    }
+                }
+            }
+        }
+    }
     // mod 1: every cell valid, every residue 0
     let one = Modulus::new(1);
     r.render_blocking(&frame(grid, &one, &pal, &layers));

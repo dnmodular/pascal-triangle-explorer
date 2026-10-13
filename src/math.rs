@@ -370,9 +370,22 @@ impl Modulus {
         self.scaled(n, k) as f64 / self.q as f64
     }
 
-    /// μ as text: exact (q divides a power of 10, so the expansion ends).
+    /// μ as text, exactly: a decimal when q divides a power of 10 (the expansion
+    /// ends), else the fraction m/q.
     pub fn label(&self) -> String {
-        decimal_text(self.m as u64, self.q as u64)
+        let mut q = self.q;
+        while q.is_multiple_of(2) {
+            q /= 2;
+        }
+        while q.is_multiple_of(5) {
+            q /= 5;
+        }
+        if q == 1 { decimal_text(self.m as u64, self.q as u64) } else { format!("{}/{}", self.m, self.q) }
+    }
+
+    /// μ = P/Q as a fraction (P/1 for a whole modulus).
+    pub fn fraction(&self) -> String {
+        format!("{}/{}", self.m, self.q)
     }
 
     pub fn is_prime(&self) -> bool {

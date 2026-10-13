@@ -570,7 +570,7 @@ fn options(ui: &mut egui::Ui, t: &mut TetraView) {
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("visit").color(ui.visuals().weak_text_color()));
         egui::ComboBox::from_id_salt("tetra mode").width(96.0).selected_text(c.sweep.mode.label()).show_ui(ui, |ui| {
-            for m in ModMode::ALL {
+            for m in ModMode::WHOLE {
                 ui.selectable_value(&mut c.sweep.mode, m, m.label()).on_hover_text(m.note());
             }
         });

@@ -549,6 +549,22 @@ while the modulus or the mode changes:
   screen. The GPU computes both residues per cell (the second modulus's tables follow
   the first's; its residues fill the cell buffer's second half); the layer measures
   read the lower modulus.
+* **Fractions** in the m field: `37/5` is μ = 7.4 exactly, and any denominator works
+  (`23/3` stays a fraction; `74/10` reduces to 37/5), as does `--m 37/5`. C mod μ =
+  (Q·C mod P)/Q holds for every μ = P/Q in lowest terms.
+* **Super primes** (visit mode): fractions μ = P/Q in the range whose numerator P is
+  prime. Since μ divides C exactly when P does, the numerator decides the picture: a
+  super prime has prime P's clean Lucas structure (zeros in blocks of P rows, the
+  same holes as mod P itself), and the denominator only reshuffles the colors
+  (×Q mod P, a permutation of the residues). 37/5 = 7.4 has mod 37's holes; its
+  cousins 37/Q (18.5, 9.25, 7.4, 4.625, …) all sit to the left of 37. Denominators:
+  *decimal* (Q dividing 10ᵈ, d = the decimals setting) or *any Q* up to a bound
+  (23/3, 43/6, …). Orders: *by value* (the number line: 7, 29/4, 59/8, 37/5, … in
+  [7, 8]) or *by numerator* (each prime with its cousins, the smallest numerators,
+  the coarsest structure, first). Near a given μ the super primes get denser as Q
+  grows (about Q/ln(μQ) per unit, by the prime number theorem), and their structure
+  scale P = μ·Q grows with them: 37/5, 739/100 and 7393/1000 are all ≈ 7.4 with
+  blocks of 37, 739 and 7393 rows. The tetra stack's modes stay whole.
 * **Mod 1** and the decimals above it: moduli start at 1, where every residue is 0
   (the canvas is all zeros). Decimals from there reach 1.25 = 5/4 (zeros where 5
   divides C), 1.5 = 3/2 (residues 0, ½ and 1), …; a morph from 1 to 2 grows the
