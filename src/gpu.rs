@@ -654,6 +654,19 @@ struct EncodeOut {
     cur: usize,
     adapt_stepped: bool,
     hist_recorded: bool,
+    /// MAGNIFY recorded this frame (its frames, grid and modulus).
+    motion_recorded: Option<(u32, GridSpec, u32)>,
+}
+
+/// What MAGNIFY's state sides hold. `side` has the state after the newest recorded
+/// frame (`frames` of them, all on `grid`, the newest at modulus `m[side]`); the other
+/// side the state before it (frames − 1), which a repaint of the same frame reads.
+#[derive(Clone, Copy, Debug, Default)]
+struct MotionState {
+    side: usize,
+    frames: u32,
+    grid: Option<GridSpec>,
+    m: [u32; 2],
 }
 
 /// A sub-range of a buffer bound as one storage binding.
@@ -704,6 +717,10 @@ pub struct Renderer {
     work: [wgpu::Buffer; 4],
     hist_buf: wgpu::Buffer,
     adapt_buf: wgpu::Buffer,
+    /// MAGNIFY's per-texel state, two sides ping-ponged: (last residue, running mean)
+    /// interleaved. `motion` says which side holds the state after the newest frame.
+    motion_bufs: [wgpu::Buffer; 2],
+    motion: MotionState,
     canvas: Canvas,
     bg0: wgpu::BindGroup,
     bgl_tween: wgpu::BindGroupLayout,
@@ -872,6 +889,7 @@ impl Renderer {
         ];
         let hist_buf = buffer(&device, "history", 1024, STORAGE_RW);
         let adapt_buf = buffer(&device, "adapt", 1024, STORAGE_RW);
+        let motion_bufs = [buffer(&device, "motion a", 1024, STORAGE_RW), buffer(&device, "motion b", 1024, STORAGE_RW)];
         let canvas = Canvas::new(&device, 16, 16);
         let tween_buf = buffer(&device, "tween", 16, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST);
         let tween_prev = buffer(&device, "tween prev", 1024, STORAGE_RW);
@@ -903,6 +921,8 @@ impl Renderer {
             work,
             hist_buf,
             adapt_buf,
+            motion_bufs,
+            motion: MotionState::default(),
             canvas,
             bg0,
             bgl_tween,
@@ -1040,6 +1060,8 @@ impl Renderer {
                 self.fields_buf = buffer(d, "fields", MAX_MEASURE_SLOTS as u64 * stride as u64 * 4, STORAGE_RW);
                 self.scratch_buf = buffer(d, "scratch", AUX_FIELDS * stride as u64 * 4, STORAGE_RW);
                 self.tmp_buf = buffer(d, "tmp", stride as u64 * 4, STORAGE_RW);
+                self.motion_bufs = [buffer(d, "motion a", stride as u64 * 8, STORAGE_RW), buffer(d, "motion b", stride as u64 * 8, STORAGE_RW)];
+                self.motion = MotionState::default();
             }
             self.work_elem = work_elem;
             let wbytes = stride as u64 * work_elem;
@@ -1114,6 +1136,7 @@ impl Renderer {
         self.hist_len = 0;
         self.hist_next = 0;
         self.adapt_valid = false;
+        self.motion = MotionState::default();
     }
 
     /// Auxiliary field `i` (0..AUX_FIELDS), or the temporary for `i == AUX_FIELDS`.
@@ -1253,7 +1276,7 @@ impl Renderer {
             value_style: matches!(input.layers.value_style, ValueStyle::Mask) as u32,
             field_active: plan.field_active as u32,
             field_stride: self.stride,
-            signed_mask: plan.measures.iter().take(n_measures as usize).enumerate().fold(0u32, |acc, (i, d)| acc | ((d.signed as u32) << i)),
+            signed_mask: plan.measures.iter().take(n_measures as usize).enumerate().fold(0u32, |acc, (i, d)| acc | ((d.signed_in(input.layers) as u32) << i)),
             style_flags: (input.style.outlines as u32 * STYLE_OUTLINES) | (input.style.glow as u32 * STYLE_GLOW),
             row_limit: input.style.row_limit,
             glow_rgb: {
@@ -1339,13 +1362,21 @@ impl Renderer {
             self.hist_next = (self.hist_next + 1) % self.hist_cap.max(1);
             self.hist_len = (self.hist_len + 1).min(self.hist_cap);
         }
+        if let Some((frames, grid, m)) = out.motion_recorded {
+            let side = 1 - self.motion.side;
+            self.motion.m[side] = m;
+            self.motion = MotionState { side, frames, grid: Some(grid), ..self.motion };
+        } else if input.advance {
+            // a new frame MAGNIFY did not see: its state is stale
+            self.motion = MotionState::default();
+        }
     }
 
     /// Encode every pass of the frame. Only reads `self`; frame-state updates are
     /// returned so the borrow of the buffers can stay alive throughout.
     fn encode(&self, enc: &mut wgpu::CommandEncoder, input: &FrameInput<'_>, plan: &crate::layers::Plan, variant: usize, n_measures: u32, passes: &mut Vec<PassParams>) -> EncodeOut {
         let g = input.grid;
-        let mut out = EncodeOut { cur: 0, adapt_stepped: false, hist_recorded: false };
+        let mut out = EncodeOut { cur: 0, adapt_stepped: false, hist_recorded: false, motion_recorded: None };
 
         // 1. values (the frame's first timestamp is written here)
         {
@@ -1407,9 +1438,31 @@ impl Renderer {
                     self.dispatch_scalar(enc, passes, pipe(count), [fb, a3, a3, a3], PassParams { slot: CELL_COUNT_SLOT, ..none });
                     self.dispatch_scalar(enc, passes, pipe(lookup), [fb, a3, a3, a3], PassParams { slot: CELL_COUNT_SLOT, ..none });
                 }
+                MeasureRun::Motion { entry } => {
+                    // a new frame reads the newest state and writes the next side; a
+                    // repaint of the same frame reads the state before it again
+                    let ms = self.motion;
+                    let on_grid = ms.grid == Some(g);
+                    let (read, have) = if input.advance { (ms.side, ms.frames) } else { (1 - ms.side, ms.frames.saturating_sub(1)) };
+                    let have = if on_grid { have } else { 0 };
+                    let same_m = have > 0 && ms.m[read] == input.modulus.m;
+                    let l = input.layers;
+                    let window = l.param("magWindow").clamp(2, 64) as f32;
+                    let mode = l.param("magSource").clamp(0, 2) as u32 | ((l.param("magDisplay").clamp(0, 1) as u32) << 2);
+                    let wrapped = l.param("magCircle") == 1 && same_m;
+                    let flag = (input.advance as u32) | (((have > 0) as u32) << 1) | ((wrapped as u32) << 2);
+                    let pp = PassParams { mode, flag, f0: l.param("magAmp").clamp(1, 64) as f32, f1: (2.0 / window).min(1.0), f2: (window - 1.0) / window, ..none };
+                    let side = |i: usize| Bind::whole(&self.motion_bufs[i]);
+                    self.dispatch_scalar(enc, passes, pipe(entry), [fb, side(read), side(1 - read), a3], pp);
+                    if input.advance {
+                        out.motion_recorded = Some(((have + 1).min(1 << 20), g, input.modulus.m));
+                    }
+                }
             }
-            // signed fields are normalized by their largest magnitude
-            self.dispatch_scalar(enc, passes, &self.pipe_reduce_max, [fb, a3, a3, a3], PassParams { slot, flag: def.signed as u32, ..none });
+            // signed fields are normalized by their largest magnitude; a fixed-scale
+            // (motion) field by 1
+            let flag = if matches!(run, MeasureRun::Motion { .. }) { 2 } else { def.signed_in(input.layers) as u32 };
+            self.dispatch_scalar(enc, passes, &self.pipe_reduce_max, [fb, a3, a3, a3], PassParams { slot, flag, ..none });
         }
 
         // 3. blend → work[0]

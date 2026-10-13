@@ -121,6 +121,11 @@ var<workgroup> wg_vals: array<u32, 256>;
 
 @compute @workgroup_size(16, 16)
 fn reduce_max(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
+  // PP.flag = 2: a fixed-scale field (MAGNIFY), normalized by 1
+  if (PP.flag == 2u) {
+    if (gid.x == 0u && gid.y == 0u) { atomicMax(&maxbuf[PP.slot], bitcast<u32>(1.0)); }
+    return;
+  }
   var bits = 0u;
   if (gid.x < P.grid_w && gid.y < P.grid_h) {
     let raw = buf_a[gid.y * P.grid_w + gid.x];
@@ -481,3 +486,60 @@ fn measure_lagdiff(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (k2 <= n2) { out = wrap_dist(cells[idx].x, residue_at(n2, k2)); }
   buf_a[idx] = f32(out);
 }
+
+// ---------------------------------------------------------------------------
+// MAGNIFY: motion magnification across frames (the reference's `magnify`).
+// buf_b holds, per texel, the state after the frames before this one: (the last
+// residue, a running mean), interleaved; on a new frame (PP.flag bit 0) the state
+// after this one goes to buf_c. Bit 1: there is a previous frame on this grid;
+// bit 2: it was at the same modulus and the circle is wrapped. PP.mode: source
+// (0 velocity, 1 deviation, 2 blend) | display << 2 (0 pure motion, 1 boost).
+// PP.f0 = gain, f1 = the running mean's rate (2 / window), f2 = (window − 1) /
+// window: the deviation from the mean of this frame and the window before it is
+// f2·(v − mean of the frames before), as the reference's window mean.
+// ---------------------------------------------------------------------------
+fn wrap_signed(d: f32, m: f32) -> f32 {
+  return d - m * round(d / m);
+}
+
+@compute @workgroup_size(16, 16)
+fn measure_magnify(@builtin(global_invocation_id) gid: vec3<u32>) {
+  if (gid.x >= P.grid_w || gid.y >= P.grid_h) { return; }
+  let idx = gid.y * P.grid_w + gid.x;
+  let c = cells[idx];
+  let valid = cell_valid(c);
+  let v = select(0.0, f32(c.x), valid);
+  let m = f32(max(P.m, 1u));
+  let denom = max(m - 1.0, 1.0);
+  let have = (PP.flag & 2u) != 0u;
+  let wrapped = (PP.flag & 4u) != 0u;
+  var prev = v;
+  var mean = v;
+  if (have) {
+    prev = buf_b[2u * idx];
+    mean = buf_b[2u * idx + 1u];
+  }
+  var vel = v - prev;
+  var dm = v - mean;
+  if (wrapped) {
+    vel = wrap_signed(vel, m);
+    dm = wrap_signed(dm, m);
+  }
+  let dev = PP.f2 * dm;
+  let src = PP.mode & 3u;
+  var motion = 0.5 * vel + 0.5 * dev;
+  if (src == 0u) { motion = vel; } else if (src == 1u) { motion = dev; }
+  let amplified = motion / denom * PP.f0;
+  if ((PP.mode >> 2u) == 1u) {
+    buf_a[idx] = select(0.0, clamp(v / denom + amplified, 0.0, 1.0), valid);
+  } else {
+    buf_a[idx] = select(0.0, clamp(amplified, -1.0, 1.0), valid);
+  }
+  if ((PP.flag & 1u) != 0u) {
+    var next = mean + PP.f1 * dm;
+    if (wrapped) { next = next - m * floor(next / m); }
+    buf_c[2u * idx] = v;
+    buf_c[2u * idx + 1u] = select(v, next, have);
+  }
+}
+

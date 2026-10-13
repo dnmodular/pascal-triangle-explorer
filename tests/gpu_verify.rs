@@ -946,6 +946,79 @@ fn ported_measures_match_cpu() {
 }
 
 #[test]
+fn magnify_matches_cpu_over_frames() {
+    // MAGNIFY across a sequence of frames on one grid: velocity, deviation (the running
+    // mean), blend, wrapped (same numerator) and boost, against a CPU twin; a repaint of
+    // the same frame (advance = false) shows the same motion again, not zero.
+    let (_gpu, mut r) = device();
+    let pal = Palette::new(Scheme::CoolWarm);
+    let rows = 50u32;
+    let (_, grid) = cell_grid(rows);
+    let cells = |r: &Renderer| r.read_cells();
+    // (source, display, circle, window, gain, moduli walked)
+    type Case = (i32, i32, i32, i32, i32, &'static [(u32, u32)]);
+    let cases: &[Case] = &[
+        (0, 0, 0, 6, 8, &[(7, 1), (8, 1), (9, 1), (10, 1)]),
+        (1, 0, 0, 4, 3, &[(7, 1), (8, 1), (9, 1), (10, 1), (11, 1)]),
+        (2, 0, 0, 2, 5, &[(5, 1), (6, 1), (7, 1)]),
+        (0, 0, 1, 6, 4, &[(10, 7), (10, 9), (10, 11), (10, 13)]),
+        (1, 0, 1, 3, 2, &[(10, 7), (10, 9), (10, 11), (10, 13)]),
+        (0, 1, 0, 6, 8, &[(7, 1), (8, 1), (9, 1)]),
+    ];
+    for &(src, disp, circle, window, gain, walk) in cases {
+        let mut layers = LayerState::default();
+        layers.set_active(LayerId::Value, false);
+        layers.set_active(LayerId::Magnify, true);
+        for (k, v) in [("magSource", src), ("magDisplay", disp), ("magCircle", circle), ("magWindow", window), ("magAmp", gain)] {
+            layers.params.insert(k, v);
+        }
+        r.reset_history();
+        // CPU state per texel: (last residue, running mean), None before the first frame
+        let mut state: Option<(Vec<f32>, Vec<f32>, u32)> = None;
+        let (w, f2) = (window as f32, (window as f32 - 1.0) / window as f32);
+        for &(p, q) in walk {
+            let md = Modulus::decimal(p, q);
+            let m = md.m as f32;
+            let denom = (m - 1.0).max(1.0);
+            r.render_blocking(&frame(grid, &md, &pal, &layers));
+            let c = cells(&r);
+            let v: Vec<f32> = c.iter().map(|c| if c[1] & 0x8000_0000 != 0 { c[0] as f32 } else { 0.0 }).collect();
+            let wrapped = circle == 1 && state.as_ref().is_some_and(|s| s.2 == md.m);
+            let wrap = |d: f32| if wrapped { d - m * (d / m).round() } else { d };
+            let mut want = vec![0f32; v.len()];
+            let mut next = (v.clone(), v.clone(), md.m);
+            for i in 0..v.len() {
+                let valid = c[i][1] & 0x8000_0000 != 0;
+                let (prev, mean) = state.as_ref().map_or((v[i], v[i]), |s| (s.0[i], s.1[i]));
+                let (vel, dm) = (wrap(v[i] - prev), wrap(v[i] - mean));
+                let dev = f2 * dm;
+                let motion = match src { 0 => vel, 1 => dev, _ => 0.5 * vel + 0.5 * dev };
+                let amp = motion / denom * gain as f32;
+                want[i] = if !valid { 0.0 } else if disp == 1 { (v[i] / denom + amp).clamp(0.0, 1.0) } else { amp.clamp(-1.0, 1.0) };
+                if state.is_some() {
+                    let mut n = mean + (2.0 / w).min(1.0) * dm;
+                    if wrapped {
+                        n -= m * (n / m).floor();
+                    }
+                    next.1[i] = n;
+                }
+            }
+            let got = r.read_field(0);
+            let label = format!("src {src} disp {disp} circle {circle} W {window} ×{gain} at {p}/{q}");
+            assert_close(&got[..want.len()], &want, 2e-5, &label);
+            assert_eq!(r.read_max()[0], 1.0, "{label}: fixed scale");
+            // a repaint of the same frame: the same field
+            r.render_blocking(&FrameInput { advance: false, ..frame(grid, &md, &pal, &layers) });
+            assert_close(&r.read_field(0)[..want.len()], &want, 2e-5, &format!("{label}, repainted"));
+            if state.is_some() && disp == 0 {
+                assert!(want.iter().any(|x| x.abs() > 0.05), "{label}: something moves");
+            }
+            state = Some(next);
+        }
+    }
+}
+
+#[test]
 fn stripes_match_reference_dp() {
     let (_gpu, mut r) = device();
     let pal = Palette::new(Scheme::Viridis);

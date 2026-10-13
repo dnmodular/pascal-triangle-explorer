@@ -32,6 +32,7 @@ pub enum LayerId {
     Primes,
     Stripes,
     LagDiff,
+    Magnify,
     Average,
     BandPass,
     Afterimage,
@@ -71,13 +72,17 @@ pub enum MeasureRun {
     Relax { init: &'static str, step: &'static str, finish: &'static str, cap: u32 },
     /// `count` builds an atomic histogram of the residues in view, `lookup` reads it.
     Histogram { count: &'static str, lookup: &'static str },
+    /// One pass that compares the frame with the per-texel state of the frames before
+    /// (buf_b, read) and, on a new frame, writes the state after it (buf_c). Fixed
+    /// scale: the field is already in −1..1 (or 0..1), so its gain is not normalized away.
+    Motion { entry: &'static str },
 }
 
 impl MeasureRun {
     /// Every compute entry point the recipe dispatches.
     pub fn entries(&self) -> Vec<&'static str> {
         match *self {
-            MeasureRun::Pointwise { entry } | MeasureRun::Blurred { entry, .. } => vec![entry],
+            MeasureRun::Pointwise { entry } | MeasureRun::Blurred { entry, .. } | MeasureRun::Motion { entry } => vec![entry],
             MeasureRun::MultiBlur { init, combine, .. } => vec![init, combine],
             MeasureRun::Relax { init, step, finish, .. } => vec![init, step, finish],
             MeasureRun::Histogram { count, lookup } => vec![count, lookup],
@@ -366,6 +371,24 @@ pub const REGISTRY: &[LayerDef] = &[
         sweep: false,
     },
     LayerDef {
+        id: LayerId::Magnify,
+        label: "MAGNIFY",
+        kind: Kind::Measure,
+        desc: "Motion magnification: amplifies how each cell's residue changes from frame to frame (velocity), or how far it is from its recent average (deviation), so small drifts become visible. Pure motion is signed: mid-gray is still, one side of the ramp rising residues, the other falling. Boost adds the motion on top of the residue. Integer compares the residues as numbers (the reference: across different moduli there is no shared circle); wrapped takes the short way round the color wheel when two frames share the modulus (a fraction walk P/Q with one numerator), so a color passing P − 1 → 0 reads as one step forward. AVERAGE (spatial) smooths the motion into zones; a sweep or scrub drives it.",
+        params: &[
+            ParamDef { key: "magSource", label: "amplify", min: 0, max: 2, default: 0, choices: &["velocity", "deviation", "blend"] },
+            ParamDef { key: "magDisplay", label: "display", min: 0, max: 1, default: 0, choices: &["pure motion", "boost base"] },
+            ParamDef { key: "magCircle", label: "circle", min: 0, max: 1, default: 0, choices: &["integer", "wrapped"] },
+            ParamDef { key: "magWindow", label: "window", min: 2, max: 64, default: 6, choices: &[] },
+            ParamDef { key: "magAmp", label: "amplify ×", min: 1, max: 64, default: 8, choices: &[] },
+        ],
+        run: Some(MeasureRun::Motion { entry: "measure_magnify" }),
+        derive: None,
+        dslot: 0,
+        signed: true,
+        sweep: true,
+    },
+    LayerDef {
         id: LayerId::Average,
         label: "AVERAGE",
         kind: Kind::Transform,
@@ -409,6 +432,16 @@ pub const REGISTRY: &[LayerDef] = &[
         sweep: true,
     },
 ];
+
+impl LayerDef {
+    /// The field is signed under these settings (MAGNIFY's boost display is not).
+    pub fn signed_in(&self, s: &LayerState) -> bool {
+        match self.id {
+            LayerId::Magnify => s.param("magDisplay") == 0,
+            _ => self.signed,
+        }
+    }
+}
 
 pub fn def(id: LayerId) -> &'static LayerDef {
     REGISTRY.iter().find(|d| d.id == id).expect("layer in registry")

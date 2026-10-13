@@ -701,8 +701,8 @@ palette image (measures as lightness, transforms per channel). `field.wgsl` is
 compiled once per element type.
 
 **Measures.** KUMMER, LUCAS, CRT, DLOG, P DIGIT, GRADIENT, DIST→0, MAGNITUDE,
-DENSITY, VARIANCE, RARITY, MOIRÉ, PRIMES, STRIPES and LAG DIFF, ported from the
-reference's `mapFieldRaw` with the same controls. How each relates to the
+DENSITY, VARIANCE, RARITY, MOIRÉ, PRIMES, STRIPES, LAG DIFF and MAGNIFY, ported
+from the reference's `mapFieldRaw` with the same controls. How each relates to the
 reference's whole-triangle computation:
 
 * **Exact at any zoom** (closed form per cell): KUMMER, LUCAS, CRT, DLOG,
@@ -715,15 +715,36 @@ reference's whole-triangle computation:
   (farther distances saturate), RARITY counts residue frequencies. Zoomed in,
   the grid is the cell lattice; zoomed out, these run on the sampled lattice.
 
+* **Across frames:** MAGNIFY (motion magnification) compares each cell with the
+  frames before it, per texel of the grid, so it reads a sweep or a scrub (a pan or
+  zoom starts it over). *Velocity* is the change since the previous frame,
+  *deviation* the distance from the mean of the last *window* frames (kept as a
+  running mean, 2 / window per frame, instead of the reference's ring of past
+  frames: two numbers per texel at any window), *blend* half of each; times
+  *amplify ×* over m − 1 (P − 1 for a fraction P/Q). *Pure motion* is signed and
+  centered: mid-gray is still, the two ends of a diverging ramp (cool–warm) rising
+  and falling residues; *boost base* adds the motion to the residue. The scale is
+  fixed (not normalized by the largest motion), so the gain means what it says.
+  *Circle*: *integer* compares residues as numbers, as the reference does (across
+  different moduli there is no common color wheel); *wrapped* takes the short way
+  round the wheel when consecutive frames share the modulus, as a fraction walk
+  P/Q with one numerator does: every cell's color then turns by Q·C mod P changes
+  of exactly C mod P per step of Q (wrapped to ±P/2), a fixed speed per cell, so
+  wrapped velocity holds still while the colors spin, and the walk's skip over a
+  multiple of P shows as one frame of double speed. AVERAGE (spatial) smooths the
+  motion into zones (`--layers magnify`).
+
 The triangle here has no bottom row, so near the reference's last rows (where
 its chains and lags run off the edge) the values legitimately differ.
 
-**Adding a measure** (TEMPORAL, COLOR FLOW, MAGNIFY, TRAIL and CENSUS remain
+**Adding a measure** (TEMPORAL, COLOR FLOW, TRAIL and CENSUS remain
 from the reference): add a `LayerDef` with `kind: Measure`, its parameters and a
 `run` recipe, and the compute entry points the recipe names in `measures.wgsl`.
 Recipes: `Pointwise`, `Blurred` (then N hex blurs), `MultiBlur` (up to three
 auxiliary fields blurred, then combined), `Relax` (iterated relaxation
-dispatches) and `Histogram` (atomic residue counts, then a lookup). Anything
+dispatches), `Histogram` (atomic residue counts, then a lookup) and `Motion` (one pass reading the
+per-texel state of the frames before and, on a new frame, writing the state after;
+fixed scale). Anything
 loop-derived (powers of `p`, per-direction steps, prime pairs) is computed on
 the CPU by the entry's `derive` function and read from `P.dparams[DSLOT_<ID>]`
 (the constant is generated from the registry). Every shader loop has a constant
@@ -737,7 +758,7 @@ Verified (by `cargo test` on Mesa lavapipe, and by the headless export):
 
 * `C(n,k) mod m` on the GPU equals the additive rule for every modulus listed
   above, and equals the CPU closed form at rows 10⁶, 1.2·10⁸ and 10⁹.
-* The packed carry count and per-factor divisibility mask, all sixteen measures,
+* The packed carry count and per-factor divisibility mask, all sixteen single-frame measures, MAGNIFY over sequences of frames (every source, display and circle, repaints included),
   all four blend modes (with a signed measure), the three transforms (spatial
   and temporal AVERAGE, BAND PASS, AFTERIMAGE over two frames) and the resolved
   residue/ramp colors match CPU twins. DIST→0 equals a CPU breadth-first search
