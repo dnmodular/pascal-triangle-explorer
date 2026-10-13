@@ -344,6 +344,19 @@ impl Modulus {
         (m >= 2 && m <= cap as u64).then(|| Modulus::decimal(m as u32, q as u32))
     }
 
+    /// The decimal modulus whole + sub·10⁻ᵈ, or where its numerator would pass `cap`
+    /// the nearest one with fewer decimals that fits (sub rounded); true when rounded.
+    pub fn from_decimal_nearest(whole: u32, sub: u64, d: u32, cap: u32) -> (Self, bool) {
+        for dd in (0..=d).rev() {
+            let drop = 10u64.pow(d - dd);
+            let s = (sub + drop / 2) / drop;
+            if let Some(md) = Modulus::from_decimal(whole, s, dd, cap) {
+                return (md, dd < d);
+            }
+        }
+        (Modulus::new(whole.clamp(1, cap)), d > 0)
+    }
+
     /// μ itself.
     pub fn mu(&self) -> f64 {
         self.m as f64 / self.q as f64
@@ -647,5 +660,22 @@ mod tests {
         assert_eq!(decimal_text(21, 2), "10.5");
         assert_eq!(decimal_text(8, 1), "8");
     }
+
+
+    #[test]
+    fn decimals_past_the_cap_round_to_the_nearest_fraction_that_fits() {
+        // 7.123457 needs the numerator 7123457 (odd: it does not reduce), past 10⁶: it
+        // rounds to 7.12346 = 356173/50000
+        let (md, rounded) = Modulus::from_decimal_nearest(7, 123_457, 6, MOD_CAP);
+        assert!(rounded);
+        assert_eq!((md.label().as_str(), md.m, md.q), ("7.12346", 356_173, 50_000));
+        // lowest terms can save a digit: 7.123456 = 111304/15625 fits
+        let (md, rounded) = Modulus::from_decimal_nearest(7, 123_456, 6, MOD_CAP);
+        assert!(!rounded && md.label() == "7.123456");
+        // 712.3457: three decimals fit (712346/1000 = 356173/500)
+        let (md, rounded) = Modulus::from_decimal_nearest(712, 3457, 4, MOD_CAP);
+        assert!(rounded && md.label() == "712.346");
+    }
+
 
 }

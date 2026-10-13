@@ -83,6 +83,9 @@ struct Model {
     /// in that is not on the sweep's grid (then shown as it is; a step leaves it).
     sp_index: usize,
     free_fraction: bool,
+    /// The exact decimal at the sweep's position needed a numerator past MOD_CAP: the
+    /// nearest fraction that fits is drawn.
+    rounded: bool,
     /// μ's closed form: the whole m, or the decimal μ = P/Q (see `Modulus::decimal`).
     /// Shared with the wave overlay, which reads long rows through the same closed form.
     modulus: Arc<Modulus>,
@@ -154,6 +157,7 @@ impl Model {
             morph: None,
             sp_index: 0,
             free_fraction: false,
+            rounded: false,
             modulus: Arc::new(Modulus::new(m)),
             m_text: m.to_string(),
             scheme: Scheme::Spectral,
@@ -230,9 +234,9 @@ impl Model {
         self.set_fraction(p, q, follow);
     }
 
-    /// The super-prime walk is the visit mode.
+    /// The walk is a list of fractions (super primes, or mode All by numerator).
     fn super_mode(&self) -> bool {
-        self.sweep.mode == ModMode::SuperPrime
+        self.sweep.fraction_mode()
     }
 
     /// Go to μ = m + sub·10⁻ᵈ; with `follow`, linked rows follow it. A μ whose
@@ -242,6 +246,9 @@ impl Model {
         let d = self.sweep.decimals;
         let sub = if d == 0 { 0 } else { sub };
         let morphing = self.sweep.morph && sub > 0;
+        if sub == 0 || morphing {
+            self.rounded = false;
+        }
         let changed = (m, sub) != (self.m, self.sub) || (sub == 0 && (self.modulus.is_decimal() || self.morph.is_some())) || (sub > 0 && morphing != self.morph.is_some()) || self.free_fraction;
         self.free_fraction = false;
         if changed {
@@ -257,8 +264,9 @@ impl Model {
                 }
             } else {
                 self.morph = None;
-                let md = if sub == 0 { None } else { Modulus::from_decimal(m, sub, d, MOD_CAP) };
-                self.modulus = Arc::new(md.unwrap_or_else(|| Modulus::new(m)));
+                let (md, rounded) = if sub == 0 { (Modulus::new(m), false) } else { Modulus::from_decimal_nearest(m, sub, d, MOD_CAP) };
+                self.modulus = Arc::new(md);
+                self.rounded = rounded;
             }
         }
         self.m_text = self.mu_text();
@@ -267,9 +275,10 @@ impl Model {
         }
     }
 
-    /// μ as text: the decimal modulus exactly, or a morph's position m + sub·10⁻ᵈ.
+    /// μ as text: the decimal modulus exactly, or the sweep's position m + sub·10⁻ᵈ
+    /// (a morph's, or one whose exact numerator is past the cap).
     fn mu_text(&self) -> String {
-        if self.morph.is_some() {
+        if self.morph.is_some() || (self.rounded && self.sub > 0) {
             let u = self.sweep.fine_units();
             math::decimal_text(self.m as u64 * u + self.sub, u)
         } else {
@@ -1293,6 +1302,8 @@ fn panel_ui(ui: &mut egui::Ui, model: &mut Model, canvas_px: (u32, u32), _frame_
         let md = &model.modulus;
         let info = if let Some((b, t)) = &model.morph {
             format!("μ = {}: morph {} → {}, {:.0}%", model.mu_text(), model.m, b.m, t * 100.0)
+        } else if model.rounded {
+            format!("μ ≈ {} (numerator past {}): drawn as {}", model.mu_text(), group(MOD_CAP as u64), md.label())
         } else if md.is_decimal() {
             let label = md.label();
             let frac = if label.contains('/') { String::new() } else { format!(" = {}/{}", md.m, md.q) };
@@ -1665,6 +1676,52 @@ fn ghost_controls(ui: &mut egui::Ui, model: &mut Model) {
     });
 }
 
+/// The fraction walks' controls in the sweep bar: the super primes' denominators and
+/// order (`super_primes`), or mode All's order, with the denominators when it walks
+/// every fraction by numerator.
+fn fraction_controls(ui: &mut egui::Ui, sw: &mut Sweep, super_primes: bool) {
+    let order_tip = |o: SpOrder| match (o, super_primes) {
+        (SpOrder::Value, true) => "Along the number line: every super prime of the range in ascending order",
+        (SpOrder::Numerator, true) => "By numerator: each prime P with all its cousins P/Q (smallest P first, the strongest structure: zeros in blocks of P rows), each cousin to the left of P",
+        (SpOrder::Value, false) => "The decimal grid along the number line: whole steps, or 10⁻ᵈ steps with decimals",
+        (SpOrder::Numerator, false) => "Every fraction P/Q of the range in lowest terms, by numerator: P decides the zeros (μ divides C exactly when P does), so the walk runs from the coarsest structures to the finest, each P with its cousins P/Q",
+    };
+    if !super_primes {
+        let o = &mut sw.all_order;
+        egui::ComboBox::from_id_salt("all order").width(100.0).selected_text(o.label()).show_ui(ui, |ui| {
+            for x in SpOrder::ALL {
+                ui.selectable_value(o, x, x.label()).on_hover_text(order_tip(x));
+            }
+        }).response.on_hover_text(order_tip(*o));
+        if sw.all_order == SpOrder::Value {
+            return;
+        }
+    }
+    // (decimal denominators need one decimal at least: the field shows it)
+    if sw.super_primes.denoms == SpDenoms::Decimal {
+        sw.decimals = sw.decimals.max(1);
+    }
+    let sp = &mut sw.super_primes;
+    egui::ComboBox::from_id_salt("sp denoms").width(86.0).selected_text(match sp.denoms {
+        SpDenoms::Decimal => "decimal",
+        SpDenoms::Any => "any Q",
+    }).show_ui(ui, |ui| {
+        ui.selectable_value(&mut sp.denoms, SpDenoms::Decimal, "decimal").on_hover_text("Denominators dividing 10ᵈ, d = the decimals setting (1 at least): the decimal fractions, 7.4 = 37/5");
+        ui.selectable_value(&mut sp.denoms, SpDenoms::Any, "any Q").on_hover_text("Every denominator up to Q: 23/3, 43/6, …");
+    }).response.on_hover_text("Which denominators the fractions P/Q take");
+    if sp.denoms == SpDenoms::Any {
+        bar_label(ui, "Q ≤");
+        bar_drag(ui, 44.0, &mut sp.qmax, 1..=10_000u32, 0.1);
+    }
+    if super_primes {
+        egui::ComboBox::from_id_salt("sp order").width(100.0).selected_text(sp.order.label()).show_ui(ui, |ui| {
+            for o in SpOrder::ALL {
+                ui.selectable_value(&mut sp.order, o, o.label()).on_hover_text(order_tip(o));
+            }
+        });
+    }
+}
+
 /// The interval sequence picker: the presets in a list (picking the current one again
 /// resets it to its standard values), then the sequence's knobs, and ↺ when they are
 /// off the standard. The 2D sweep bar and the tetra panel share it.
@@ -1724,7 +1781,7 @@ fn bar_sep(ui: &mut egui::Ui) {
 fn sweep_bar(ui: &mut egui::Ui, model: &mut Model) {
     let sw = &mut model.sweep;
     let mut action: Option<i32> = None; // Some(0) = jump to start, Some(n) = step n frames
-    let before = (sw.mode, sw.prime_order, sw.seq, sw.step, sw.knobs(), sw.start, sw.end, sw.decimals, sw.morph, sw.super_primes);
+    let before = (sw.mode, sw.prime_order, sw.seq, sw.step, sw.knobs(), sw.start, sw.end, sw.decimals, sw.morph, sw.super_primes, sw.all_order);
     ui.spacing_mut().item_spacing = Vec2::new(4.0, 6.0);
 
     // ---- row 1: transport · selection mode · mode options · range ----
@@ -1775,33 +1832,8 @@ fn sweep_bar(ui: &mut egui::Ui, model: &mut Model) {
             }
             // (as in the reference, the 2×Pn and 3×Pn walks start on their first term)
             ModMode::Interval => seq_picker(ui, sw, "seq", 130.0),
-            ModMode::SuperPrime => {
-                // (decimal denominators need one decimal at least: the field shows it)
-                if sw.super_primes.denoms == SpDenoms::Decimal {
-                    sw.decimals = sw.decimals.max(1);
-                }
-                let sp = &mut sw.super_primes;
-                egui::ComboBox::from_id_salt("sp denoms").width(86.0).selected_text(match sp.denoms {
-                    SpDenoms::Decimal => "decimal",
-                    SpDenoms::Any => "any Q",
-                }).show_ui(ui, |ui| {
-                    ui.selectable_value(&mut sp.denoms, SpDenoms::Decimal, "decimal").on_hover_text("Denominators dividing 10ᵈ, d = the decimals setting (1 at least): the decimal fractions, 7.4 = 37/5");
-                    ui.selectable_value(&mut sp.denoms, SpDenoms::Any, "any Q").on_hover_text("Every denominator up to Q: 23/3, 43/6, …");
-                }).response.on_hover_text("Which denominators the fractions P/Q take");
-                if sp.denoms == SpDenoms::Any {
-                    bar_label(ui, "Q ≤");
-                    bar_drag(ui, 44.0, &mut sp.qmax, 1..=10_000u32, 0.1);
-                }
-                egui::ComboBox::from_id_salt("sp order").width(100.0).selected_text(sp.order.label()).show_ui(ui, |ui| {
-                    for o in SpOrder::ALL {
-                        let tip = match o {
-                            SpOrder::Value => "Along the number line: every super prime of the range in ascending order",
-                            SpOrder::Numerator => "By numerator: each prime P with all its cousins P/Q (smallest P first, the strongest structure: zeros in blocks of P rows), each cousin to the left of P",
-                        };
-                        ui.selectable_value(&mut sp.order, o, o.label()).on_hover_text(tip);
-                    }
-                });
-            }
+            ModMode::SuperPrime => fraction_controls(ui, sw, true),
+            ModMode::All => fraction_controls(ui, sw, false),
             _ => {}
         });
         bar_sep(ui);
@@ -1830,19 +1862,20 @@ fn sweep_bar(ui: &mut egui::Ui, model: &mut Model) {
         let max = sw.max_decimals();
         sw.decimals = sw.decimals.min(max);
         bar_drag(ui, 36.0, &mut sw.decimals, 0..=max, 0.05).on_hover_text(format!(
-            "Steps between the visited moduli: with d decimals each step moves μ by 10⁻ᵈ through the gap to the next one, an analog glide from modulus to modulus (C mod μ = C − μ⌊C/μ⌋, exact at any row). Shallow rows slide smoothly; deeper ones turn faster, about C(n,k)·10⁻ᵈ/μ² a step. 0 = whole moduli. At most {max} here: μ·10ᵈ must stay within {}.",
+            "Steps between the visited moduli: with d decimals (up to {max}) each step moves μ by 10⁻ᵈ through the gap to the next one, an analog glide from modulus to modulus (C mod μ = C − μ⌊C/μ⌋, exact at any row). Shallow rows slide smoothly; deeper ones turn faster, about C(n,k)·10⁻ᵈ/μ² a step. 0 = whole moduli. The exact residue needs μ's numerator within {}: past it (712.3456 at 4 decimals) the nearest fraction that fits is drawn and the panel says so; a morph is exact at every decimal.",
             group(MOD_CAP as u64)
         ));
         ui.checkbox(&mut sw.morph, "morph").on_hover_text("How the decimal steps between two visited moduli are drawn. Off: the exact real residue C mod μ (zeros jump with μ's numerator, deep rows turn over every step). On: a morph from the lower modulus to the next, each cell's color sliding along the palette from its color mod m to its color mod m′ (through the colors between), zeros fading in and out, the wave blended the same way: every in-between frame is its own, to stop on, play or export.");
         bar_sep(ui);
-        let text = if sw.mode == ModMode::SuperPrime {
+        let text = if sw.fraction_mode() {
+            let what = if sw.mode == ModMode::SuperPrime { "super primes" } else { "fractions" };
             let list = sw.super_list();
             let mut pv: Vec<String> = list.iter().take(6).map(|&(p, q)| Modulus::decimal(p, q).label()).collect();
             if list.len() > 6 {
                 pv.push("…".into());
             }
             let capped = if list.len() >= pascal::sweep::SP_MAX { " (capped)" } else { "" };
-            format!("{} super primes{capped} · {}", group(list.len() as u64), pv.join(", "))
+            format!("{} {what}{capped} · {}", group(list.len() as u64), pv.join(", "))
         } else {
             let preview = sw.preview(8);
             let frames = sw.frames_in_range(100_000);
@@ -1855,7 +1888,7 @@ fn sweep_bar(ui: &mut egui::Ui, model: &mut Model) {
         mono_line(ui, &text);
     });
 
-    let changed = before != (sw.mode, sw.prime_order, sw.seq, sw.step, sw.knobs(), sw.start, sw.end, sw.decimals, sw.morph, sw.super_primes);
+    let changed = before != (sw.mode, sw.prime_order, sw.seq, sw.step, sw.knobs(), sw.start, sw.end, sw.decimals, sw.morph, sw.super_primes, sw.all_order);
     match action {
         Some(0) if model.super_mode() => {
             let last = model.sweep.super_list().len().saturating_sub(1);
@@ -2619,6 +2652,29 @@ mod tests {
         md.sweep.speed_ms = 16;
         assert!(md.play_tick(std::time::Instant::now()));
         assert_eq!(md.sp_index, md.sweep.super_nearest(73, 10).unwrap() + 1);
+    }
+
+    #[test]
+    fn nine_decimals_and_all_by_numerator() {
+        let mut md = Model::new();
+        md.sweep.decimals = 9;
+        md.set_m(7);
+        md.step(1);
+        // 7.000000001 needs 7000000001: past the cap, so the nearest fraction that fits
+        assert!(md.rounded && md.m_text == "7.000000001" && !md.modulus.is_decimal());
+        // six exact digits near 7 (lowest terms: 7.123456 = 111304/15625)
+        assert!(md.goto_text("7.123456") && !md.rounded && md.modulus.label() == "7.123456");
+        // mode All by numerator: every fraction of the range, coarsest numerators first
+        md.sweep.decimals = 1;
+        md.sweep.start = 7;
+        md.sweep.end = 8;
+        md.sweep.all_order = SpOrder::Numerator;
+        md.goto(7);
+        assert_eq!((md.modulus.m, md.modulus.q), (7, 1));
+        md.step(3);
+        assert_eq!((md.modulus.m, md.modulus.q, md.m_text.as_str()), (36, 5, "7.2"));
+        md.step(1);
+        assert_eq!(md.m_text, "7.4");
     }
 
     #[test]
