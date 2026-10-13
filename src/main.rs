@@ -1776,6 +1776,10 @@ fn sweep_bar(ui: &mut egui::Ui, model: &mut Model) {
             // (as in the reference, the 2×Pn and 3×Pn walks start on their first term)
             ModMode::Interval => seq_picker(ui, sw, "seq", 130.0),
             ModMode::SuperPrime => {
+                // (decimal denominators need one decimal at least: the field shows it)
+                if sw.super_primes.denoms == SpDenoms::Decimal {
+                    sw.decimals = sw.decimals.max(1);
+                }
                 let sp = &mut sw.super_primes;
                 egui::ComboBox::from_id_salt("sp denoms").width(86.0).selected_text(match sp.denoms {
                     SpDenoms::Decimal => "decimal",
