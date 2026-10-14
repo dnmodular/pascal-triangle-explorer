@@ -136,10 +136,13 @@ pub enum ModMode {
     Interval,
     /// Fractions P/Q with a prime numerator (see [`SuperPrimes`]); the 2D sweep only.
     SuperPrime,
+    /// Every modulus of the range, each next one a structural relative of the last
+    /// (see [`kinship`]); the 2D sweep only.
+    Kinship,
 }
 
 impl ModMode {
-    pub const ALL: [ModMode; 7] = [ModMode::All, ModMode::Prime, ModMode::Composite, ModMode::Even, ModMode::Odd, ModMode::Interval, ModMode::SuperPrime];
+    pub const ALL: [ModMode; 8] = [ModMode::All, ModMode::Prime, ModMode::Composite, ModMode::Even, ModMode::Odd, ModMode::Interval, ModMode::SuperPrime, ModMode::Kinship];
     /// The modes over whole moduli (the tetra stack's).
     pub const WHOLE: [ModMode; 6] = [ModMode::All, ModMode::Prime, ModMode::Composite, ModMode::Even, ModMode::Odd, ModMode::Interval];
     pub fn label(self) -> &'static str {
@@ -151,6 +154,7 @@ impl ModMode {
             ModMode::Odd => "odd",
             ModMode::Interval => "interval",
             ModMode::SuperPrime => "super primes",
+            ModMode::Kinship => "kinship",
         }
     }
     pub fn note(self) -> &'static str {
@@ -161,6 +165,7 @@ impl ModMode {
             ModMode::Even => "Even moduli only; every frame keeps the mod-2 Sierpinski skeleton.",
             ModMode::Odd => "Odd moduli only. Steps skip by 2.",
             ModMode::Interval => "Walks a sequence of moduli from the range start: fixed steps, or the increment and landing sequences below.",
+            ModMode::Kinship => "Every modulus of the range once, in an order of resemblance instead of size: each next one is a close relative of the last. Consecutive numbers never share a prime factor (m and m + 1 are coprime), so counting up redraws the whole structure every step; here a step adds or removes one prime factor where it can (2, 4, 8, 16, 24, 12, 6, 3, 9, 18, …: a layer of holes appears or vanishes), or follows the picture most like the last one (look-alike).",
             ModMode::SuperPrime => "Fractions μ = P/Q in the range whose numerator P is prime (lowest terms): 37/5 = 7.4, 59/8 = 7.375, … C mod μ = (Q·C mod P)/Q, so μ divides C exactly when P does: the picture has prime P's clean Lucas structure (blocks of P rows), the denominator only reshuffling its colors. Denominators: the decimal ones of the decimals setting (Q dividing 10ᵈ), or every Q up to a bound. Ordered by value (the number line) or by numerator (each prime with its cousins P/Q, all to its left, smallest P, the strongest structure, first).",
         }
     }
@@ -518,7 +523,10 @@ pub struct Sweep {
     pub super_primes: SuperPrimes,
     /// Mode All's order: the decimal grid by value, or every fraction by numerator.
     pub all_order: SpOrder,
+    /// The kinship walk's order.
+    pub kin_order: KinOrder,
     sp_cache: Option<(SpKey, Vec<(u32, u32)>)>,
+    kin_cache: Option<(KinKey, Vec<(u32, u32)>)>,
     /// Cached walk lists, rebuilt when the mode parameters change.
     cache: Option<(PoolKey, Vec<u32>)>,
 }
@@ -542,7 +550,9 @@ impl Default for Sweep {
             morph: false,
             super_primes: SuperPrimes::default(),
             all_order: SpOrder::Value,
+            kin_order: KinOrder::Lattice,
             sp_cache: None,
+            kin_cache: None,
             cache: None,
         }
     }
@@ -597,6 +607,9 @@ impl Default for SuperPrimes {
 /// Most fractions one super-prime walk lists.
 pub const SP_MAX: usize = 200_000;
 
+/// What a kinship walk is built from: range and order.
+type KinKey = (u32, u32, KinOrder);
+
 /// What a fraction walk is built from: range, settings, decimals, prime numerators only.
 type SpKey = (u32, u32, SuperPrimes, u32, bool);
 
@@ -648,6 +661,168 @@ pub fn fractions_with(lo: u32, hi: u32, denoms: &[u32], order: SpOrder, prime_on
     if order == SpOrder::Value {
         // P/Q against P'/Q' without division: P·Q' vs P'·Q
         out.sort_by(|x, y| (x.0 as u64 * y.1 as u64).cmp(&(y.0 as u64 * x.1 as u64)).then(x.1.cmp(&y.1)));
+    }
+    out
+}
+
+/// How the kinship walk picks the next modulus.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum KinOrder {
+    /// Fewest prime factors changed (m → m·p or m/p is one step; see [`kinship`]).
+    Lattice,
+    /// The most similar zero pattern over the first rows (see [`kinship`]).
+    LookAlike,
+}
+
+impl KinOrder {
+    pub const ALL: [KinOrder; 2] = [KinOrder::Lattice, KinOrder::LookAlike];
+    pub fn label(self) -> &'static str {
+        match self {
+            KinOrder::Lattice => "one factor",
+            KinOrder::LookAlike => "look-alike",
+        }
+    }
+    pub fn tip(self) -> &'static str {
+        match self {
+            KinOrder::Lattice => "Each next modulus is the unvisited one fewest prime factors away: m·p or m/p is one step (16 → 8, 6 → 3, 3 → 15), 16 → 24 two (÷2, ×3). Ties go to the smaller primes changed, then the smaller modulus. Exact arithmetic, any range size.",
+            KinOrder::LookAlike => "Each next modulus is the unvisited one whose zero pattern (where m divides C) over the first rows overlaps the last one's most (Jaccard similarity). Measured, not reasoned: it finds the same families (2, 4, 12, 6, 3, 15, 5, 10, 20, 8, 24, 16, …). Up to 300 moduli; large primes, with no zeros that early, come last as loners.",
+        }
+    }
+}
+
+/// Most moduli a look-alike walk takes (pairwise comparisons of zero patterns).
+pub const KIN_LOOK_MAX: usize = 300;
+/// Most moduli a one-factor walk takes.
+pub const KIN_LATTICE_MAX: usize = 2_000;
+
+/// Every modulus of lo..=hi once (lo at least 1), starting at lo, each next one the
+/// unvisited modulus nearest the last:
+///
+/// * `Lattice`: by the number of prime factors (with multiplicity) to divide out of
+///   one and multiply in to reach the other, Ω(m/g) + Ω(m′/g) with g = gcd(m, m′);
+///   ties by the sum of those primes, then the smaller modulus.
+/// * `LookAlike`: by 1 − Jaccard similarity of the zero sets {(n, k): m | C(n, k)} over
+///   rows 0..R (R = 1.5·hi within 96..=384); ties by the smaller modulus.
+///
+/// The walk is cut at KIN_LATTICE_MAX / KIN_LOOK_MAX moduli.
+pub fn kinship(lo: u32, hi: u32, order: KinOrder) -> Vec<u32> {
+    let (lo, hi) = (lo.clamp(1, MOD_CAP), hi.clamp(1, MOD_CAP));
+    let (lo, hi) = (lo.min(hi), lo.max(hi));
+    let cap = if order == KinOrder::Lattice { KIN_LATTICE_MAX } else { KIN_LOOK_MAX };
+    let mods: Vec<u32> = (lo..=hi).take(cap).collect();
+    let n = mods.len();
+    let mut out = Vec::with_capacity(n);
+    let mut left = vec![true; n];
+    let mut cur = 0usize;
+    match order {
+        KinOrder::Lattice => {
+            // Ω and the sum of prime factors (with multiplicity), additive: Ω(m/g) = Ω(m) − Ω(g)
+            let top = *mods.last().unwrap_or(&1) as usize;
+            let mut spf = vec![0u32; top + 1];
+            for i in 2..=top {
+                if spf[i] == 0 {
+                    for j in (i..=top).step_by(i) {
+                        if spf[j] == 0 {
+                            spf[j] = i as u32;
+                        }
+                    }
+                }
+            }
+            let parts = |mut x: u32| {
+                let (mut c, mut s) = (0u32, 0u64);
+                while x > 1 {
+                    let p = spf[x as usize];
+                    x /= p;
+                    c += 1;
+                    s += p as u64;
+                }
+                (c, s)
+            };
+            let table: Vec<(u32, u64)> = (0..=top as u32).map(parts).collect();
+            let info: Vec<(u32, u64)> = mods.iter().map(|&m| table[m as usize]).collect();
+            let gcd = |mut a: u32, mut b: u32| {
+                while b != 0 {
+                    (a, b) = (b, a % b);
+                }
+                a
+            };
+            for _ in 0..n {
+                left[cur] = false;
+                out.push(mods[cur]);
+                let m = mods[cur];
+                let mut best: Option<((u32, u64, u32), usize)> = None;
+                for (j, &x) in mods.iter().enumerate() {
+                    if !left[j] {
+                        continue;
+                    }
+                    let g = table[gcd(m, x) as usize];
+                    let (a, b) = (info[cur], info[j]);
+                    let key = (a.0 + b.0 - 2 * g.0, a.1 + b.1 - 2 * g.1, x);
+                    if best.is_none_or(|(k, _)| key < k) {
+                        best = Some((key, j));
+                    }
+                }
+                match best {
+                    Some((_, j)) => cur = j,
+                    None => break,
+                }
+            }
+        }
+        KinOrder::LookAlike => {
+            let rows = (hi as u64 * 3 / 2).clamp(96, 384) as usize;
+            let cells = rows * (rows + 1) / 2;
+            let words = cells.div_ceil(64);
+            let masks: Vec<Vec<u64>> = mods
+                .iter()
+                .map(|&m| {
+                    let mut bits = vec![0u64; words];
+                    let mut row = vec![1u32 % m.max(1)];
+                    let mut i = 0usize;
+                    for _ in 0..rows {
+                        for &v in &row {
+                            if v == 0 {
+                                bits[i / 64] |= 1 << (i % 64);
+                            }
+                            i += 1;
+                        }
+                        let mut next = Vec::with_capacity(row.len() + 1);
+                        next.push(1 % m);
+                        for w in row.windows(2) {
+                            let s = w[0] + w[1];
+                            next.push(if s >= m { s - m } else { s });
+                        }
+                        next.push(1 % m);
+                        row = next;
+                    }
+                    bits
+                })
+                .collect();
+            for _ in 0..n {
+                left[cur] = false;
+                out.push(mods[cur]);
+                let a = &masks[cur];
+                let mut best: Option<(f64, usize)> = None;
+                for j in 0..n {
+                    if !left[j] {
+                        continue;
+                    }
+                    let b = &masks[j];
+                    let (mut inter, mut uni) = (0u32, 0u32);
+                    for (x, y) in a.iter().zip(b) {
+                        inter += (x & y).count_ones();
+                        uni += (x | y).count_ones();
+                    }
+                    let d = if uni == 0 { 0.0 } else { 1.0 - inter as f64 / uni as f64 };
+                    if best.is_none_or(|(bd, _)| d < bd) {
+                        best = Some((d, j));
+                    }
+                }
+                match best {
+                    Some((_, j)) => cur = j,
+                    None => break,
+                }
+            }
+        }
     }
     out
 }
@@ -739,7 +914,7 @@ impl Sweep {
 
     /// The walk is a list of fractions: the super primes, or mode All by numerator.
     pub fn fraction_mode(&self) -> bool {
-        self.mode == ModMode::SuperPrime || (self.mode == ModMode::All && self.all_order == SpOrder::Numerator)
+        matches!(self.mode, ModMode::SuperPrime | ModMode::Kinship) || (self.mode == ModMode::All && self.all_order == SpOrder::Numerator)
     }
 
     /// The fraction walk for the range and settings (cached): the super primes, or in
@@ -752,6 +927,14 @@ impl Sweep {
             }
             (a, b)
         };
+        if self.mode == ModMode::Kinship {
+            // whole moduli as fractions m/1, in kinship order
+            let key = (lo.max(1), hi.max(1), self.kin_order);
+            if self.kin_cache.as_ref().is_none_or(|(k, _)| *k != key) {
+                self.kin_cache = Some((key, kinship(key.0, key.1, key.2).into_iter().map(|m| (m, 1)).collect()));
+            }
+            return &self.kin_cache.as_ref().expect("built").1;
+        }
         let d = self.decimals.clamp(1, MAX_DECIMALS);
         let prime_only = self.mode == ModMode::SuperPrime;
         let mut sp = self.super_primes;
@@ -1018,7 +1201,7 @@ impl Sweep {
                 v.clamp(4, MOD_CAP as i64) as u32
             }
             ModMode::Interval => clamp_mod(cur as i64 + dir as i64 * step),
-            ModMode::All | ModMode::SuperPrime => clamp_mod(cur as i64 + dir as i64),
+            ModMode::All | ModMode::SuperPrime | ModMode::Kinship => clamp_mod(cur as i64 + dir as i64),
             _ => clamp_mod(cur as i64 + dir as i64 * 2),
         }
     }
@@ -1378,5 +1561,36 @@ mod tests {
         // from 2 the walk keeps its old ends
         s.start = 2;
         assert_eq!(s.first_pos(), (2, 0));
+    }
+
+    #[test]
+    fn kinship_walks_by_resemblance() {
+        // one factor: the families in turn, each step a prime multiplied in or divided out
+        // where one is left (16 → 24 is two: ÷2, ×3); against an independent prototype
+        assert_eq!(kinship(1, 24, KinOrder::Lattice), vec![1, 2, 4, 8, 16, 24, 12, 6, 3, 9, 18, 15, 5, 10, 20, 14, 7, 21, 11, 22, 13, 17, 19, 23]);
+        // look-alike: Jaccard of the zero sets over the first 96 rows, against a Python twin
+        assert_eq!(kinship(2, 24, KinOrder::LookAlike), vec![2, 4, 12, 6, 3, 9, 18, 15, 5, 10, 20, 8, 24, 16, 14, 7, 21, 13, 11, 22, 23, 17, 19]);
+        assert_eq!(
+            kinship(1, 40, KinOrder::LookAlike),
+            vec![1, 2, 4, 12, 6, 3, 9, 18, 36, 24, 8, 16, 32, 40, 20, 10, 5, 15, 30, 35, 7, 14, 28, 21, 39, 13, 26, 22, 11, 33, 29, 31, 37, 19, 38, 34, 17, 23, 25, 27]
+        );
+        // every modulus of the range exactly once
+        for order in KinOrder::ALL {
+            let mut w = kinship(5, 300, order);
+            assert_eq!(w[0], 5);
+            w.sort_unstable();
+            assert_eq!(w, (5..=300).collect::<Vec<_>>(), "{order:?}");
+        }
+        // big ranges are cut, not slow
+        assert_eq!(kinship(1, 1_000_000, KinOrder::LookAlike).len(), KIN_LOOK_MAX);
+        // the sweep walks it as a list: playback, steps, the range from 0
+        let mut s = Sweep { mode: ModMode::Kinship, start: 0, end: 24, looping: true, playing: true, ..Default::default() };
+        assert!(s.fraction_mode());
+        assert_eq!(s.super_list()[..6], [(1, 1), (2, 1), (4, 1), (8, 1), (16, 1), (24, 1)]);
+        assert_eq!(s.super_tick(23), 0, "loops");
+        assert_eq!(s.super_nearest(6, 1), Some(7));
+        s.kin_order = KinOrder::LookAlike;
+        s.start = 2;
+        assert_eq!(s.super_list()[..4], [(2, 1), (4, 1), (12, 1), (6, 1)]);
     }
 }

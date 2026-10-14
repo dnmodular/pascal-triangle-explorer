@@ -589,6 +589,21 @@ while the modulus or the mode changes:
   lowest terms (10/4 = 5/2, and draws 5/2), but in a by-numerator walk every
   numerator then shows all its denominators. The m field shows the fraction as
   listed.
+* **Kinship** (visit mode): every modulus of the range once, in an order of
+  resemblance instead of size. Consecutive numbers never share a prime factor (m and
+  m + 1 are coprime), and a triangle's zeros come from its prime powers, so counting
+  up redraws the whole structure every step. Kinship steps to a relative instead.
+  *One factor* (the default) goes to the unvisited modulus the fewest prime factors
+  away (m·p or m/p is one step; ties to the smaller primes, then the smaller
+  modulus): 2, 4, 8, 16, 24, 12, 6, 3, 9, 18, 15, 5, 10, 20, 14, 7, 21, 11, 22, …
+  for 1–24, so a step adds or removes one layer of holes. *Look-alike* measures
+  instead: the unvisited modulus whose zero pattern (where m divides C) over the
+  first rows overlaps the last one's most (Jaccard; 1.5 × the range end rows,
+  96–384), which finds the same families from the pictures alone (2, 4, 12, 6, 3,
+  9, 18, 15, 5, 10, 20, 8, 24, 16, …); primes too large to have zeros that early
+  come last. One factor takes up to 2,000 moduli, look-alike 300 (the panel says
+  when a range is cut). Steps, playback and typed moduli move along the walk
+  (`--visit kinship --kin look-alike`); the tetra stack keeps its whole-number modes.
 * **Mod 1** and the decimals above it: whole moduli start at 1, where every residue
   is 0 (the canvas is all zeros). Decimals from there reach 1.25 = 5/4 (zeros where 5
   divides C), 1.5 = 3/2 (residues 0, ½ and 1), …; a morph from 1 to 2 grows the

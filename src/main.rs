@@ -12,7 +12,7 @@ use pascal::gpu::{CanvasStyle, FrameInput, Gpu, Renderer, Tween};
 use pascal::layers::{AvgMode, BlendMode, FieldColorMode, Kind, LayerId, LayerState, Preset, REGISTRY};
 use pascal::math::{self, Modulus, MOD_CAP};
 use pascal::palette::{Palette, Scheme};
-use pascal::sweep::{ModMode, PrimeOrder, Seq, SpDenoms, SpOrder, Sweep};
+use pascal::sweep::{KinOrder, ModMode, PrimeOrder, Seq, SpDenoms, SpOrder, Sweep};
 use pascal::view::{GridSpec, View, MAX_PPC, MIN_PPC, ROW_H, STATUS_H};
 use pascal::wave_overlay::{Corner, WaveOverlay};
 use winit::application::ApplicationHandler;
@@ -670,7 +670,7 @@ struct App {
 }
 
 const USAGE: &str = "pascal-triangle-explorer [options]
-  --m N              modulus (whole, or decimal like 10.5; 1 and up) (default 7)
+  --m N              modulus: whole, decimal (10.5, 0.7) or fraction (37/5) (default 7)
   --morph            draw a decimal --m as a morph between the whole moduli around it
   --rows R           rows to fit (default 128)
   --palette NAME     spectral | viridis | magma | inferno | turbo | cividis | coolwarm | mono
@@ -681,8 +681,12 @@ const USAGE: &str = "pascal-triangle-explorer [options]
   --glow             glow around zero cells when zoomed in
   --mode MODE        residue | mask | valuation
   --visit MODE       sweep selection: all | primes | composites | even | odd | interval
+                     | super primes | kinship
+  --kin ORDER        kinship order: one-factor | look-alike
+  --fraction-colors  value | phase | auto (how fractions color)
   --layers a,b,c     active layers: value kummer lucas crt dlog pdigit gradient distzero magnitude
-                     density variance rarity moire primes stripes lagdiff average bandpass afterimage
+                     density variance rarity moire primes stripes lagdiff magnify average bandpass
+                     afterimage
   --field MODE       math | palette (field color mode)
   --export FILE.png  render once without a window and write a PNG
   --svg FILE.svg     write rows 0..R−1 (--rows, at most 1024) as an SVG (residue / mask / valuation)
@@ -739,6 +743,13 @@ fn main() {
             "--visit" => {
                 if let Some(m) = ModMode::ALL.iter().find(|m| m.label() == next()) {
                     model.sweep.mode = *m;
+                }
+            }
+            // the kinship walk's order: one-factor or look-alike
+            "--kin" => {
+                let v = next().replace('-', " ");
+                if let Some(o) = KinOrder::ALL.into_iter().find(|o| o.label() == v) {
+                    model.sweep.kin_order = o;
                 }
             }
             "--export" => export = Some(PathBuf::from(next())),
@@ -1849,7 +1860,7 @@ fn bar_sep(ui: &mut egui::Ui) {
 fn sweep_bar(ui: &mut egui::Ui, model: &mut Model) {
     let sw = &mut model.sweep;
     let mut action: Option<i32> = None; // Some(0) = jump to start, Some(n) = step n frames
-    let before = (sw.mode, sw.prime_order, sw.seq, sw.step, sw.knobs(), sw.start, sw.end, sw.decimals, sw.morph, sw.super_primes, sw.all_order);
+    let before = (sw.mode, sw.prime_order, sw.seq, sw.step, sw.knobs(), sw.start, sw.end, sw.decimals, sw.morph, sw.super_primes, sw.all_order, sw.kin_order);
     ui.spacing_mut().item_spacing = Vec2::new(4.0, 6.0);
 
     // ---- row 1: transport · selection mode · mode options · range ----
@@ -1901,6 +1912,14 @@ fn sweep_bar(ui: &mut egui::Ui, model: &mut Model) {
             // (as in the reference, the 2×Pn and 3×Pn walks start on their first term)
             ModMode::Interval => seq_picker(ui, sw, "seq", 130.0),
             ModMode::SuperPrime => fraction_controls(ui, sw, true),
+            ModMode::Kinship => {
+                let o = &mut sw.kin_order;
+                egui::ComboBox::from_id_salt("kin order").width(100.0).selected_text(o.label()).show_ui(ui, |ui| {
+                    for x in KinOrder::ALL {
+                        ui.selectable_value(o, x, x.label()).on_hover_text(x.tip());
+                    }
+                }).response.on_hover_text(o.tip());
+            }
             ModMode::All => fraction_controls(ui, sw, false),
             _ => {}
         });
@@ -1936,13 +1955,22 @@ fn sweep_bar(ui: &mut egui::Ui, model: &mut Model) {
         ui.checkbox(&mut sw.morph, "morph").on_hover_text("How the decimal steps between two visited moduli are drawn. Off: the exact real residue C mod μ (zeros jump with μ's numerator, deep rows turn over every step). On: a morph from the lower modulus to the next, each cell's color sliding along the palette from its color mod m to its color mod m′ (through the colors between), zeros fading in and out, the wave blended the same way: every in-between frame is its own, to stop on, play or export.");
         bar_sep(ui);
         let text = if sw.fraction_mode() {
-            let what = if sw.mode == ModMode::SuperPrime { "super primes" } else { "fractions" };
+            let what = match sw.mode {
+                ModMode::SuperPrime => "super primes",
+                ModMode::Kinship => "moduli",
+                _ => "fractions",
+            };
+            let cap = match (sw.mode, sw.kin_order) {
+                (ModMode::Kinship, KinOrder::Lattice) => pascal::sweep::KIN_LATTICE_MAX,
+                (ModMode::Kinship, KinOrder::LookAlike) => pascal::sweep::KIN_LOOK_MAX,
+                _ => pascal::sweep::SP_MAX,
+            };
             let list = sw.super_list();
             let mut pv: Vec<String> = list.iter().take(6).map(|&(p, q)| Modulus::decimal(p, q).label()).collect();
             if list.len() > 6 {
                 pv.push("…".into());
             }
-            let capped = if list.len() >= pascal::sweep::SP_MAX { " (capped)" } else { "" };
+            let capped = if list.len() >= cap { " (capped)" } else { "" };
             format!("{} {what}{capped} · {}", group(list.len() as u64), pv.join(", "))
         } else {
             let preview = sw.preview(8);
@@ -1956,7 +1984,7 @@ fn sweep_bar(ui: &mut egui::Ui, model: &mut Model) {
         mono_line(ui, &text);
     });
 
-    let changed = before != (sw.mode, sw.prime_order, sw.seq, sw.step, sw.knobs(), sw.start, sw.end, sw.decimals, sw.morph, sw.super_primes, sw.all_order);
+    let changed = before != (sw.mode, sw.prime_order, sw.seq, sw.step, sw.knobs(), sw.start, sw.end, sw.decimals, sw.morph, sw.super_primes, sw.all_order, sw.kin_order);
     match action {
         Some(0) if model.super_mode() => {
             let last = model.sweep.super_list().len().saturating_sub(1);
@@ -2895,5 +2923,28 @@ mod tests {
         md.set_super(i, false);
         assert_eq!((md.modulus.m, md.modulus.q, md.m_text.as_str()), (5, 2, "10/4"));
         assert!(md.goto_text(&md.m_text.clone()) && md.modulus.label() == "2.5");
+    }
+
+    #[test]
+    fn kinship_steps_through_relatives() {
+        let mut md = Model::new();
+        md.sweep.mode = ModMode::Kinship;
+        md.sweep.start = 2;
+        md.sweep.end = 24;
+        md.set_super(0, false);
+        let mut seen = vec![md.modulus.m];
+        for _ in 0..8 {
+            md.step(1);
+            seen.push(md.modulus.m);
+        }
+        assert_eq!(seen, vec![2, 4, 8, 16, 24, 12, 6, 3, 9]);
+        assert!(!md.modulus.is_decimal() && md.m_text == "9");
+        md.step(-2);
+        assert_eq!(md.modulus.m, 6);
+        // a typed modulus lands on its place in the walk
+        assert!(md.goto_text("15"));
+        assert_eq!(md.sweep.super_list()[md.sp_index], (15, 1));
+        md.step(1);
+        assert_eq!(md.modulus.m, 5);
     }
 }
