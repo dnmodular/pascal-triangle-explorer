@@ -473,14 +473,26 @@ impl Side {
     }
 }
 
-/// Peeling: which sides, and how many layers are off. A layer is one row or cell of the
+/// Peeling: how many layers are off each side. A layer is one row or cell of the
 /// stride on the triangles' sides (k, n − k, last row − n) and one drawn slice at the top
 /// or the base, so a stride never makes a layer peel nothing.
+///
+/// Each side has its own depth: its `offset`, plus the shared `layers` when it is linked
+/// (`sides`). The shared controls (step, play, rewind) move every linked side together,
+/// each from its own offset; a side's own controls move its offset alone.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Peel {
-    /// The sides that peel, in `Side::ALL` order; the unchecked ones stay.
+    /// The linked sides, in `Side::ALL` order: they peel with the shared `layers`.
     pub sides: [bool; 5],
+    /// The shared layers, off every linked side.
     pub layers: u32,
+    /// Each side's own layers, on top of the shared ones (linked or not).
+    pub offset: [u32; 5],
+    /// Draw the layer each side lost last (the stack view), pulled out from the stack by
+    /// `gap` cells along that side's outward normal; cells on an edge between two
+    /// sides' last layers move out along both, so the sheets stay joined.
+    pub shell: bool,
+    pub gap: f32,
     /// The animation: a layer comes off every 1/speed s while playing, and when the
     /// last cube is gone it starts again from nothing peeled.
     pub playing: bool,
@@ -492,25 +504,46 @@ pub struct Peel {
 
 impl Default for Peel {
     fn default() -> Self {
-        Peel { sides: [false; 5], layers: 0, playing: false, backward: false, speed: 6.0 }
+        Peel { sides: [false; 5], layers: 0, offset: [0; 5], shell: false, gap: 3.0, playing: false, backward: false, speed: 6.0 }
     }
 }
 
 impl Peel {
-    /// Whether any side peels.
+    /// Whether any side is linked to the shared controls.
     pub fn active(&self) -> bool {
         self.sides.iter().any(|&on| on)
     }
 
-    /// Layers off each side, in `Side::ALL` order (0 = untouched).
+    /// Whether anything is peeled off at all.
+    pub fn any(&self) -> bool {
+        self.depths().iter().any(|&d| d > 0)
+    }
+
+    /// Layers off each side, in `Side::ALL` order (0 = untouched): its offset, plus the
+    /// shared layers when it is linked.
     pub fn depths(&self) -> [u32; 5] {
-        self.sides.map(|on| if on { self.layers } else { 0 })
+        std::array::from_fn(|i| self.offset[i].saturating_add(if self.sides[i] { self.layers } else { 0 }))
+    }
+
+    /// The same peel with only side `i` linked and no offsets (a side on its own).
+    pub fn alone(&self, i: usize) -> Peel {
+        let mut sides = [false; 5];
+        sides[i] = true;
+        Peel { sides, layers: 0, offset: [0; 5], ..*self }
     }
 
     /// The checked sides.
     pub fn checked(&self) -> impl Iterator<Item = Side> + '_ {
         Side::ALL.into_iter().zip(self.sides).filter(|&(_, on)| on).map(|(sd, _)| sd)
     }
+}
+
+/// Shared layers a cell `avail` layers in from a side survives when the side is at
+/// `offset + slope·t`: None when the offset already takes it, u32::MAX when the side
+/// does not move.
+fn steps_left(avail: u32, offset: u32, slope: u32) -> Option<u32> {
+    let room = avail.checked_sub(offset)?;
+    Some(room.checked_div(slope).unwrap_or(u32::MAX))
 }
 
 /// A snapped camera direction for the stack: straight down at the apex, straight up at
@@ -1049,32 +1082,42 @@ impl Layout {
             || (depths[4] > 0 && self.layers - 1 - s.layer < depths[4])
     }
 
-    /// The fewest layers that peel the whole stack away with `peel`'s sides.
+    /// The fewest shared layers that peel the whole stack away: the linked sides moving
+    /// together, every side from its own offset (`peel.layers` itself is ignored). 0
+    /// when no side is linked or the offsets already leave nothing.
     pub fn peel_extent(&self, peel: &Peel) -> u32 {
-        let mut p = *peel;
-        p.layers = 1;
-        let unit = p.depths();
-        if self.view == View::Diamond || unit.iter().all(|&d| d == 0) {
+        let o = peel.offset;
+        let l = peel.sides.map(u32::from);
+        if self.view == View::Diamond || l.iter().all(|&x| x == 0) {
             return 0;
         }
         if self.view == View::Face && self.face != Face::Top {
-            return self.face_peel_extent(unit);
+            return self.face_peel_extent(o, l);
         }
         let st = self.stride;
         let n_slices = self.layers;
         let mut extent = 0u32;
         for (si, s) in self.slices.iter().enumerate() {
             let last = s.front;
-            // a cell survives L layers while every peeled side is at least L layers away
-            let slice_d = [s.layer, n_slices - 1 - s.layer];
-            let slice_min = (3..5).filter(|&i| unit[i] > 0).map(|i| slice_d[i - 3] + 1).min().unwrap_or(u32::MAX);
-            if slice_min <= extent {
+            // a cell survives t shared layers while every side j is at least o_j + l_j·t
+            // layers away
+            let Some(slice_t) = steps_left(s.layer, o[3], l[3]).zip(steps_left(n_slices - 1 - s.layer, o[4], l[4])).map(|(a, b)| a.min(b)) else { continue };
+            if slice_t.saturating_add(1) <= extent {
                 continue;
             }
             for (n, k) in self.slice_cells(si) {
                 let cell_d = [k / st, (n - k) / st, (last - n) / st];
-                let cell_min = (0..3).filter(|&i| unit[i] > 0).map(|i| cell_d[i] + 1).min().unwrap_or(u32::MAX);
-                extent = extent.max(cell_min.min(slice_min));
+                let mut t = slice_t;
+                let mut alive = true;
+                for j in 0..3 {
+                    match steps_left(cell_d[j], o[j], l[j]) {
+                        Some(x) => t = t.min(x),
+                        None => alive = false,
+                    }
+                }
+                if alive {
+                    extent = extent.max(t.saturating_add(1));
+                }
             }
         }
         extent
@@ -1084,44 +1127,54 @@ impl Layout {
     /// the top), whatever depth this layout is at. On a line (or the base triangle) of
     /// modulus m, L layers off each of c of the left, right and front sides leave a cell
     /// exactly while m − 1 ≥ c·L·s; the top and the base take whole lines (slices).
-    fn face_peel_extent(&self, unit: [u32; 5]) -> u32 {
+    ///
+    /// With depths of their own, side j at o_j + l_j·t after t shared layers: the left,
+    /// right and front sides together cut Σ (o_j + l_j·t) layers from each line, which
+    /// keeps a cell exactly while (m − 1) / s is at least that.
+    fn face_peel_extent(&self, o: [u32; 5], l: [u32; 5]) -> u32 {
         let st = self.stride;
-        let c = unit[..3].iter().filter(|&&d| d > 0).count() as u32;
-        let (top, bottom) = (unit[3] > 0, unit[4] > 0);
-        let sides_ok = |m: u32, l: u32| c == 0 || (m - 1) / st >= c * l;
-        let lives = |m: u32| ((m - 1) / st).checked_div(c).unwrap_or(u32::MAX);
+        let (so, sl) = (o[0] + o[1] + o[2], l[0] + l[1] + l[2]);
+        let sides = |m: u32| steps_left((m - 1) / st, so, sl);
+        let both = |a: Option<u32>, b: Option<u32>| a.zip(b).map(|(a, b)| a.min(b));
         if self.face == Face::Base {
-            let len = self.mods.len();
-            if bottom {
-                // each layer shows the slice one modulus up
-                let mut l = 0;
-                while (l as usize) < len {
-                    let i = (len - 1 - l as usize) as u32;
-                    if (top && i < l) || !sides_ok(self.mods[i as usize], l) {
+            let len = self.mods.len() as u32;
+            if l[4] > 0 {
+                // each shared layer shows the slice one modulus up
+                let mut t = 0;
+                loop {
+                    let up = o[4] + t;
+                    if up >= len {
                         break;
                     }
-                    l += 1;
+                    let i = len - 1 - up;
+                    let top_ok = i >= o[3] + l[3] * t;
+                    let sides_ok = (self.mods[i as usize] - 1) / st >= so + sl * t;
+                    if !top_ok || !sides_ok {
+                        break;
+                    }
+                    t += 1;
                 }
-                return l;
+                return t;
             }
-            let i = (len - 1) as u32;
-            let most = lives(self.mods[len - 1]).min(if top { i } else { u32::MAX });
-            return most.saturating_add(1);
+            let Some(i) = (len - 1).checked_sub(o[4]) else { return 0 };
+            return both(sides(self.mods[i as usize]), steps_left(i, o[3], l[3])).map_or(0, |t| t.saturating_add(1));
         }
         let rows = drawn(View::Face, &self.mods, self.spacing, st);
         let n = rows.len() as u32;
-        rows.iter().enumerate().map(|(r, &i)| {
+        rows.iter().enumerate().filter_map(|(r, &i)| {
             let r = r as u32;
-            let most = lives(self.mods[i]).min(if top { r } else { u32::MAX }).min(if bottom { n - 1 - r } else { u32::MAX });
-            most.saturating_add(1)
+            both(both(sides(self.mods[i]), steps_left(r, o[3], l[3])), steps_left(n - 1 - r, o[4], l[4])).map(|t| t.saturating_add(1))
         }).max().unwrap_or(0)
     }
 
     /// A camera looking square onto a side of the stack (or straight down / up),
     /// framing the whole stack, from the stack's own corners so every shape works.
-    pub fn snap_camera(&self, snap: Snap) -> Camera {
-        let mut cam = Camera::framing(self.bounds());
-        let (Some(first), Some(last)) = (self.slices.first(), self.slices.last()) else { return cam };
+    /// The stack's outward unit normals, in `Side::ALL` order: its left, right and
+    /// front faces (from its own corners, so every shape works), the top (up) and the
+    /// base (down).
+    pub fn side_normals(&self) -> [[f32; 3]; 5] {
+        let mut out = [[0.0; 3], [0.0; 3], [0.0; 3], [0.0, 1.0, 0.0], [0.0, -1.0, 0.0]];
+        let (Some(first), Some(last)) = (self.slices.first(), self.slices.last()) else { return out };
         let apex = self.corners(first.m, first.height())[0];
         let [b0, bl, br] = self.corners(last.m, last.height());
         // outward normal of the plane through a, b, c, away from the opposite corner
@@ -1132,12 +1185,49 @@ impl Layout {
             }
             nrm
         };
+        out[0] = outward(apex, b0, bl, br);
+        out[1] = outward(apex, b0, br, bl);
+        out[2] = outward(apex, bl, br, b0);
+        out
+    }
+
+    /// The cell's offset when the peel's last layers are drawn pulled out by `gap`
+    /// (world units): Some(Σ gap·normal of every side whose last removed layer holds
+    /// it) for a cell in a last layer, None for a cell still on the stack or peeled
+    /// deeper than any side's last layer. As the draw shader decides.
+    pub fn shell_offset(&self, si: usize, n: u32, k: u32, depths: [u32; 5], gap: f32) -> Option<[f32; 3]> {
+        if self.view == View::Diamond || !self.peeled(si, n, k, depths) {
+            return None;
+        }
+        // one layer shallower on every side: still peeled there means deeper than the
+        // last layers
+        if self.peeled(si, n, k, depths.map(|d| d.saturating_sub(1))) {
+            return None;
+        }
+        let normals = self.side_normals();
+        let mut off = [0.0; 3];
+        for (i, nrm) in normals.iter().enumerate() {
+            let mut one = [0; 5];
+            one[i] = depths[i];
+            if self.peeled(si, n, k, one) {
+                off = add(off, scale(*nrm, gap));
+            }
+        }
+        Some(off)
+    }
+
+    pub fn snap_camera(&self, snap: Snap) -> Camera {
+        let mut cam = Camera::framing(self.bounds());
+        if self.slices.is_empty() {
+            return cam;
+        }
+        let nrm = self.side_normals();
         let dir = match snap {
-            Snap::Top => [0.0, 1.0, 0.0],
-            Snap::Bottom => [0.0, -1.0, 0.0],
-            Snap::Left => outward(apex, b0, bl, br),
-            Snap::Right => outward(apex, b0, br, bl),
-            Snap::Front => outward(apex, bl, br, b0),
+            Snap::Top => nrm[3],
+            Snap::Bottom => nrm[4],
+            Snap::Left => nrm[0],
+            Snap::Right => nrm[1],
+            Snap::Front => nrm[2],
         };
         // eye = target + dir·dist, with eye = target + (sin yaw·cos pitch, sin pitch, −cos yaw·cos pitch)
         cam.pitch = dir[1].clamp(-1.0, 1.0).asin().clamp(-1.55, 1.55);
@@ -1889,6 +1979,115 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn sides_keep_their_own_depths_and_linked_ones_move_together() {
+        // offsets of their own, some sides linked: the depths add up, and the extent is
+        // exactly the shared layers that clear everything (brute force, stack and faces)
+        let p = Peel { sides: [true, false, true, false, false], layers: 2, offset: [1, 3, 0, 2, 0], ..Peel::default() };
+        assert_eq!(p.depths(), [3, 3, 2, 2, 0]);
+        assert!(p.any() && p.active());
+        let unlinked = Peel { sides: [false; 5], offset: [0, 4, 0, 0, 0], ..Peel::default() };
+        assert!(unlinked.any() && !unlinked.active());
+        let cases: [([bool; 5], [u32; 5]); 6] = [
+            ([true, false, true, false, false], [1, 3, 0, 2, 0]),
+            ([false, true, false, false, false], [2, 0, 1, 0, 1]),
+            ([true; 5], [0, 1, 2, 0, 3]),
+            ([false, false, false, true, false], [0, 0, 0, 0, 4]),
+            ([false, false, false, false, true], [2, 2, 0, 3, 0]),
+            ([true, true, false, false, false], [40, 0, 0, 0, 0]), // the offset alone clears it
+        ];
+        let mods: Vec<u32> = (2..=30).collect();
+        for budget in [u32::MAX, 3_000] {
+            let l = Layout::build(View::Stack, &mods, Spacing::True, Shape::Regular, budget);
+            let cells: Vec<(usize, u32, u32)> = (0..l.total).map(|g| l.cell(g).unwrap()).collect();
+            for (sides, offset) in cases {
+                let p = Peel { sides, offset, ..Peel::default() };
+                let left = |layers: u32| cells.iter().filter(|&&(si, n, k)| !l.peeled(si, n, k, Peel { layers, ..p }.depths())).count();
+                let extent = l.peel_extent(&p);
+                assert_eq!(left(extent), 0, "{sides:?} {offset:?}: {extent} leave cubes");
+                if extent > 0 {
+                    assert!(left(extent - 1) > 0, "{sides:?} {offset:?}: {extent} is one too many");
+                } else {
+                    assert_eq!(left(0), 0);
+                }
+            }
+        }
+        for face in Face::ALL {
+            for (sides, offset) in cases {
+                let p = Peel { sides, offset, ..Peel::default() };
+                let at = |layers: u32| {
+                    let d = Peel { layers, ..p }.depths();
+                    let l = Layout::build_face(face, face.side().map_or(0, |i| d[i]), &mods, Spacing::True, Shape::Regular, u32::MAX);
+                    let left = (0..l.total).filter(|&g| {
+                        let (si, n, k) = l.cell(g).unwrap();
+                        !l.peeled(si, n, k, d)
+                    }).count();
+                    (l, left)
+                };
+                let extent = at(0).0.peel_extent(&p);
+                assert_eq!(at(extent).1, 0, "{face:?} {sides:?} {offset:?}: {extent} leave cells");
+                if extent > 0 {
+                    assert!(at(extent - 1).1 > 0, "{face:?} {sides:?} {offset:?}: {extent} is one too many");
+                    // the same from any depth the face is already at
+                    assert_eq!(at(extent - 1).0.peel_extent(&p), extent, "{face:?} {sides:?} {offset:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_last_layers_off_each_side_float_out_joined() {
+        let l = Layout::build(View::Stack, &(2..=20).collect::<Vec<_>>(), Spacing::True, Shape::Regular, u32::MAX);
+        let nrm = l.side_normals();
+        // outward: each face normal points away from the stack's centre
+        let b = l.bounds();
+        let mid = scale(add(b.0, b.1), 0.5);
+        for (i, nv) in nrm.iter().enumerate() {
+            assert!((dot(*nv, *nv) - 1.0).abs() < 1e-4, "{i}");
+        }
+        for (si, s) in l.slices.iter().enumerate() {
+            let c = l.center(si, s.front, 0);
+            assert!(dot(nrm[0], sub(c, mid)) > 0.0, "left normal points out");
+        }
+        // left 2 deep, right 1, front none: the left's last layer is k = 1, the right's
+        // n − k = 0; the cell on both (n = 1, k = 1) moves out along both normals
+        let d = [2, 1, 0, 0, 0];
+        let gap = 3.0;
+        let mut seen = [0usize; 3];
+        for (si, s) in l.slices.iter().enumerate() {
+            for (n, k) in l.slice_cells(si) {
+                let got = l.shell_offset(si, n, k, d, gap);
+                let in_left = k == 1;
+                let in_right = n - k == 0 && k >= 1;
+                let deeper = k == 0;
+                let want = if deeper || !(in_left || in_right) {
+                    None
+                } else {
+                    let mut o = [0.0; 3];
+                    if in_left {
+                        o = add(o, scale(nrm[0], gap));
+                    }
+                    if in_right {
+                        o = add(o, scale(nrm[1], gap));
+                    }
+                    Some(o)
+                };
+                assert_eq!(got, want, "slice {si} m={} ({n}, {k})", s.m);
+                if got.is_some() {
+                    seen[usize::from(in_left) + 2 * usize::from(in_right) - 1] += 1;
+                }
+            }
+        }
+        // a left sheet, a right sheet, and the edge where they join
+        assert!(seen.iter().all(|&x| x > 0), "{seen:?}");
+        // the top's last slice moves up, the base's down
+        let d = [0, 0, 0, 1, 1];
+        assert_eq!(l.shell_offset(0, 0, 0, d, 2.0), Some(scale(nrm[3], 2.0)));
+        let last = l.slices.len() - 1;
+        assert_eq!(l.shell_offset(last, l.slices[last].front, 0, d, 2.0), Some(scale(nrm[4], 2.0)));
+        assert_eq!(l.shell_offset(1, 0, 0, d, 2.0), None, "still on the stack");
     }
 
     #[test]

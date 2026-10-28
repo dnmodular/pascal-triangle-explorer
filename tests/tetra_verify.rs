@@ -172,7 +172,7 @@ fn the_flat_views_draw_their_zeros_solid() {
     let (w, h) = (640u32, 480u32);
     r.ensure_target(w, h);
     let cam = Camera::flat(layout.bounds(), w as f32, h as f32, 0.0, 0.0);
-    let mut o = DrawOptions { camera: cam, fill: f32::NEG_INFINITY, hover: None, brush: 0.0, color_slice: false, ghosts: false, mask: false, flat: true, peel: [0; 5], solid_zeros: false, cell: Cell::Cube };
+    let mut o = DrawOptions { camera: cam, fill: f32::NEG_INFINITY, hover: None, brush: 0.0, color_slice: false, ghosts: false, mask: false, flat: true, peel: [0; 5], solid_zeros: false, cell: Cell::Cube, shell: None };
     r.draw_blocking(&o);
     let (_, _, holes) = r.read_target_rgba();
     o.solid_zeros = true;
@@ -346,7 +346,7 @@ fn the_stack_draws_green_wire_and_lit_brush_cells() {
     let (w, h) = (400u32, 300u32);
     r.ensure_target(w, h);
     let cam = Camera::framing(layout.bounds());
-    let mut o = DrawOptions { camera: cam, fill: f32::INFINITY, hover: None, brush: 3.0, color_slice: false, ghosts: false, mask: false, flat: false, peel: [0; 5], solid_zeros: false, cell: Cell::Cube };
+    let mut o = DrawOptions { camera: cam, fill: f32::INFINITY, hover: None, brush: 3.0, color_slice: false, ghosts: false, mask: false, flat: false, peel: [0; 5], solid_zeros: false, cell: Cell::Cube, shell: None };
     r.draw_blocking(&o);
     let (_, _, plain) = r.read_target_rgba();
     let bg = BACKGROUND.map(|c| (c * 255.0).round() as u8);
@@ -478,6 +478,67 @@ fn the_faces_peel_on_the_gpu() {
 /// sphere's per-pixel ray test and its written depth) names the cell the CPU ray cast
 /// through the same shapes hits, in the stack from around it, through a peel, and in
 /// the top face (the stack turned, the rhombi with it, seen orthographically).
+#[test]
+fn the_last_layers_off_each_side_draw_pulled_out() {
+    // left 2 deep, front 3: with the shell on, each side's last removed layer is drawn
+    // where the CPU puts it (pulled out along the side's normal, edges along both), and
+    // nothing else changes; picks still see the stack only
+    let (_gpu, mut r) = device();
+    let mods: Vec<u32> = (2..=40).collect();
+    let (layout, _) = scene(&mut r, &mods, Spacing::True, u32::MAX);
+    let (w, h) = (640u32, 480u32);
+    r.ensure_target(w, h);
+    let mut cam = layout.snap_camera(pascal::tetra::Snap::Left);
+    cam.dist *= 1.6;
+    cam.yaw += 0.35;
+    cam.pitch += 0.25;
+    let peel = [2, 0, 3, 0, 0];
+    let gap = 4.0;
+    let mut o = DrawOptions { camera: cam, fill: f32::NEG_INFINITY, hover: None, brush: 0.0, color_slice: false, ghosts: false, mask: false, flat: false, peel, solid_zeros: false, cell: Cell::Cube, shell: None };
+    r.draw_blocking(&o);
+    let (_, _, plain) = r.read_target_rgba();
+    o.shell = Some(gap);
+    r.draw_blocking(&o);
+    let (_, _, shell) = r.read_target_rgba();
+    let bg = BACKGROUND.map(|c| (c * 255.0).round() as u8);
+    let px = |img: &[u8], i: usize| [img[i * 4], img[i * 4 + 1], img[i * 4 + 2]];
+    // every shell cell the CPU places over background lands as color on the GPU
+    let (mut checked, mut landed, mut shells) = (0, 0, 0);
+    for si in 0..layout.slices.len() {
+        for (n, k) in layout.slice_cells(si) {
+            let Some(off) = layout.shell_offset(si, n, k, peel, gap * layout.stride as f32) else { continue };
+            shells += 1;
+            let c = layout.center(si, n, k);
+            let p = [c[0] + off[0], c[1] + off[1], c[2] + off[2]];
+            let Some((x, y)) = cam.project(w, h, p) else { continue };
+            let (x, y) = (x as u32, y as u32);
+            if x >= w || y >= h {
+                continue;
+            }
+            let i = (y * w + x) as usize;
+            if px(&plain, i) == bg {
+                checked += 1;
+                if px(&shell, i) != bg {
+                    landed += 1;
+                }
+            }
+        }
+    }
+    assert!(shells > 200 && checked > 50, "shells {shells}, checked {checked}");
+    assert!(landed * 100 >= checked * 97, "{landed} of {checked} shell cells drawn");
+    // the sheets show up as new color around the stack
+    let added = (0..(w * h) as usize).filter(|&i| px(&plain, i) == bg && px(&shell, i) != bg).count();
+    assert!(added > 500, "the sheets added {added} pixels");
+    // the pick sees the stack, never a sheet
+    for y in (0..h).step_by(16) {
+        for x in (0..w).step_by(16) {
+            if let Some(c) = r.pick_blocking_peeled(&cam, x as f32, y as f32, peel) {
+                assert!(!layout.peeled(c.slice as usize, c.n, c.k, peel), "picked a peeled cube {c:?}");
+            }
+        }
+    }
+}
+
 #[test]
 fn rhombic_and_sphere_cells_pick_what_the_ray_hits() {
     let (_gpu, mut r) = device();

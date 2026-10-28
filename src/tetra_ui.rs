@@ -25,7 +25,7 @@ const UNFOLD_TIME: f32 = 1.1;
 const SNAP_TIME: f32 = 0.45;
 /// What a peel extent was counted for: the sides, and the layout (view, face, total,
 /// stride, slices).
-type PeelKey = ([bool; 5], View, Face, u32, u32, usize);
+type PeelKey = ([bool; 5], [u32; 5], View, Face, u32, u32, usize);
 /// Width of the space's options panel (points).
 const OPTIONS_W: f32 = 270.0;
 
@@ -160,7 +160,7 @@ impl TetraView {
     pub fn peel_extent(&mut self) -> u32 {
         let Some(l) = &self.layout else { return 0 };
         let p = self.config.peel;
-        let key = (p.sides, l.view, l.face, l.total, l.stride, l.slices.len());
+        let key = (p.sides, p.offset, l.view, l.face, l.total, l.stride, l.slices.len());
         match self.peel_extent {
             Some((k, e)) if k == key => e,
             _ => {
@@ -225,6 +225,22 @@ impl TetraView {
             };
             p.sides[i] = true;
         }
+    }
+
+    /// The most layers side `i` can lose on its own before nothing of the stack is left.
+    pub fn side_cap(&self, i: usize) -> u32 {
+        self.layout.as_ref().map_or(0, |l| l.peel_extent(&self.config.peel.alone(i)))
+    }
+
+    /// Move side `i`'s own depth by `d` layers (the linked sides' shared layers stay):
+    /// within 0 and the side's cap.
+    pub fn step_side(&mut self, i: usize, d: i32) {
+        let cap = self.side_cap(i);
+        let p = &mut self.config.peel;
+        p.playing = false;
+        let shared = if p.sides[i] { p.layers } else { 0 };
+        let depth = (p.offset[i] as i64 + shared as i64 + d as i64).clamp(shared as i64, cap.max(shared) as i64);
+        p.offset[i] = (depth - shared as i64) as u32;
     }
 
     /// Step the peel by `d` layers by hand (it stops playing): clamped at nothing
@@ -465,7 +481,7 @@ pub fn render(model: &mut Model, cache: &mut TetraCache, r: &mut TetraRenderer, 
     let solid_zeros = t.open && view.flat() && t.config.solid_zeros;
     // (the tile keeps its wire cubes)
     let cell = if t.open { t.config.cell } else { Cell::Cube };
-    let opts = DrawOptions { camera, fill: t.fill_height(), hover, brush: t.config.brush, color_slice: t.config.color_slice, ghosts: t.config.ghosts, mask, flat: t.open && view.flat(), peel, solid_zeros, cell };
+    let opts = DrawOptions { camera, fill: t.fill_height(), hover, brush: t.config.brush, color_slice: t.config.color_slice, ghosts: t.config.ghosts, mask, flat: t.open && view.flat(), peel, solid_zeros, cell, shell: (t.peeling() && t.config.peel.shell && view == View::Stack).then_some(t.config.peel.gap) };
     // an unchanged picture is not drawn again (hover, egui repaints)
     let drawn = (opts, t.target_px);
     if recreated || cache.drawn != Some(drawn) {
@@ -644,21 +660,50 @@ fn options(ui: &mut egui::Ui, t: &mut TetraView) {
     note(ui, "Keys: V next view · F next face · C next cell · 1–5 snap the stack's camera · ← → step the peel a layer (Shift: ten) · Home / End none / all · P play it, R rewind · U unfold again · G spacing · O options · Esc back. Stack: drag orbit, right / shift-drag pan, wheel zoom. Faces and diamond: drag pan, wheel zoom. Double-click reframes.");
 }
 
-/// The peel: which sides, how many layers, and the animation that takes them off one by
-/// one and starts over.
+/// The peel: each side's own depth, which sides are linked to the shared layers, and the
+/// animation that takes the linked sides' layers off one by one and starts over.
 fn peel_controls(ui: &mut egui::Ui, t: &mut TetraView) {
     let extent = t.peel_extent();
     let p = &mut t.config.peel;
     // (another view or face may peel away in fewer layers)
-    if !p.playing && p.active() && extent > 0 {
+    if !p.playing && p.active() {
         p.layers = p.layers.min(extent);
     }
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("peel").color(ui.visuals().weak_text_color()));
+        ui.label(egui::RichText::new("link · side · own depth").small().color(ui.visuals().weak_text_color()));
     });
-    for (sd, on) in Side::ALL.into_iter().zip(p.sides.iter_mut()) {
-        ui.checkbox(on, sd.label()).on_hover_text(format!("Peel the {} side; unchecked sides stay", sd.name()));
+    let depths = p.depths();
+    let mut side_step: Option<(usize, i32)> = None;
+    for (i, sd) in Side::ALL.into_iter().enumerate() {
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut p.sides[i], "").on_hover_text(format!("Link the {} side: the shared controls below (← →, play, rewind) peel it together with the other linked sides, each from its own depth", sd.name()));
+            ui.add_sized([128.0, 18.0], egui::Label::new(sd.label()));
+            let small = |ui: &mut egui::Ui, text: &str, tip: &str| ui.add(egui::Button::new(egui::RichText::new(text).monospace()).small()).on_hover_text(tip).clicked();
+            if small(ui, "◀", &format!("One layer back on the {} side alone", sd.name())) {
+                side_step = Some((i, -1));
+            }
+            mono_line(ui, &format!("{:>3}", depths[i]));
+            if small(ui, "▶", &format!("One layer more off the {} side alone", sd.name())) {
+                side_step = Some((i, 1));
+            }
+            if p.offset[i] > 0 && small(ui, "↺", "Back to the shared layers only (its own extra layers off)") {
+                side_step = Some((i, -(p.offset[i] as i32)));
+            }
+        });
     }
+    ui.checkbox(&mut p.shell, "show the last layer off each side").on_hover_text("Draw each side's most recently removed layer (the stack view), pulled out from the stack along that side's outward normal. Cells where two sides' last layers meet move out along both, so the sheets stay joined at their edges.");
+    if p.shell {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("gap").color(ui.visuals().weak_text_color()));
+            mono_drag(ui, &mut p.gap, 0.0..=200.0, 0.05).on_hover_text("How far the removed layers float out from the stack, in cells");
+            ui.label(egui::RichText::new("cells").color(ui.visuals().weak_text_color()));
+        });
+    }
+    if let Some((i, d)) = side_step {
+        t.step_side(i, d);
+    }
+    let p = &mut t.config.peel;
     if !p.active() {
         return;
     }
@@ -688,7 +733,7 @@ fn peel_controls(ui: &mut egui::Ui, t: &mut TetraView) {
     });
     ui.horizontal(|ui| {
         ui.spacing_mut().slider_width = 150.0;
-        ui.add(egui::Slider::new(&mut p.layers, 0..=extent.max(1)).show_value(false)).on_hover_text("Layers peeled (← → step)");
+        ui.add(egui::Slider::new(&mut p.layers, 0..=extent.max(1)).show_value(false)).on_hover_text("Shared layers off the linked sides (← → step)");
         mono_line(ui, &format!("{} / {}", p.layers, extent));
     });
     ui.horizontal(|ui| {
@@ -1050,10 +1095,18 @@ pub fn space(ui: &mut egui::Ui, model: &mut Model, ppp: f32, tex: Option<egui::T
                 }
             }
             let p = t.config.peel;
-            if l.view != View::Diamond && p.active() && (p.layers > 0 || p.playing) {
-                let names: Vec<&str> = p.checked().map(Side::name).collect();
-                let how = if names.len() == Side::ALL.len() { "every side".to_string() } else { names.join(", ") };
-                lines.push(format!("peeled: {} layer{} off {how}{} (← → step · P play · R rewind)", p.layers, if p.layers == 1 { "" } else { "s" }, if !p.playing { "" } else if p.backward { ", rewinding" } else { ", playing" }));
+            if l.view != View::Diamond && (p.any() || p.playing) {
+                let d = p.depths();
+                let uniform = p.offset.iter().all(|&o| o == 0) && p.active();
+                let what = if uniform {
+                    let names: Vec<&str> = p.checked().map(Side::name).collect();
+                    let how = if names.len() == Side::ALL.len() { "every side".to_string() } else { names.join(", ") };
+                    format!("{} layer{} off {how}", p.layers, if p.layers == 1 { "" } else { "s" })
+                } else {
+                    let each: Vec<String> = Side::ALL.into_iter().enumerate().filter(|&(i, _)| d[i] > 0 || p.sides[i]).map(|(i, sd)| format!("{} {}{}", sd.name(), d[i], if p.sides[i] { "•" } else { "" })).collect();
+                    format!("{} (• linked)", each.join(" · "))
+                };
+                lines.push(format!("peeled: {what}{} (← → step the linked · P play · R rewind)", if !p.playing { "" } else if p.backward { ", rewinding" } else { ", playing" }));
             }
             let lens = match model.layers.preset() {
                 Some(Preset::Mask) => "mask",

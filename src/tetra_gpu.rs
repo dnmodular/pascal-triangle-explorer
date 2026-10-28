@@ -137,6 +137,10 @@ struct DrawParams {
     fwd: [f32; 4],
     right: [f32; 4],
     up: [f32; 4],
+    /// x: the last removed layers' gap (world units), y: 1 when they are drawn.
+    shell: [f32; 4],
+    /// The sides' outward normals (`Side::ALL` order), for the gap.
+    nrm: [[f32; 4]; 5],
 }
 
 const FLAG_SLICE: u32 = 1;
@@ -280,6 +284,9 @@ pub struct DrawOptions {
     pub solid_zeros: bool,
     /// What the cells are drawn as (the stack and the top face; elsewhere boxes).
     pub cell: Cell,
+    /// Draw each side's last removed layer pulled out this many cells along the side's
+    /// normal (the stack view; None: peeled cells are not drawn).
+    pub shell: Option<f32>,
 }
 
 /// What a pick sees: the peel, whether the zeros are solid (and pickable), the cells.
@@ -699,7 +706,12 @@ impl TetraRenderer {
         let (f, r, u) = o.camera.basis();
         let e = o.camera.eye();
         let persp = if o.camera.ortho > 0.0 { 0.0 } else { 1.0 };
-        DrawParams { view_proj, hover, half: [he[0], he[1], he[2], brush], wire: if ghost { [0.55, 0.75, 0.6, 1.0] } else { WIRE }, hover_slice, flags, line_px: 0.75, ghost_alpha: 0.07, fill: [o.fill.clamp(-1e30, 1e30), 0.0, 0.0, 0.0], peel_a, peel_b, eye: [e[0], e[1], e[2], persp], fwd: [f[0], f[1], f[2], 0.0], right: [r[0], r[1], r[2], 0.0], up: [u[0], u[1], u[2], 0.0] }
+        let shell = match o.shell {
+            Some(gap) if s.layout.view == View::Stack && gap.is_finite() => [gap.clamp(0.0, 1e4) * st as f32, 1.0, 0.0, 0.0],
+            _ => [0.0; 4],
+        };
+        let nrm = s.layout.side_normals().map(|v| [v[0], v[1], v[2], 0.0]);
+        DrawParams { view_proj, hover, half: [he[0], he[1], he[2], brush], wire: if ghost { [0.55, 0.75, 0.6, 1.0] } else { WIRE }, hover_slice, flags, line_px: 0.75, ghost_alpha: 0.07, fill: [o.fill.clamp(-1e30, 1e30), 0.0, 0.0, 0.0], peel_a, peel_b, eye: [e[0], e[1], e[2], persp], fwd: [f[0], f[1], f[2], 0.0], right: [r[0], r[1], r[2], 0.0], up: [u[0], u[1], u[2], 0.0], shell, nrm }
     }
 
     /// Point both indirect draws (the nonzero cubes, the zeros) at `cell`'s indices; the
@@ -786,7 +798,7 @@ impl TetraRenderer {
             return false;
         }
         let (Some(t), Some(s)) = (&self.target, &self.scene) else { return false };
-        let o = DrawOptions { camera: *camera, fill: f32::INFINITY, hover: None, brush: 0.0, color_slice: false, ghosts: false, mask: false, flat: false, peel, solid_zeros: false, cell };
+        let o = DrawOptions { camera: *camera, fill: f32::INFINITY, hover: None, brush: 0.0, color_slice: false, ghosts: false, mask: false, flat: false, peel, solid_zeros: false, cell, shell: None };
         self.use_cell(s, cell, camera);
         let sphere = s.layout.draws(cell) == Cell::Sphere && !flat_view(camera);
         let vp = camera.pick_view_proj(t.w, t.h, px, py);

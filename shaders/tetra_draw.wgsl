@@ -42,6 +42,8 @@ struct DrawParams {
   fwd: vec4<f32>,
   right: vec4<f32>,
   up: vec4<f32>,
+  shell: vec4<f32>,     // x: the last removed layers' gap (world), y: 1 when they are drawn
+  nrm: array<vec4<f32>, 5>,   // the sides' outward normals: left, right, front, top, base
 };
 
 struct Slice {
@@ -103,6 +105,44 @@ fn peeled(c: vec2<u32>, si: u32, s: Slice) -> bool {
       || (D.peel_a.z > 0u && last - n < D.peel_a.z)
       || (D.peel_a.w > 0u && layer < D.peel_a.w)
       || (D.peel_b.x > 0u && D.peel_b.y - 1u - layer < D.peel_b.x);
+}
+
+// The same, every side one layer shallower: still peeled there means deeper than the
+// side's last removed layer.
+fn peeled_shallower(c: vec2<u32>, s: Slice) -> bool {
+  let n = c.x & 0xffffu;
+  let k = c.x >> 16u;
+  let last = s.peel_id & 0xffffu;
+  let layer = s.peel_id >> 16u;
+  let st = D.peel_b.z;
+  let a = vec3<u32>(select(0u, D.peel_a.x - st, D.peel_a.x > st), select(0u, D.peel_a.y - st, D.peel_a.y > st), select(0u, D.peel_a.z - st, D.peel_a.z > st));
+  let top = select(0u, D.peel_a.w - 1u, D.peel_a.w > 1u);
+  let base = select(0u, D.peel_b.x - 1u, D.peel_b.x > 1u);
+  return (a.x > 0u && k < a.x)
+      || (a.y > 0u && n - k < a.y)
+      || (a.z > 0u && last - n < a.z)
+      || (top > 0u && layer < top)
+      || (base > 0u && D.peel_b.y - 1u - layer < base);
+}
+
+// Where a cell goes: xyz its offset, w 1 when it is drawn. A cell on the stack stays;
+// a peeled one is drawn only in a side's last removed layer while those show, pulled
+// out along the normal of every side whose last layer holds it (an edge cell along
+// two), so the sheets stay joined.
+fn placement(c: vec2<u32>, si: u32, s: Slice) -> vec4<f32> {
+  if (!peeled(c, si, s)) { return vec4<f32>(0.0, 0.0, 0.0, 1.0); }
+  if (D.shell.y < 0.5 || peeled_shallower(c, s)) { return vec4<f32>(0.0); }
+  let n = c.x & 0xffffu;
+  let k = c.x >> 16u;
+  let last = s.peel_id & 0xffffu;
+  let layer = s.peel_id >> 16u;
+  var dir = vec3<f32>(0.0);
+  if (D.peel_a.x > 0u && k < D.peel_a.x) { dir = dir + D.nrm[0].xyz; }
+  if (D.peel_a.y > 0u && n - k < D.peel_a.y) { dir = dir + D.nrm[1].xyz; }
+  if (D.peel_a.z > 0u && last - n < D.peel_a.z) { dir = dir + D.nrm[2].xyz; }
+  if (D.peel_a.w > 0u && layer < D.peel_a.w) { dir = dir + D.nrm[3].xyz; }
+  if (D.peel_b.x > 0u && D.peel_b.y - 1u - layer < D.peel_b.x) { dir = dir + D.nrm[4].xyz; }
+  return vec4<f32>(dir * D.shell.x, 1.0);
 }
 
 // Outside the clip volume: a peeled cube's triangles collapse and are clipped.
@@ -196,7 +236,8 @@ fn cube_vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> 
   let c = cubes[cube_index(ii)];
   let si = c.y & 0xffffu;
   let s = slices[si];
-  let center = cube_center(c, s);
+  let place = placement(c, si, s);
+  let center = cube_center(c, s) + place.xyz;
   let cv = cell_vertex(vi);
   let world = center + cv.offset;
   var lit = false;
@@ -209,7 +250,7 @@ fn cube_vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> 
     }
   }
   var out: CubeOut;
-  out.pos = select(D.view_proj * vec4<f32>(world, 1.0), NOWHERE, peeled(c, si, s));
+  out.pos = select(D.view_proj * vec4<f32>(world, 1.0), NOWHERE, place.w < 0.5);
   out.local = cv.local;
   out.world = world;
   out.center = center;

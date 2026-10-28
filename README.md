@@ -424,10 +424,21 @@ voids run through the solid as tunnels.
   so. The HUD shows the shape, m and its factorization, n, k and the residue.
 * **Peel** (stack and face views): takes the stack apart layer by layer from its sides: left
   (k = 0), right (k = n), front (the last rows), top (slices from the apex down) and
-  base (slices from the bottom up). Each side has a checkbox: the checked sides peel
-  together, the same number of layers each, and the unchecked ones stay (check one
-  side to peel just it, or all but one to keep that one). **P** checks the left side
-  (in a face view, that face's own side) if none is checked. A layer is a row or cell of the stride
+  base (slices from the bottom up). Each side has a depth of its own and a link
+  checkbox. The side's own ◀ ▶ move just that side a layer (↺ takes its own layers
+  back off); the shared controls below move every linked side together, each from
+  its own depth: left 3 and front 7, both linked, step to 4 and 8, while an unlinked
+  side holds wherever it was left. With no own layers and every linked side at the
+  shared count, that is the plain uniform peel (link one side to peel just it, or all
+  but one to keep that one). The shared count runs to the fewest shared layers that
+  clear the stack from the sides' own depths (an exact count: per cell, or per
+  line of a face, where the left, right and front sides together cut the sum of
+  their depths). **P** links the left side (in a face view, that face's own side) if
+  none is linked. *Show the last layer off each side* (stack view) draws each
+  side's most recently removed layer pulled out of the stack by *gap* cells along
+  the side's outward normal; a cell in two sides' last layers (an edge) moves out
+  along both, so the sheets stay joined at their edges, and the corners along all
+  three. They are drawn, not picked: the pick sees the stack. A layer is a row or cell of the stride
   on the sides and a drawn slice at the top and the base. **←** / **→** step it a
   layer back or on (**Shift** ten), **Home** / **End** go to nothing / everything
   peeled, and the buttons do the same (|◀ ◀| |▶ ▶|). ▶ (or **P**) plays it, a layer
