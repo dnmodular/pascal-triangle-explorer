@@ -27,11 +27,3 @@ fn value_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     cells[P.grid_w * P.grid_h + idx] = vec2<u32>(residue_b(c.n, c.k), 0u);
   }
 }
-
-// a·b mod m for a, b < m ≤ 2^20 in 32-bit steps: b split into 10-bit halves, every
-// product below 2^30
-fn mulmod20(a: u32, b: u32, m: u32) -> u32 {
-  let hi = (a * (b >> 10u)) % m;
-  let lo = (a * (b & 1023u)) % m;
-  return ((hi << 10u) % m + lo) % m;
-}

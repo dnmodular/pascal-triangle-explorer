@@ -146,10 +146,21 @@ fn residue_b(n: u32, k: u32) -> u32 {
   return x;
 }
 
-// C(n,k) mod m (0 outside the triangle).
+// a·b mod m for a, b < m ≤ 2^20 in 32-bit steps: b split into 10-bit halves, every
+// product below 2^30
+fn mulmod20(a: u32, b: u32, m: u32) -> u32 {
+  let hi = (a * (b >> 10u)) % m;
+  let lo = (a * (b & 1023u)) % m;
+  return ((hi << 10u) % m + lo) % m;
+}
+
+// The residue as the cells hold it (0 outside the triangle): C(n,k) mod m, times q mod
+// m for a fraction μ = m/q, so it compares with `cells[..].x` at any modulus.
 fn residue_at(n: u32, k: u32) -> u32 {
   if (k > n) { return 0u; }
-  return residue_info(n, k, false).x;
+  let r = residue_info(n, k, false).x;
+  if (P.qscale > 1u) { return mulmod20(r, P.qscale, P.m); }
+  return r;
 }
 
 // Wrap-around distance between two residues mod m.
@@ -222,10 +233,22 @@ fn texel_of(px: f32, py: f32) -> vec2<i32> {
   return vec2<i32>(i32(iq), j);
 }
 
+// How far the row above (or below) is offset, in texels: left neighbour = i + shift − 1,
+// right = i + shift. 1:1 a texel is a cell and the offset is the change in k0 (0 or 1,
+// by the rows' parity). On a sampled lattice (a texel several cells wide) the columns
+// already line up in world x across rows, and the change in k0 counts cells, not
+// texels: there the texel rows are bricks instead, odd rows half a texel right, which
+// keeps the neighbourhood upright (no drift to one side over many passes).
+fn row_shift(j: i32, n_from: u32, n_to: u32) -> i32 {
+  if (P.sx > 1.0 || P.sy > 1.0) { return j & 1; }
+  return k0_of(n_to) - k0_of(n_from);
+}
+
 // Lattice neighbourhood of texel (i, j): the six neighbours of cell (n, k) are
 // (n, k±1), (n−1, k−1), (n−1, k), (n+1, k), (n+1, k+1). Rows above and below are
 // offset by the change in k0, so the brick pattern is followed exactly when a
-// texel is a cell. Returns the texel index or -1.
+// texel is a cell (and to the nearest texel on a sampled lattice). Returns the
+// texel index or -1.
 fn neighbor_index(i: i32, j: i32, which: u32) -> i32 {
   let W = i32(P.grid_w);
   let H = i32(P.grid_h);
@@ -237,14 +260,14 @@ fn neighbor_index(i: i32, j: i32, which: u32) -> i32 {
     let n = row_of(u32(j));
     let nup = row_of(u32(nj));
     if (n < 0 || nup < 0) { return -1; }
-    ni = i + (k0_of(u32(n)) - k0_of(u32(nup))) - 1 + i32(which);
+    ni = i + row_shift(j, u32(nup), u32(n)) - 1 + i32(which);
   } else if (which < 4u) {    // 2 down-left, 3 down-right
     nj = j + 1;
     if (nj >= H) { return -1; }
     let n = row_of(u32(j));
     let ndn = row_of(u32(nj));
     if (n < 0 || ndn < 0) { return -1; }
-    ni = i - (k0_of(u32(ndn)) - k0_of(u32(n))) + i32(which) - 2;
+    ni = i + i32(which) - 2 - select(k0_of(u32(ndn)) - k0_of(u32(n)), 1 - (j & 1), P.sx > 1.0 || P.sy > 1.0);
   } else if (which == 4u) {   // left
     ni = i - 1;
   } else {                    // right

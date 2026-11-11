@@ -158,12 +158,13 @@ pub fn ln_factorial_table() -> &'static [f32] {
 
 impl ModulusGpuData {
     pub fn new(md: &Modulus) -> Self {
-        Self::pair(md, None)
+        Self::pair(md, None, true)
     }
 
     /// The tables of `md` and, for a morph, of a second modulus `b` (its factor tables
-    /// appended, the descriptors pointing at them).
-    pub fn pair(md: &Modulus, b: Option<&Modulus>) -> Self {
+    /// appended, the descriptors pointing at them). `ranks`: with the prime-index
+    /// table, one entry per residue, which only PRIMES reads.
+    pub fn pair(md: &Modulus, b: Option<&Modulus>, ranks: bool) -> Self {
         let mut tables = Vec::new();
         let factors = factor_tables(md, &mut tables);
         let (factors_b, nfactors_b) = match b {
@@ -177,8 +178,10 @@ impl ModulusGpuData {
         tables.extend(ln_factorial_table().iter().map(|v| v.to_bits()));
         // 1-based prime index of every residue 0..m (PRIMES)
         let prank_off = tables.len() as u32;
-        let pt = crate::sweep::prime_tables();
-        tables.extend((0..md.m).map(|v| pt.rank(v)));
+        if ranks {
+            let pt = crate::sweep::prime_tables();
+            tables.extend((0..md.m).map(|v| pt.rank(v)));
+        }
         if tables.len() % 4 != 0 {
             tables.resize(tables.len() + 4 - tables.len() % 4, 0);
         }
@@ -745,6 +748,7 @@ pub struct Renderer {
     adapt_valid: bool,
     /// (m, q, the morph's second m or 0, spectral) last uploaded.
     uploaded_m: Option<(u32, u32, u32, bool)>,
+    uploaded_ranks: bool,
     uploaded_level_map: Option<[u8; 256]>,
     uploaded_scheme: Option<Scheme>,
     modulus_data: Option<ModulusGpuData>,
@@ -943,6 +947,7 @@ impl Renderer {
             hist_len: 0,
             adapt_valid: false,
             uploaded_m: None,
+            uploaded_ranks: false,
             uploaded_level_map: None,
             uploaded_scheme: None,
             modulus_data: None,
@@ -1081,21 +1086,26 @@ impl Renderer {
         self.grid = Some(*grid);
     }
 
-    fn ensure_modulus(&mut self, md: &Modulus, b: Option<&Modulus>, spectral: bool, phase: bool) {
+    fn ensure_modulus(&mut self, md: &Modulus, b: Option<&Modulus>, spectral: bool, phase: bool, ranks: bool) {
         // phase colors: the scaled residue as the whole numerator colors it
         let cq = if phase { 1 } else { md.q };
         let mb = b.map_or(0, |b| b.m);
-        if self.uploaded_m == Some((md.m, cq, mb, spectral)) {
+        // (the prime-index table is uploaded once PRIMES asks, then kept for this modulus)
+        let ranks_missing = ranks && !self.uploaded_ranks;
+        if self.uploaded_m == Some((md.m, cq, mb, spectral)) && !ranks_missing {
             return;
         }
-        if self.uploaded_m.map(|(m, _, b, _)| (m, b)) != Some((md.m, mb)) {
-            let data = ModulusGpuData::pair(md, b);
+        if self.uploaded_m.map(|(m, _, b, _)| (m, b)) != Some((md.m, mb)) || ranks_missing {
+            let mut data = ModulusGpuData::pair(md, b, ranks);
+            self.uploaded_ranks = ranks;
             let bytes = bytemuck::cast_slice::<u32, u8>(&data.tables);
             if (bytes.len() as u64) > self.tables_buf.size() {
                 self.tables_buf = buffer(&self.device, "tables", round_up(bytes.len() as u64, 4096) * 2, STORAGE_RW);
                 self.rebuild_bg0();
             }
             self.queue.write_buffer(&self.tables_buf, 0, bytes);
+            // (only the descriptors are read from here on)
+            data.tables = Vec::new();
             self.modulus_data = Some(data);
         }
         // the morph's second modulus's levels follow, from a residue index that is a whole
@@ -1240,7 +1250,7 @@ impl Renderer {
         };
         let work_elem = if variant == 0 { 4 } else { 16 };
         self.ensure_grid(&input.grid, work_elem);
-        self.ensure_modulus(input.modulus, input.morph.map(|(b, _)| b), input.palette.scheme == Scheme::Spectral, input.style.phase);
+        self.ensure_modulus(input.modulus, input.morph.map(|(b, _)| b), input.palette.scheme == Scheme::Spectral, input.style.phase, input.layers.is_active(LayerId::Primes));
         self.ensure_palette(input.palette);
         self.ensure_level_map(input.palette.level_map(input.modulus.m, input.style.offset));
         self.pass_params.clear();
@@ -1503,6 +1513,14 @@ impl Renderer {
                         let hist = Bind::whole(&self.hist_buf);
                         let pp = PassParams { hist_start, hist_len, hist_cap: self.hist_cap, stride: self.stride, ..Default::default() };
                         self.dispatch_field(enc, passes, &fp.temporal, w(cur), w(dst), hist, fields_all, pp, false);
+                        // record this frame's under-field now: later transforms reuse
+                        // the working buffers (after the read: the ring slot written
+                        // may be the oldest one just averaged)
+                        if input.advance {
+                            let dst_off = self.hist_next as u64 * wbytes;
+                            enc.copy_buffer_to_buffer(&self.work[cur], 0, &self.hist_buf, dst_off, wbytes);
+                            out.hist_recorded = true;
+                        }
                         free.insert(0, cur);
                         cur = dst;
                     }
@@ -1558,12 +1576,6 @@ impl Renderer {
                 }
                 _ => {}
             }
-        }
-
-        if temporal_on && input.advance {
-            let dst_off = self.hist_next as u64 * wbytes;
-            enc.copy_buffer_to_buffer(&self.work[0], 0, &self.hist_buf, dst_off, wbytes);
-            out.hist_recorded = true;
         }
 
         // 5. resolve

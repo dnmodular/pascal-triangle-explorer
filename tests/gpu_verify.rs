@@ -771,6 +771,106 @@ fn transforms_match_cpu() {
 }
 
 #[test]
+fn temporal_history_survives_a_band_pass_and_fractions_compare_like_with_like() {
+    let (_gpu, mut r) = device();
+    let pal = Palette::new(Scheme::CoolWarm);
+    let (_, grid) = cell_grid(80);
+    // temporal AVERAGE under BAND PASS: the ring must hold the blended field, not a
+    // band-pass intermediate, so identical frames keep giving the first frame's result
+    let md = Modulus::new(6);
+    let mut layers = LayerState::default();
+    layers.set_active(LayerId::Value, false);
+    layers.set_active(LayerId::Kummer, true);
+    layers.set_active(LayerId::Average, true);
+    layers.avg_mode = AvgMode::Temporal;
+    layers.params.insert("avgAmount", 4);
+    layers.set_active(LayerId::BandPass, true);
+    for (lo, hi) in [(1, 6), (0, 3), (2, 5)] {
+        layers.params.insert("bandLo", lo);
+        layers.params.insert("bandHi", hi);
+        r.reset_history();
+        r.render_blocking(&frame(grid, &md, &pal, &layers));
+        let first = r.read_work();
+        for i in 0..4 {
+            r.render_blocking(&frame(grid, &md, &pal, &layers));
+            assert_close(&r.read_work(), &first, 2e-6, &format!("keep {lo} cut {hi}, frame {}", i + 2));
+        }
+    }
+    // LAG DIFF and GRADIENT at a fraction: neighbours are scaled as the cells are
+    // (s = q·C mod m), so the distances are those of the picture on screen
+    let md = Modulus::decimal(10, 7);
+    let cells = |r: &Renderer| r.read_cells();
+    let wrap = |a: u32, b: u32| a.abs_diff(b).min(md.m - a.abs_diff(b)) as f32;
+    for id in [LayerId::LagDiff, LayerId::Gradient] {
+        let mut layers = LayerState::default();
+        layers.set_active(LayerId::Value, false);
+        layers.set_active(id, true);
+        layers.params.insert("lagDir", 0);
+        layers.params.insert("lagLen", 1);
+        r.render_blocking(&frame(grid, &md, &pal, &layers));
+        let (c, got) = (cells(&r), r.read_field(0));
+        let mut checked = 0;
+        for j in 0..grid.h {
+            for i in 0..grid.w {
+                let Some((n, k)) = grid.cell_of(i, j) else { continue };
+                let idx = (j * grid.w + i) as usize;
+                assert_eq!(c[idx][0], md.scaled(n, k));
+                let v = md.scaled(n, k);
+                let want = if id == LayerId::LagDiff {
+                    wrap(v, md.scaled(n + 1, k))
+                } else if n == 0 {
+                    0.0
+                } else {
+                    (if k > 0 { wrap(v, md.scaled(n - 1, k - 1)) } else { 0.0 }) + (if k < n { wrap(v, md.scaled(n - 1, k)) } else { 0.0 })
+                };
+                assert_eq!(got[idx], want, "{id:?} at ({n}, {k})");
+                checked += 1;
+            }
+        }
+        assert!(checked > 1000, "{id:?}: {checked}");
+    }
+}
+
+#[test]
+fn zoomed_out_blurs_stay_upright() {
+    // a texel several cells wide: the triangle mod 2 is mirror-symmetric, and a wide
+    // blur of its density stays close to it when the neighbours above and below sit
+    // at the same world x. (A shift by the rows' cell offset, many texels, sheared it
+    // sideways: 0.23 here against 0.14. The sampling alone is not exactly symmetric,
+    // so a narrow blur shows more.)
+    let (_gpu, mut r) = device();
+    let pal = Palette::new(Scheme::Viridis);
+    let md = Modulus::new(2);
+    let (w, h) = (512u32, 444u32);
+    let rows = 4096.0;
+    let view = View::fit(w as f64, h as f64, rows);
+    let grid = GridSpec::new(&view, w, h, 1, 1 << 26);
+    assert!(grid.sx > 4.0 && grid.sy > 4.0, "{} {}", grid.sx, grid.sy);
+    let mut layers = LayerState::default();
+    layers.set_active(LayerId::Value, false);
+    layers.set_active(LayerId::Density, true);
+    let (gw, gh) = (grid.w as usize, grid.h as usize);
+    let mut asyms = Vec::new();
+    for radius in [1, 4, 16] {
+        layers.params.insert("densityR", radius);
+        r.render_blocking(&frame(grid, &md, &pal, &layers));
+        let f = r.read_field(0);
+        let (mut diff, mut sum) = (0f64, 0f64);
+        for j in 0..gh {
+            for i in 0..gw {
+                let (a, b) = (f[j * gw + i] as f64, f[j * gw + (gw - 1 - i)] as f64);
+                diff += (a - b).abs();
+                sum += a + b;
+            }
+        }
+        asyms.push(diff / sum.max(1e-9));
+    }
+    eprintln!("asymmetry {asyms:.4?}");
+    let asym = asyms[2];
+    assert!(asym < 0.19, "left and right differ by {asym:.3} of the field");
+}
+
+#[test]
 fn resolve_colors_match_palette_tables() {
     let (_gpu, mut r) = device();
     let rows = 60u32;
