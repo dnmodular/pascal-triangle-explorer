@@ -1,0 +1,1636 @@
+//! Modulus sweep: which moduli are visited, in which order, and the playback rules.
+//!
+//! A port of the reference's MOD_MODES / INTERVAL_SEQS / buildSeqMods / snapMod /
+//! nextModInDir / playBounds and the play timer (`reference/pascal.before-exploration.html`,
+//! identical in `pascal.html`). Pure logic, no UI: the app calls [`Sweep::step`],
+//! [`Sweep::tick`] and [`Sweep::snap`].
+
+use std::sync::OnceLock;
+
+use crate::math::MOD_CAP;
+
+/// Most decimal places between moduli.
+pub const MAX_DECIMALS: u32 = 9;
+
+/// Most moduli one sequence enumerates, and the iteration guard while accumulating.
+const SEQ_MAX: usize = 5000;
+const SEQ_STEP_GUARD: usize = 100_000;
+
+// ---------------------------------------------------------------------------------------
+// Prime families up to MOD_CAP (one sieve, built on first use).
+// ---------------------------------------------------------------------------------------
+
+pub struct PrimeTables {
+    pub primes: Vec<u32>,
+    composite: Vec<bool>,
+    /// The number of distinct prime factors of v when v is squarefree, else 0xFF.
+    sqf_omega: Vec<u8>,
+    pub semiprimes: Vec<u32>,
+    pub sphenics: Vec<u32>,
+}
+
+impl PrimeTables {
+    fn build() -> Self {
+        let cap = MOD_CAP as usize;
+        let mut composite = vec![false; cap + 1];
+        composite[0] = true;
+        composite[1] = true;
+        let mut i = 2;
+        while i * i <= cap {
+            if !composite[i] {
+                let mut j = i * i;
+                while j <= cap {
+                    composite[j] = true;
+                    j += i;
+                }
+            }
+            i += 1;
+        }
+        let primes: Vec<u32> = (2..=cap).filter(|&v| !composite[v]).map(|v| v as u32).collect();
+        // Distinct-pair semiprimes p·q, p < q.
+        let mut semiprimes = Vec::new();
+        for (a, &p) in primes.iter().enumerate() {
+            if (p as u64) * (p as u64) >= MOD_CAP as u64 {
+                break;
+            }
+            for &q in &primes[a + 1..] {
+                let v = p as u64 * q as u64;
+                if v > MOD_CAP as u64 {
+                    break;
+                }
+                semiprimes.push(v as u32);
+            }
+        }
+        semiprimes.sort_unstable();
+        // Sphenic numbers p·q·r of three distinct primes.
+        let mut sphenics = Vec::new();
+        for (a, &p) in primes.iter().enumerate() {
+            if (p as u64).pow(3) > MOD_CAP as u64 {
+                break;
+            }
+            for (b, &q) in primes.iter().enumerate().skip(a + 1) {
+                if p as u64 * q as u64 * q as u64 > MOD_CAP as u64 {
+                    break;
+                }
+                for &r in &primes[b + 1..] {
+                    let v = p as u64 * q as u64 * r as u64;
+                    if v > MOD_CAP as u64 {
+                        break;
+                    }
+                    sphenics.push(v as u32);
+                }
+            }
+        }
+        sphenics.sort_unstable();
+        let mut sqf_omega = vec![0u8; cap + 1];
+        for &p in &primes {
+            let p = p as usize;
+            for m in (p..=cap).step_by(p) {
+                sqf_omega[m] = sqf_omega[m].saturating_add(1);
+            }
+            if p * p <= cap {
+                for m in (p * p..=cap).step_by(p * p) {
+                    sqf_omega[m] = 0xFF;
+                }
+            }
+        }
+        PrimeTables { primes, composite, sqf_omega, semiprimes, sphenics }
+    }
+
+    /// The squarefree products of exactly r distinct primes in [lo, hi], ascending
+    /// (r = 1 the primes, 2 the distinct-pair semiprimes, 3 the sphenic numbers).
+    pub fn products_of(&self, r: u32, lo: u32, hi: u32) -> Vec<u32> {
+        let hi = hi.min(MOD_CAP) as usize;
+        (lo.max(2) as usize..=hi).filter(|&v| self.sqf_omega[v] as u32 == r).map(|v| v as u32).take(SEQ_MAX).collect()
+    }
+
+    pub fn is_prime(&self, v: u32) -> bool {
+        (v as usize) < self.composite.len() && !self.composite[v as usize]
+    }
+
+    /// 1-based index of `v` among the primes, 0 when `v` is not prime.
+    pub fn rank(&self, v: u32) -> u32 {
+        if !self.is_prime(v) {
+            return 0;
+        }
+        self.primes.partition_point(|&p| p < v) as u32 + 1
+    }
+}
+
+pub fn prime_tables() -> &'static PrimeTables {
+    static T: OnceLock<PrimeTables> = OnceLock::new();
+    T.get_or_init(PrimeTables::build)
+}
+
+// ---------------------------------------------------------------------------------------
+// Modes and sequences.
+// ---------------------------------------------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ModMode {
+    All,
+    Prime,
+    Composite,
+    Even,
+    Odd,
+    Interval,
+    /// Fractions P/Q with a prime numerator (see [`SuperPrimes`]); the 2D sweep only.
+    SuperPrime,
+    /// Every modulus of the range, each next one a structural relative of the last
+    /// (see [`kinship`]); the 2D sweep only.
+    Kinship,
+}
+
+impl ModMode {
+    pub const ALL: [ModMode; 8] = [ModMode::All, ModMode::Prime, ModMode::Composite, ModMode::Even, ModMode::Odd, ModMode::Interval, ModMode::SuperPrime, ModMode::Kinship];
+    /// The modes over whole moduli (the tetra stack's).
+    pub const WHOLE: [ModMode; 6] = [ModMode::All, ModMode::Prime, ModMode::Composite, ModMode::Even, ModMode::Odd, ModMode::Interval];
+    pub fn label(self) -> &'static str {
+        match self {
+            ModMode::All => "all",
+            ModMode::Prime => "primes",
+            ModMode::Composite => "composites",
+            ModMode::Even => "even",
+            ModMode::Odd => "odd",
+            ModMode::Interval => "interval",
+            ModMode::SuperPrime => "super primes",
+            ModMode::Kinship => "kinship",
+        }
+    }
+    pub fn note(self) -> &'static str {
+        match self {
+            ModMode::All => "Every modulus from 2 up. Steps move by 1.",
+            ModMode::Prime => "Prime moduli only, where Lucas and Kummer apply exactly.",
+            ModMode::Composite => "Composites (4 and up), where several prime gaskets interfere. Pairs well with CRT and MOIRÉ.",
+            ModMode::Even => "Even moduli only; every frame keeps the mod-2 Sierpinski skeleton.",
+            ModMode::Odd => "Odd moduli only. Steps skip by 2.",
+            ModMode::Interval => "Walks a sequence of moduli from the range start: fixed steps, or the increment and landing sequences below.",
+            ModMode::Kinship => "Every modulus of the range once, in an order of resemblance instead of size: each next one is a close relative of the last. Consecutive numbers never share a prime factor (m and m + 1 are coprime), so counting up redraws the whole structure every step; here a step adds or removes one prime factor where it can (2, 4, 8, 16, 24, 12, 6, 3, 9, 18, …: a layer of holes appears or vanishes), or follows the picture most like the last one (look-alike).",
+            ModMode::SuperPrime => "Fractions μ = P/Q in the range whose numerator P is prime (lowest terms): 37/5 = 7.4, 59/8 = 7.375, … C mod μ = (Q·C mod P)/Q, so μ divides C exactly when P does: the picture has prime P's clean Lucas structure (blocks of P rows), the denominator only reshuffling its colors. Denominators: the decimal ones of the decimals setting (Q dividing 10ᵈ), or every Q up to a bound. Ordered by value (the number line) or by numerator (each prime with its cousins P/Q, all to its left, smallest P, the strongest structure, first).",
+        }
+    }
+}
+
+/// Order in which prime mode walks the primes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PrimeOrder {
+    All,
+    ByRem4,
+    Rem1,
+    Rem3,
+}
+
+impl PrimeOrder {
+    pub const ALL: [PrimeOrder; 4] = [PrimeOrder::All, PrimeOrder::ByRem4, PrimeOrder::Rem1, PrimeOrder::Rem3];
+    pub fn label(self) -> &'static str {
+        match self {
+            PrimeOrder::All => "all primes",
+            PrimeOrder::ByRem4 => "grouped by p mod 4",
+            PrimeOrder::Rem1 => "p ≡ 1 (mod 4)",
+            PrimeOrder::Rem3 => "p ≡ 3 (mod 4)",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Seq {
+    Fixed,
+    Pi,
+    Fib,
+    Prime,
+    Square,
+    Pow2,
+    Semi2p,
+    Semi3p,
+    PrimeSemi,
+    SemiFull,
+    PrimeSemiFull,
+    Sphenic,
+}
+
+impl Seq {
+    pub const ALL: [Seq; 12] = [
+        Seq::Fixed,
+        Seq::Pi,
+        Seq::Fib,
+        Seq::Prime,
+        Seq::Square,
+        Seq::Pow2,
+        Seq::Semi2p,
+        Seq::Semi3p,
+        Seq::PrimeSemi,
+        Seq::SemiFull,
+        Seq::PrimeSemiFull,
+        Seq::Sphenic,
+    ];
+    pub fn label(self) -> &'static str {
+        match self {
+            Seq::Fixed => "fixed step",
+            Seq::Pi => "π digits",
+            Seq::Fib => "Fibonacci",
+            Seq::Prime => "primes",
+            Seq::Square => "squares",
+            Seq::Pow2 => "powers of 2",
+            Seq::Semi2p => "2×Pn",
+            Seq::Semi3p => "3×Pn",
+            Seq::PrimeSemi => "primes + 2×Pn",
+            Seq::SemiFull => "semiprimes",
+            Seq::PrimeSemiFull => "primes + semiprimes",
+            Seq::Sphenic => "sphenic",
+        }
+    }
+    /// The sequence's knobs (none, one or two), each with its standard value: the
+    /// preset is the family at those values.
+    pub fn knobs(self) -> &'static [Knob] {
+        const MUL: Knob = Knob { name: "×", tip: "Each increment times this", lo: 1, hi: 100, standard: 1, flag: false };
+        const fn k(standard: u32) -> Knob {
+            Knob { name: "k", tip: "k × each prime: the walk lands on k·p", lo: 1, hi: 1000, standard, flag: false }
+        }
+        const fn distinct(standard: u32) -> Knob {
+            Knob { name: "distinct", tip: "Skip the primes that divide k, so k and p are distinct factors (3×3 = 9 is a square)", lo: 0, hi: 1, standard, flag: true }
+        }
+        const fn r(standard: u32) -> Knob {
+            Knob { name: "r", tip: "Squarefree products of r distinct primes: 1 the primes, 2 semiprimes, 3 sphenic, up to 7 (510510 = 2·3·5·7·11·13·17)", lo: 1, hi: 7, standard, flag: false }
+        }
+        const SEMI2: [Knob; 2] = [k(2), distinct(0)];
+        const SEMI3: [Knob; 2] = [k(3), distinct(1)];
+        const K2: [Knob; 1] = [k(2)];
+        const R2: [Knob; 1] = [r(2)];
+        const R3: [Knob; 1] = [r(3)];
+        match self {
+            Seq::Fixed => &[],
+            Seq::Pi | Seq::Prime => &[MUL],
+            Seq::Fib => &[
+                Knob { name: "a", tip: "First seed: the walk lands on b, a + b, a + 2b, … (1, 2 Fibonacci; 2, 1 Lucas)", lo: 0, hi: 10_000, standard: 1, flag: false },
+                Knob { name: "b", tip: "Second seed: the first term landed on", lo: 1, hi: 10_000, standard: 2, flag: false },
+            ],
+            Seq::Square => &[Knob { name: "power", tip: "Increments 1^e, 2^e, 3^e, … (2 squares, 3 cubes)", lo: 1, hi: 6, standard: 2, flag: false }],
+            Seq::Pow2 => &[Knob { name: "base", tip: "Increments 1, b, b², b³, …", lo: 2, hi: 16, standard: 2, flag: false }],
+            Seq::Semi2p => &SEMI2,
+            Seq::Semi3p => &SEMI3,
+            Seq::PrimeSemi => &K2,
+            Seq::SemiFull | Seq::PrimeSemiFull => &R2,
+            Seq::Sphenic => &R3,
+        }
+    }
+
+    /// The knob values of the preset (0 for knobs it does not have).
+    pub fn standard(self) -> [u32; 2] {
+        let ks = self.knobs();
+        [ks.first().map_or(0, |k| k.standard), ks.get(1).map_or(0, |k| k.standard)]
+    }
+
+    /// The family's name at these knob values: the preset's own when standard.
+    pub fn describe(self, knobs: [u32; 2]) -> String {
+        if knobs == self.standard() {
+            return self.label().to_string();
+        }
+        let [a, b] = knobs;
+        match self {
+            Seq::Pi => format!("{a} × π digits"),
+            Seq::Prime => format!("{a} × primes"),
+            Seq::Fib => format!("Fibonacci from {a}, {b}"),
+            Seq::Square => format!("powers i^{a}"),
+            Seq::Pow2 => format!("powers of {a}"),
+            Seq::Semi2p | Seq::Semi3p => format!("{a}×Pn{}", if b == 1 { ", p ∤ k" } else { "" }),
+            Seq::PrimeSemi => format!("primes + {a}×Pn"),
+            Seq::SemiFull | Seq::Sphenic => format!("products of {a} primes"),
+            Seq::PrimeSemiFull => format!("primes + products of {a}"),
+            Seq::Fixed => self.label().to_string(),
+        }
+    }
+
+    /// Where the walk starts when the preset is chosen (or its knobs change): the k×Pn
+    /// walks on their first term, k·(the first prime they use).
+    pub fn first_term(self, knobs: [u32; 2]) -> Option<u32> {
+        match self {
+            Seq::Semi2p | Seq::Semi3p => kpn_primes(knobs).next().map(|p| (p as u64 * knobs[0].max(1) as u64).min(MOD_CAP as u64) as u32),
+            _ => None,
+        }
+    }
+
+    /// Sequences whose terms are landed on directly (not added as increments).
+    pub fn absolute(self) -> bool {
+        matches!(self, Seq::Fib | Seq::PrimeSemi | Seq::SemiFull | Seq::PrimeSemiFull | Seq::Sphenic)
+    }
+}
+
+const PI_DIGITS: &str = concat!(
+    "3",
+    "1415926535897932384626433832795028841971693993751058209749445923",
+    "0781640628620899862803482534211706798214808651328230664709384460",
+    "9550582231725359408128481117450284102701938521105559644622948954",
+    "9303819644288109756659334461284756482337867831652712019091456485",
+    "6692346034861045432664821339360726024914127372458700660631558817",
+);
+
+/// One knob of a sequence: a number in lo..=hi, or a switch (0 / 1).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Knob {
+    pub name: &'static str,
+    pub tip: &'static str,
+    pub lo: u32,
+    pub hi: u32,
+    /// The preset's value.
+    pub standard: u32,
+    /// A switch (shown as a checkbox).
+    pub flag: bool,
+}
+
+/// The primes a k×Pn walk multiplies: all of them, or (distinct) those not dividing k.
+fn kpn_primes(knobs: [u32; 2]) -> impl Iterator<Item = u32> {
+    let (k, distinct) = (knobs[0].max(1), knobs[1] == 1);
+    prime_tables().primes.iter().copied().filter(move |&p| !(distinct && k.is_multiple_of(p)))
+}
+
+/// The increments of an increment sequence (`seqIncrement` in the reference), with
+/// its knobs: the walk adds them one by one to the start.
+fn seq_increments(seq: Seq, fixed: u32, knobs: [u32; 2]) -> Box<dyn Iterator<Item = u64>> {
+    let pr = &prime_tables().primes;
+    let [a, _] = knobs;
+    let a = a as u64;
+    match seq {
+        Seq::Pi => Box::new(PI_DIGITS.bytes().cycle().map(move |d| (d - b'0') as u64 * a)),
+        Seq::Prime => Box::new(pr.iter().map(move |&p| p as u64 * a).chain(std::iter::repeat(*pr.last().unwrap() as u64 * a))),
+        Seq::Square => Box::new((1u64..).map(move |i| i.checked_pow(a as u32).unwrap_or(u64::MAX))),
+        Seq::Pow2 => Box::new((0u32..).map(move |i| a.max(2).checked_pow(i).unwrap_or(u64::MAX))),
+        Seq::Semi2p | Seq::Semi3p => {
+            // k × the gaps between the primes used: from k·p₀ the walk lands on k·p
+            let k = a.max(1);
+            let ps: Vec<u32> = kpn_primes(knobs).collect();
+            Box::new((0..ps.len().saturating_sub(1)).map(move |i| k * (ps[i + 1] - ps[i]) as u64).chain(std::iter::repeat(k)))
+        }
+        _ => Box::new(std::iter::repeat(fixed.max(1) as u64)),
+    }
+}
+
+/// The list of moduli a sequence visits in `[start, hi]` (`buildSeqMods`), at the
+/// preset's standard knobs.
+pub fn seq_mods(start: u32, hi: u32, seq: Seq, fixed: u32) -> Vec<u32> {
+    seq_mods_with(start, hi, seq, fixed, seq.standard())
+}
+
+/// The same at any knob values.
+pub fn seq_mods_with(start: u32, hi: u32, seq: Seq, fixed: u32, knobs: [u32; 2]) -> Vec<u32> {
+    let t = prime_tables();
+    let mut out = Vec::new();
+    if seq.absolute() {
+        let lo = start.max(2);
+        let merge = |a: &[u32], b: &[u32], out: &mut Vec<u32>| {
+            let (mut i, mut j) = (0, 0);
+            while out.len() < SEQ_MAX {
+                let x = a.get(i).copied();
+                let y = b.get(j).copied();
+                let v = match (x, y) {
+                    (None, None) => break,
+                    (Some(p), Some(s)) if p <= s => {
+                        i += 1;
+                        if p == s {
+                            j += 1;
+                        }
+                        p
+                    }
+                    (Some(p), None) => {
+                        i += 1;
+                        p
+                    }
+                    (_, Some(s)) => {
+                        j += 1;
+                        s
+                    }
+                };
+                if v > hi {
+                    break;
+                }
+                if v >= lo {
+                    out.push(v);
+                }
+            }
+        };
+        match seq {
+            Seq::Fib => {
+                // b, a + b, …: ascending once past the seeds (only rising terms are kept)
+                let (mut a, mut b) = (knobs[0] as u64, knobs[1].max(1) as u64);
+                while out.len() < SEQ_MAX && b <= hi as u64 {
+                    if b >= lo as u64 && out.last().is_none_or(|&l| (l as u64) < b) {
+                        out.push(b as u32);
+                    }
+                    let c = a + b;
+                    a = b;
+                    b = c;
+                }
+            }
+            Seq::PrimeSemi => {
+                let k = knobs[0].max(1);
+                let times: Vec<u32> = t.primes.iter().map(|&p| p.saturating_mul(k)).collect();
+                merge(&t.primes, &times, &mut out);
+            }
+            Seq::SemiFull | Seq::Sphenic => out = t.products_of(knobs[0], lo, hi),
+            Seq::PrimeSemiFull => merge(&t.primes, &t.products_of(knobs[0], 2, hi), &mut out),
+            _ => unreachable!(),
+        }
+        return out;
+    }
+    let mut v = start as u64;
+    if v >= 2 && v <= hi as u64 {
+        out.push(v as u32);
+    }
+    for inc in seq_increments(seq, fixed, knobs).take(SEQ_STEP_GUARD) {
+        if out.len() >= SEQ_MAX {
+            break;
+        }
+        if inc == 0 {
+            continue;
+        }
+        v = v.saturating_add(inc);
+        if v > hi as u64 {
+            break;
+        }
+        if v >= 2 {
+            out.push(v as u32);
+        }
+    }
+    out
+}
+
+/// Moduli run from 1 (where every residue is 0) to MOD_CAP.
+fn clamp_mod(v: i64) -> u32 {
+    v.clamp(1, MOD_CAP as i64) as u32
+}
+
+/// A range end: 0 (the decimals and fractions below 1) up to MOD_CAP.
+fn clamp_end(v: i64) -> u32 {
+    v.clamp(0, MOD_CAP as i64) as u32
+}
+
+/// Nearest value of an ascending list to `target`; ties go to the lower one.
+fn nearest(arr: &[u32], target: u32) -> u32 {
+    if arr.is_empty() {
+        return target;
+    }
+    let lo = arr.partition_point(|&a| a < target).min(arr.len() - 1);
+    let above = arr[lo];
+    if lo == 0 {
+        return above;
+    }
+    let below = arr[lo - 1];
+    if target.abs_diff(below) <= above.abs_diff(target) {
+        below
+    } else {
+        above
+    }
+}
+
+fn nearest_index(arr: &[u32], target: u32) -> usize {
+    let v = nearest(arr, target);
+    arr.partition_point(|&a| a < v)
+}
+
+// ---------------------------------------------------------------------------------------
+// The sweep state.
+// ---------------------------------------------------------------------------------------
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Sweep {
+    pub mode: ModMode,
+    pub prime_order: PrimeOrder,
+    pub seq: Seq,
+    /// Step for `Seq::Fixed` (1..=10000).
+    pub step: u32,
+    /// Knobs set by hand ([`Seq::knobs`]), for the sequence they were set on; any other
+    /// sequence (or None) runs at its preset's standard values.
+    custom: Option<(Seq, [u32; 2])>,
+    /// Playback range; `start` is also the interval anchor.
+    pub start: u32,
+    pub end: u32,
+    /// Milliseconds per frame.
+    pub speed_ms: u32,
+    pub looping: bool,
+    pub playing: bool,
+    /// +1 forward, −1 reverse.
+    pub dir: i32,
+    /// Display-only transition between frames, 0 = hard cuts.
+    pub tween_ms: u32,
+    /// Decimal places between visited moduli (0 = whole moduli only): a step then moves
+    /// 10⁻ᵈ through the gap to the next visited modulus, μ = m + sub·10⁻ᵈ, an analog
+    /// glide from modulus to modulus (see [`Sweep::step_fine`]).
+    pub decimals: u32,
+    /// How a decimal μ between two visited moduli is drawn: the exact real residue
+    /// C mod μ (false), or a morph from the lower whole modulus to the next one, each
+    /// cell's color sliding between its two residues' colors (true).
+    pub morph: bool,
+    /// The fraction walks' settings (mode SuperPrime, and mode All by numerator).
+    pub super_primes: SuperPrimes,
+    /// Mode All's order: the decimal grid by value, or every fraction by numerator.
+    pub all_order: SpOrder,
+    /// The kinship walk's order.
+    pub kin_order: KinOrder,
+    sp_cache: Option<(SpKey, Vec<(u32, u32)>)>,
+    kin_cache: Option<(KinKey, Vec<(u32, u32)>)>,
+    /// Cached walk lists, rebuilt when the mode parameters change.
+    cache: Option<(PoolKey, Vec<u32>)>,
+    /// The last [`Sweep::frames_in_range`] count (the sweep bar asks every frame).
+    frames_cache: Option<(FramesKey, usize)>,
+}
+
+impl Default for Sweep {
+    fn default() -> Self {
+        Sweep {
+            mode: ModMode::All,
+            prime_order: PrimeOrder::All,
+            seq: Seq::Fixed,
+            step: 3,
+            custom: None,
+            start: 2,
+            end: 128,
+            speed_ms: 150,
+            looping: true,
+            playing: false,
+            dir: 1,
+            tween_ms: 0,
+            decimals: 0,
+            morph: false,
+            super_primes: SuperPrimes::default(),
+            all_order: SpOrder::Value,
+            kin_order: KinOrder::Lattice,
+            sp_cache: None,
+            kin_cache: None,
+            cache: None,
+            frames_cache: None,
+        }
+    }
+}
+
+/// Which denominators the super-prime walk takes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum SpDenoms {
+    /// Q dividing 10ᵈ (d = the decimals setting, at least 1): the decimal fractions.
+    Decimal,
+    /// Every Q up to `qmax`.
+    Any,
+}
+
+/// How the super-prime walk is ordered.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum SpOrder {
+    /// By value: the number line.
+    Value,
+    /// By numerator, then denominator: each prime P with its cousins P/Q.
+    Numerator,
+}
+
+impl SpOrder {
+    pub const ALL: [SpOrder; 2] = [SpOrder::Value, SpOrder::Numerator];
+    pub fn label(self) -> &'static str {
+        match self {
+            SpOrder::Value => "by value",
+            SpOrder::Numerator => "by numerator",
+        }
+    }
+}
+
+/// The super-prime walk: fractions μ = P/Q in lowest terms with P prime, in the range.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SuperPrimes {
+    pub denoms: SpDenoms,
+    /// Largest denominator for [`SpDenoms::Any`].
+    pub qmax: u32,
+    pub order: SpOrder,
+    /// Also list the fractions not in lowest terms (10/4 beside 5/2): the same μ, so the
+    /// same picture, but each numerator then shows every denominator.
+    pub unreduced: bool,
+}
+
+impl Default for SuperPrimes {
+    fn default() -> Self {
+        SuperPrimes { denoms: SpDenoms::Decimal, qmax: 12, order: SpOrder::Value, unreduced: false }
+    }
+}
+
+/// Most fractions one super-prime walk lists.
+pub const SP_MAX: usize = 200_000;
+
+/// What a kinship walk is built from: range and order.
+type KinKey = (u32, u32, KinOrder);
+
+/// What a fraction walk is built from: range, settings, decimals, prime numerators only.
+type SpKey = (u32, u32, SuperPrimes, u32, bool);
+
+/// The fractions P/Q in lowest terms with lo ≤ P/Q ≤ hi, P ≤ MOD_CAP and Q one of
+/// `denoms` (ascending), only prime numerators when `prime_only` (the super primes),
+/// ordered. They are generated by numerator, so a list cut at SP_MAX drops the largest
+/// numerators (the finest structures), whatever the order. lo = 0 takes in the
+/// fractions below 1 (P/Q > 0 always).
+pub fn fractions(lo: u32, hi: u32, denoms: &[u32], order: SpOrder, prime_only: bool) -> Vec<(u32, u32)> {
+    fractions_with(lo, hi, denoms, order, prime_only, false)
+}
+
+/// [`fractions`], with `unreduced` also the fractions not in lowest terms.
+pub fn fractions_with(lo: u32, hi: u32, denoms: &[u32], order: SpOrder, prime_only: bool, unreduced: bool) -> Vec<(u32, u32)> {
+    let t = prime_tables();
+    let (lo, hi) = (lo as u64, hi.max(1) as u64);
+    let mut out = Vec::new();
+    let gcd = crate::math::gcd_u64;
+    'outer: for p in lo.max(1)..=MOD_CAP as u64 {
+        if prime_only && !t.is_prime(p as u32) {
+            continue;
+        }
+        // lo ≤ p/q ≤ hi: q from ⌈p/hi⌉ to ⌊p/lo⌋
+        let (q_lo, q_hi) = (p.div_ceil(hi), p.checked_div(lo).unwrap_or(u64::MAX));
+        let start = denoms.partition_point(|&q| (q as u64) < q_lo);
+        for &q in &denoms[start..] {
+            let q = q as u64;
+            if q > q_hi {
+                break;
+            }
+            let lowest = unreduced || if prime_only { !q.is_multiple_of(p) } else { gcd(p, q) == 1 };
+            if lowest {
+                out.push((p as u32, q as u32));
+                if out.len() >= SP_MAX {
+                    break 'outer;
+                }
+            }
+        }
+        // past the largest denominator's reach nothing more can come in
+        if p > hi * *denoms.last().unwrap_or(&1) as u64 {
+            break;
+        }
+    }
+    if order == SpOrder::Value {
+        // P/Q against P'/Q' without division: P·Q' vs P'·Q
+        out.sort_by(|x, y| (x.0 as u64 * y.1 as u64).cmp(&(y.0 as u64 * x.1 as u64)).then(x.1.cmp(&y.1)));
+    }
+    out
+}
+
+/// How the kinship walk picks the next modulus.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum KinOrder {
+    /// Fewest prime factors changed (m → m·p or m/p is one step; see [`kinship`]).
+    Lattice,
+    /// The most similar zero pattern over the first rows (see [`kinship`]).
+    LookAlike,
+}
+
+impl KinOrder {
+    pub const ALL: [KinOrder; 2] = [KinOrder::Lattice, KinOrder::LookAlike];
+    pub fn label(self) -> &'static str {
+        match self {
+            KinOrder::Lattice => "one factor",
+            KinOrder::LookAlike => "look-alike",
+        }
+    }
+    pub fn tip(self) -> &'static str {
+        match self {
+            KinOrder::Lattice => "Each next modulus is the unvisited one fewest prime factors away: m·p or m/p is one step (16 → 8, 6 → 3, 3 → 15), 16 → 24 two (÷2, ×3). Ties go to the smaller primes changed, then the smaller modulus. Exact arithmetic, any range size.",
+            KinOrder::LookAlike => "Each next modulus is the unvisited one whose zero pattern (where m divides C) over the first rows overlaps the last one's most (Jaccard similarity). Measured, not reasoned: it finds the same families (2, 4, 12, 6, 3, 15, 5, 10, 20, 8, 24, 16, …). Up to 300 moduli; large primes, with no zeros that early, come last as loners.",
+        }
+    }
+}
+
+/// Most moduli a look-alike walk takes (pairwise comparisons of zero patterns).
+pub const KIN_LOOK_MAX: usize = 300;
+/// Most moduli a one-factor walk takes.
+pub const KIN_LATTICE_MAX: usize = 2_000;
+
+/// Every modulus of lo..=hi once (lo at least 1), starting at lo, each next one the
+/// unvisited modulus nearest the last:
+///
+/// * `Lattice`: by the number of prime factors (with multiplicity) to divide out of
+///   one and multiply in to reach the other, Ω(m/g) + Ω(m′/g) with g = gcd(m, m′);
+///   ties by the sum of those primes, then the smaller modulus.
+/// * `LookAlike`: by 1 − Jaccard similarity of the zero sets {(n, k): m | C(n, k)} over
+///   rows 0..R (R = 1.5·hi within 96..=384); ties by the smaller modulus.
+///
+/// The walk is cut at KIN_LATTICE_MAX / KIN_LOOK_MAX moduli.
+pub fn kinship(lo: u32, hi: u32, order: KinOrder) -> Vec<u32> {
+    let (lo, hi) = (lo.clamp(1, MOD_CAP), hi.clamp(1, MOD_CAP));
+    let (lo, hi) = (lo.min(hi), lo.max(hi));
+    let cap = if order == KinOrder::Lattice { KIN_LATTICE_MAX } else { KIN_LOOK_MAX };
+    let mods: Vec<u32> = (lo..=hi).take(cap).collect();
+    let chain = match order {
+        KinOrder::Lattice => {
+            // Ω and the sum of prime factors (with multiplicity), additive: Ω(m/g) = Ω(m) − Ω(g)
+            let top = *mods.last().unwrap_or(&1) as usize;
+            let mut spf = vec![0u32; top + 1];
+            for i in 2..=top {
+                if spf[i] == 0 {
+                    for j in (i..=top).step_by(i) {
+                        if spf[j] == 0 {
+                            spf[j] = i as u32;
+                        }
+                    }
+                }
+            }
+            let parts = |mut x: u32| {
+                let (mut c, mut s) = (0u32, 0u64);
+                while x > 1 {
+                    let p = spf[x as usize];
+                    x /= p;
+                    c += 1;
+                    s += p as u64;
+                }
+                (c, s)
+            };
+            let table: Vec<(u32, u64)> = (0..=top as u32).map(parts).collect();
+            greedy_chain(mods.len(), |i, j| {
+                let g = table[crate::math::gcd_u64(mods[i] as u64, mods[j] as u64) as usize];
+                let (a, b) = (table[mods[i] as usize], table[mods[j] as usize]);
+                (a.0 + b.0 - 2 * g.0, a.1 + b.1 - 2 * g.1)
+            })
+        }
+        KinOrder::LookAlike => {
+            let rows = (hi as u64 * 3 / 2).clamp(96, 384) as usize;
+            let words = (rows * (rows + 1) / 2).div_ceil(64);
+            let masks: Vec<Vec<u64>> = mods
+                .iter()
+                .map(|&m| {
+                    // the zero set of rows 0..rows mod m, a bit per cell (two row buffers)
+                    let mut bits = vec![0u64; words];
+                    let (mut row, mut next) = (vec![1 % m], Vec::with_capacity(rows + 1));
+                    let mut i = 0usize;
+                    for _ in 0..rows {
+                        for &v in &row {
+                            if v == 0 {
+                                bits[i / 64] |= 1 << (i % 64);
+                            }
+                            i += 1;
+                        }
+                        next.clear();
+                        next.push(1 % m);
+                        next.extend(row.windows(2).map(|w| {
+                            let s = w[0] + w[1];
+                            if s >= m { s - m } else { s }
+                        }));
+                        next.push(1 % m);
+                        std::mem::swap(&mut row, &mut next);
+                    }
+                    bits
+                })
+                .collect();
+            greedy_chain(mods.len(), |i, j| {
+                let (mut inter, mut uni) = (0u32, 0u32);
+                for (x, y) in masks[i].iter().zip(&masks[j]) {
+                    inter += (x & y).count_ones();
+                    uni += (x | y).count_ones();
+                }
+                if uni == 0 { 0.0 } else { 1.0 - inter as f64 / uni as f64 }
+            })
+        }
+    };
+    chain.into_iter().map(|i| mods[i]).collect()
+}
+
+/// A walk over 0..n from 0, each next index the unvisited one nearest the last by
+/// `dist(last, candidate)`; ties go to the smaller index.
+fn greedy_chain<K: PartialOrd>(n: usize, dist: impl Fn(usize, usize) -> K) -> Vec<usize> {
+    let mut out = Vec::with_capacity(n);
+    let mut left = vec![true; n];
+    let mut cur = 0usize;
+    for _ in 0..n {
+        left[cur] = false;
+        out.push(cur);
+        let mut best: Option<(K, usize)> = None;
+        for j in (0..n).filter(|&j| left[j]) {
+            let d = dist(cur, j);
+            if best.as_ref().is_none_or(|(b, _)| d < *b) {
+                best = Some((d, j));
+            }
+        }
+        match best {
+            Some((_, j)) => cur = j,
+            None => break,
+        }
+    }
+    out
+}
+
+/// The super primes (prime numerators) of [`fractions`].
+pub fn super_primes(lo: u32, hi: u32, denoms: &[u32], order: SpOrder) -> Vec<(u32, u32)> {
+    let mut d = denoms.to_vec();
+    d.sort_unstable();
+    fractions(lo, hi, &d, order, true)
+}
+
+/// What a walk list is built from: mode, prime order, sequence, step, knobs, anchor.
+type PoolKey = (ModMode, PrimeOrder, Seq, u32, [u32; 2], u32);
+/// What a frame count depends on: the walk, the range and the cap.
+type FramesKey = (ModMode, PrimeOrder, Seq, u32, [u32; 2], u32, u32, usize);
+
+/// Where prime `cur` sits in a prime walk list. The lists are ascending, except the
+/// grouped one, [2] then the primes ≡ 1 (mod 4) then those ≡ 3, each group ascending.
+fn prime_pos(pool: &[u32], order: PrimeOrder, cur: u32) -> Option<usize> {
+    if order != PrimeOrder::ByRem4 {
+        return pool.binary_search(&cur).ok();
+    }
+    if pool.first() == Some(&cur) {
+        return Some(0);
+    }
+    let rest = &pool[1.min(pool.len())..];
+    let split = rest.partition_point(|&p| p % 4 == 1);
+    let (group, base) = if cur % 4 == 1 { (&rest[..split], 1) } else { (&rest[split..], 1 + split) };
+    group.binary_search(&cur).ok().map(|i| base + i)
+}
+
+impl Sweep {
+    /// Choose sequence `q` at its standard knobs (choosing the current one again resets
+    /// it to them); the k×Pn walks start on their first term.
+    pub fn choose_seq(&mut self, q: Seq) {
+        self.seq = q;
+        self.custom = None;
+        if let Some(v) = q.first_term(q.standard()) {
+            self.start = v;
+        }
+    }
+
+    /// The current sequence's knob values.
+    pub fn knobs(&self) -> [u32; 2] {
+        match self.custom {
+            Some((q, k)) if q == self.seq => k,
+            _ => self.seq.standard(),
+        }
+    }
+
+    /// Set the knobs by hand (clamped to their ranges). The k×Pn walks move their start
+    /// onto their first term again; the start can still be moved off it afterwards,
+    /// which shifts the walk.
+    pub fn set_knobs(&mut self, mut k: [u32; 2]) {
+        if k == self.knobs() {
+            return;
+        }
+        for (v, kn) in k.iter_mut().zip(self.seq.knobs()) {
+            *v = (*v).clamp(kn.lo, kn.hi);
+        }
+        self.custom = Some((self.seq, k));
+        if let Some(v) = self.seq.first_term(k) {
+            self.start = v;
+        }
+    }
+
+    /// The knobs are the preset's.
+    pub fn standard_knobs(&self) -> bool {
+        self.knobs() == self.seq.standard()
+    }
+
+    /// The sequence's current name.
+    pub fn seq_name(&self) -> String {
+        self.seq.describe(self.knobs())
+    }
+
+    fn anchor(&self) -> u32 {
+        clamp_mod(self.start as i64)
+    }
+
+    /// The explicit walk list of list-based modes (primes in walk order, or a sequence).
+    fn pool(&mut self) -> Option<&[u32]> {
+        let key: PoolKey = (self.mode, self.prime_order, self.seq, self.step, self.knobs(), self.anchor());
+        let list_mode = self.mode == ModMode::Prime || (self.mode == ModMode::Interval && self.seq != Seq::Fixed);
+        if !list_mode {
+            return None;
+        }
+        let stale = self.cache.as_ref().is_none_or(|(k, _)| *k != key);
+        if stale {
+            let list = if self.mode == ModMode::Prime {
+                let pr = &prime_tables().primes;
+                match self.prime_order {
+                    PrimeOrder::All => pr.clone(),
+                    PrimeOrder::Rem1 => pr.iter().copied().filter(|p| p % 4 == 1).collect(),
+                    PrimeOrder::Rem3 => pr.iter().copied().filter(|p| p % 4 == 3).collect(),
+                    PrimeOrder::ByRem4 => std::iter::once(2).chain(pr.iter().copied().filter(|p| p % 4 == 1)).chain(pr.iter().copied().filter(|p| p % 4 == 3)).collect(),
+                }
+            } else {
+                seq_mods_with(self.anchor(), MOD_CAP, self.seq, self.step, key.4)
+            };
+            self.cache = Some((key, list));
+        }
+        self.cache.as_ref().map(|c| c.1.as_slice())
+    }
+
+
+    /// The walk is a list of fractions: the super primes, or mode All by numerator.
+    pub fn fraction_mode(&self) -> bool {
+        matches!(self.mode, ModMode::SuperPrime | ModMode::Kinship) || (self.mode == ModMode::All && self.all_order == SpOrder::Numerator)
+    }
+
+    /// The fraction walk for the range and settings (cached): the super primes, or in
+    /// mode All every fraction, by numerator.
+    pub fn super_list(&mut self) -> &[(u32, u32)] {
+        let (lo, hi) = {
+            let (mut a, mut b) = (clamp_end(self.start as i64), clamp_end(self.end as i64));
+            if a > b {
+                std::mem::swap(&mut a, &mut b);
+            }
+            (a, b)
+        };
+        if self.mode == ModMode::Kinship {
+            // whole moduli as fractions m/1, in kinship order
+            let key = (lo.max(1), hi.max(1), self.kin_order);
+            if self.kin_cache.as_ref().is_none_or(|(k, _)| *k != key) {
+                self.kin_cache = Some((key, kinship(key.0, key.1, key.2).into_iter().map(|m| (m, 1)).collect()));
+            }
+            return &self.kin_cache.as_ref().expect("built").1;
+        }
+        let d = self.decimals.clamp(1, MAX_DECIMALS);
+        let prime_only = self.mode == ModMode::SuperPrime;
+        let mut sp = self.super_primes;
+        if !prime_only {
+            sp.order = SpOrder::Numerator;
+        }
+        let key: SpKey = (lo, hi, sp, d, prime_only);
+        if self.sp_cache.as_ref().is_none_or(|(k, _)| *k != key) {
+            let denoms: Vec<u32> = match sp.denoms {
+                // the divisors of 10ᵈ: 2^i·5^j, i, j ≤ d
+                SpDenoms::Decimal => {
+                    // (within u32: 2^d·5^d = 10^d ≤ 10^9)
+                    let mut v: Vec<u32> = (0..=d).flat_map(|i| (0..=d).map(move |j| 2u32.pow(i) * 5u32.pow(j))).collect();
+                    v.sort_unstable();
+                    v
+                }
+                SpDenoms::Any => (1..=sp.qmax.clamp(1, 10_000)).collect(),
+            };
+            self.sp_cache = Some((key, fractions_with(lo, hi, &denoms, sp.order, prime_only, sp.unreduced)));
+        }
+        &self.sp_cache.as_ref().expect("built").1
+    }
+
+    /// The super prime at or nearest μ = p/q (by value; in numerator order the same
+    /// fraction if listed, else the nearest by value).
+    pub fn super_nearest(&mut self, p: u32, q: u32) -> Option<usize> {
+        let list = self.super_list();
+        if list.is_empty() {
+            return None;
+        }
+        if let Some(i) = list.iter().position(|&x| x == (p, q)) {
+            return Some(i);
+        }
+        let mu = p as f64 / q as f64;
+        list.iter().enumerate().min_by(|a, b| {
+            let da = (a.1 .0 as f64 / a.1 .1 as f64 - mu).abs();
+            let db = (b.1 .0 as f64 / b.1 .1 as f64 - mu).abs();
+            da.total_cmp(&db)
+        }).map(|(i, _)| i)
+    }
+
+    /// One frame of super-prime playback from index `i`: the next in the play
+    /// direction, looping or stopping at the ends.
+    pub fn super_tick(&mut self, i: usize) -> usize {
+        let n = self.super_list().len();
+        if n == 0 {
+            return 0;
+        }
+        let next = i as i64 + self.dir as i64;
+        if next < 0 || next >= n as i64 {
+            if self.looping {
+                return if self.dir > 0 { 0 } else { n - 1 };
+            }
+            self.playing = false;
+            return i.min(n - 1);
+        }
+        next as usize
+    }
+
+    /// `k` super-prime steps from index `i` (clamped to the walk).
+    pub fn super_step(&mut self, i: usize, k: i32) -> usize {
+        let n = self.super_list().len();
+        (i as i64 + k as i64).clamp(0, n.saturating_sub(1) as i64) as usize
+    }
+
+    /// 10^decimals: the sub-steps per unit of modulus.
+    pub fn fine_units(&self) -> u64 {
+        10u64.pow(self.decimals.min(MAX_DECIMALS))
+    }
+
+    /// The most decimal places to step by. A morph uses only the whole moduli, so all
+    /// of them are exact; the exact real residue needs μ's numerator within MOD_CAP,
+    /// so (see `Modulus::from_decimal_nearest`) where it would pass it the nearest
+    /// fraction that fits is drawn: 7.123456 is exact, 712.3456 rounds to 712345/1000.
+    pub fn max_decimals(&self) -> u32 {
+        MAX_DECIMALS
+    }
+
+    /// The decimals at which μ ≈ `mu` is still exact (its numerator within MOD_CAP).
+    pub fn exact_decimals(mu: f64) -> u32 {
+        (0..=MAX_DECIMALS).rev().find(|&d| mu * 10f64.powi(d as i32) <= MOD_CAP as f64).unwrap_or(0)
+    }
+
+    /// The whole moduli from `m` to the next visited one (1 past the last: its decimals
+    /// lead nowhere, so a sub-step there is a whole step).
+    pub fn gap_after(&mut self, m: u32) -> u32 {
+        let next = self.next_in_dir(m, 1);
+        if next > m { next - m } else { 1 }
+    }
+
+    /// One step from μ = m + sub·10⁻ᵈ (`pos` = (m, sub)) in direction `dir`, through the
+    /// gaps between visited moduli in 10⁻ᵈ steps: forward from m to its next visited
+    /// modulus m' takes (m' − m)·10ᵈ steps, the last one landing on m' itself. With no
+    /// decimals it is the whole step [`Sweep::next_in_dir`].
+    pub fn step_fine(&mut self, pos: (u32, u64), dir: i32) -> (u32, u64) {
+        let (m, sub) = pos;
+        if self.decimals == 0 {
+            return (self.next_in_dir(m, dir), 0);
+        }
+        let units = self.fine_units();
+        if dir > 0 {
+            if sub + 1 < self.gap_after(m) as u64 * units {
+                return (m, sub + 1);
+            }
+            return (self.next_in_dir(m, 1), 0);
+        }
+        if sub > 0 {
+            // μ = 0 itself is no modulus: the walk stops at 10⁻ᵈ
+            return (m, if m == 0 { sub.max(2) - 1 } else { sub - 1 });
+        }
+        if self.zero_start() && m == self.first_visited() {
+            // below the first visited modulus, down into the decimals below 1
+            return (0, m as u64 * units - 1);
+        }
+        let prev = self.next_in_dir(m, -1);
+        if prev < m {
+            (prev, (m - prev) as u64 * units - 1)
+        } else {
+            (prev, 0) // wrapped: land on the whole modulus
+        }
+    }
+
+    /// `n` fine steps (sign = direction).
+    pub fn step_fine_by(&mut self, pos: (u32, u64), n: i32) -> (u32, u64) {
+        let mut p = pos;
+        for _ in 0..n.unsigned_abs() {
+            p = self.step_fine(p, n.signum());
+        }
+        p
+    }
+
+    /// One frame of playback from `pos`: a fine step in the play direction, wrapping at
+    /// the range ends (looping) or stopping there; the range ends are whole moduli. With
+    /// no decimals it is [`Sweep::tick`].
+    pub fn tick_fine(&mut self, pos: (u32, u64)) -> (u32, u64) {
+        if self.decimals == 0 {
+            return (self.tick(pos.0), 0);
+        }
+        let hi = self.bounds().1;
+        let dir = self.dir;
+        let next = self.step_fine(pos, dir);
+        let first = self.first_pos();
+        let past = if dir > 0 { next.0 > hi || (next.0 == hi && next.1 > 0) || next.0 < pos.0 } else { next.0 < first.0 || next.0 > pos.0 || next == pos };
+        if !past {
+            return next;
+        }
+        if self.looping {
+            if dir > 0 { first } else { (hi, 0) }
+        } else {
+            self.playing = false;
+            if dir > 0 { (hi, 0) } else { first }
+        }
+    }
+
+    /// The range starts at 0: with decimals the walk takes in 10⁻ᵈ … 1 − 10⁻ᵈ below
+    /// the first visited modulus (and the fraction walks their fractions below 1).
+    pub fn zero_start(&self) -> bool {
+        self.start.min(self.end) == 0
+    }
+
+    /// The smallest modulus the mode visits.
+    pub fn first_visited(&mut self) -> u32 {
+        self.snap(1)
+    }
+
+    /// Where fine playback starts: the range start, or from 0 the first decimal past it
+    /// (10⁻ᵈ: μ = 0 is no modulus, C mod 0 being C itself).
+    pub fn first_pos(&mut self) -> (u32, u64) {
+        if self.zero_start() && self.decimals > 0 {
+            (0, 1)
+        } else {
+            (self.bounds().0, 0)
+        }
+    }
+
+    /// The modulus nearest to `v` that the active mode allows (`snapMod`).
+    pub fn snap(&mut self, v: i64) -> u32 {
+        let x = clamp_mod(v);
+        let t = prime_tables();
+        // snap by value: the grouped-by-mod-4 bank is not ascending, but it holds every prime
+        if self.mode == ModMode::Prime && self.prime_order == PrimeOrder::ByRem4 {
+            return nearest(&t.primes, x);
+        }
+        if let Some(pool) = self.pool() {
+            if !pool.is_empty() {
+                return nearest(pool, x);
+            }
+        }
+        match self.mode {
+            ModMode::Interval => {
+                let a = self.anchor() as i64;
+                let n = self.step.max(1) as i64;
+                let k = ((x as i64 - a) as f64 / n as f64).round().max(0.0) as i64;
+                clamp_mod(a + k * n)
+            }
+            ModMode::Even | ModMode::Odd => {
+                let want = u32::from(self.mode == ModMode::Odd);
+                if x % 2 == want {
+                    x
+                } else if x < MOD_CAP {
+                    x + 1
+                } else {
+                    x - 1
+                }
+            }
+            ModMode::Composite => {
+                if !t.is_prime(x) {
+                    return x.max(4);
+                }
+                let (mut up, mut down) = (x + 1, x - 1);
+                loop {
+                    if down >= 4 && !t.is_prime(down) {
+                        return down;
+                    }
+                    if up <= MOD_CAP && !t.is_prime(up) {
+                        return up;
+                    }
+                    up += 1;
+                    down = down.saturating_sub(1);
+                }
+            }
+            _ => x,
+        }
+    }
+
+    /// Where the modulus lands one step from `cur` in direction `dir` (`nextModInDir`).
+    pub fn next_in_dir(&mut self, cur: u32, dir: i32) -> u32 {
+        if cur == 0 {
+            // from below 1 (a decimal 0.x): up to the first visited modulus
+            return if dir > 0 { self.first_visited() } else { 0 };
+        }
+        let mode = self.mode;
+        let order = self.prime_order;
+        let step = self.step.max(1) as i64;
+        let anchor = self.anchor() as i64;
+        if let Some(pool) = self.pool() {
+            if !pool.is_empty() {
+                if mode == ModMode::Prime {
+                    let n = pool.len() as i64;
+                    let next = match prime_pos(pool, order, cur) {
+                        None => 0,
+                        Some(i) => (i as i64 + dir as i64).rem_euclid(n),
+                    };
+                    return pool[next as usize];
+                }
+                let i = nearest_index(pool, cur) as i64;
+                let next = (i + dir as i64).clamp(0, pool.len() as i64 - 1);
+                return pool[next as usize];
+            }
+        }
+        let t = prime_tables();
+        match mode {
+            ModMode::Composite => {
+                let mut v = cur as i64 + dir as i64;
+                while v >= 4 && v <= MOD_CAP as i64 && t.is_prime(v as u32) {
+                    v += dir as i64;
+                }
+                v.clamp(4, MOD_CAP as i64) as u32
+            }
+            ModMode::All | ModMode::SuperPrime | ModMode::Kinship => clamp_mod(cur as i64 + dir as i64),
+            // a step that would leave the mode's own moduli (below the anchor, below 2
+            // for the evens, past the cap) stays put: clamping would land between them
+            _ => {
+                let (stride, least) = match mode {
+                    ModMode::Interval => (step, anchor),
+                    ModMode::Even => (2, 2),
+                    _ => (2, 1),
+                };
+                let v = cur as i64 + dir as i64 * stride;
+                if v < least || v > MOD_CAP as i64 { cur } else { v as u32 }
+            }
+        }
+    }
+
+    /// `n` steps (sign = direction), stopping at the ends of non-wrapping walks.
+    pub fn step_by(&mut self, cur: u32, n: i32) -> u32 {
+        let mut v = cur;
+        for _ in 0..n.unsigned_abs() {
+            v = self.next_in_dir(v, n.signum());
+        }
+        v
+    }
+
+    /// First and last modulus of the playback range, snapped to the mode (`playBounds`).
+    pub fn bounds(&mut self) -> (u32, u32) {
+        let (mut lo, mut hi) = (clamp_mod(self.start as i64), clamp_mod(self.end as i64));
+        if lo > hi {
+            std::mem::swap(&mut lo, &mut hi);
+        }
+        (self.snap(lo as i64), self.snap(hi as i64))
+    }
+
+    /// One play tick from `cur`: the next frame, stopping playback at the range edge when
+    /// not looping (the reference's play interval).
+    pub fn tick(&mut self, cur: u32) -> u32 {
+        let (lo, hi) = self.bounds();
+        let dir = self.dir;
+        let target = self.next_in_dir(cur, dir);
+        let at_edge = (dir > 0 && (target >= hi || target == cur)) || (dir < 0 && (target <= lo || target == cur));
+        let mut next = target;
+        if dir > 0 && target > hi {
+            next = if self.looping { lo } else { hi };
+        }
+        if dir < 0 && target < lo {
+            next = if self.looping { hi } else { lo };
+        }
+        if at_edge && !self.looping {
+            next = if dir > 0 { hi } else { lo };
+            self.playing = false;
+        } else if at_edge && self.looping && target == cur {
+            next = if dir > 0 { lo } else { hi };
+        }
+        next
+    }
+
+    /// The first few moduli the active mode visits from the range start (panel preview).
+    pub fn preview(&mut self, count: usize) -> Vec<u32> {
+        let (lo, _) = self.bounds();
+        let mut out = vec![lo];
+        let mut v = lo;
+        while out.len() < count {
+            let n = self.next_in_dir(v, 1);
+            if n <= v {
+                break;
+            }
+            out.push(n);
+            v = n;
+        }
+        out
+    }
+
+    /// Number of moduli in the range for the active mode (capped at `limit`).
+    pub fn frames_in_range(&mut self, limit: usize) -> usize {
+        let key: FramesKey = (self.mode, self.prime_order, self.seq, self.step, self.knobs(), self.start, self.end, limit);
+        if let Some((k, n)) = self.frames_cache {
+            if k == key {
+                return n;
+            }
+        }
+        let n = self.count_frames(limit);
+        self.frames_cache = Some((key, n));
+        n
+    }
+
+    fn count_frames(&mut self, limit: usize) -> usize {
+        let (lo, hi) = self.bounds();
+        let mut v = lo;
+        let mut n = 1;
+        while n < limit {
+            let next = self.next_in_dir(v, 1);
+            if next <= v || next > hi {
+                break;
+            }
+            v = next;
+            n += 1;
+        }
+        n
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prime_families() {
+        let t = prime_tables();
+        assert_eq!(&t.primes[..6], &[2, 3, 5, 7, 11, 13]);
+        assert_eq!(t.primes.len(), 78498); // π(10^6)
+        assert_eq!(&t.semiprimes[..8], &[6, 10, 14, 15, 21, 22, 26, 33]);
+        assert_eq!(&t.sphenics[..6], &[30, 42, 66, 70, 78, 102]);
+        assert_eq!(t.rank(2), 1);
+        assert_eq!(t.rank(13), 6);
+        assert_eq!(t.rank(15), 0);
+    }
+
+    #[test]
+    fn sequences_match_reference() {
+        // increments accumulate from the start
+        assert_eq!(&seq_mods(2, 1000, Seq::Fixed, 3)[..4], &[2, 5, 8, 11]);
+        assert_eq!(&seq_mods(2, 1000, Seq::Pi, 1)[..6], &[2, 5, 6, 10, 11, 16]);
+        assert_eq!(&seq_mods(2, 1000, Seq::Square, 1)[..5], &[2, 3, 7, 16, 32]);
+        assert_eq!(&seq_mods(2, 1000, Seq::Pow2, 1)[..5], &[2, 3, 5, 9, 17]);
+        assert_eq!(&seq_mods(2, 1000, Seq::Prime, 1)[..5], &[2, 4, 7, 12, 19]);
+        // 2×Pn from 4: 4, 6, 10, 14, 22, 26 (2 × consecutive primes)
+        assert_eq!(&seq_mods(4, 1000, Seq::Semi2p, 1)[..6], &[4, 6, 10, 14, 22, 26]);
+        // 3×Pn from 6: 6, 15, 21, 33, 39 (3 × primes other than 3)
+        assert_eq!(&seq_mods(6, 1000, Seq::Semi3p, 1)[..5], &[6, 15, 21, 33, 39]);
+        // landing sequences
+        assert_eq!(&seq_mods(2, 1000, Seq::Fib, 1)[..6], &[2, 3, 5, 8, 13, 21]);
+        assert_eq!(&seq_mods(2, 1000, Seq::PrimeSemi, 1)[..8], &[2, 3, 4, 5, 6, 7, 10, 11]);
+        assert_eq!(&seq_mods(2, 1000, Seq::SemiFull, 1)[..4], &[6, 10, 14, 15]);
+        assert_eq!(&seq_mods(2, 1000, Seq::PrimeSemiFull, 1)[..8], &[2, 3, 5, 6, 7, 10, 11, 13]);
+        assert_eq!(&seq_mods(40, 1000, Seq::Sphenic, 1)[..3], &[42, 66, 70]);
+    }
+
+    #[test]
+    fn families_open_their_presets_up() {
+        let t = prime_tables();
+        // products of r distinct primes: r = 2 and 3 are the semiprime and sphenic tables
+        // (lists stop at SEQ_MAX terms, as the presets' always did)
+        assert_eq!(t.products_of(2, 2, 1_000_000), t.semiprimes[..SEQ_MAX]);
+        assert_eq!(t.products_of(3, 2, 1_000_000), t.sphenics[..SEQ_MAX.min(t.sphenics.len())]);
+        assert_eq!(&t.products_of(1, 2, 30), &[2, 3, 5, 7, 11, 13, 17, 19, 23, 29]);
+        assert_eq!(&t.products_of(4, 2, 1000)[..4], &[210, 330, 390, 462]);
+        assert_eq!(&t.products_of(7, 2, 1_000_000)[..3], &[510510, 570570, 690690]);
+        // k×Pn: 5 × the primes, and 2 × the odd primes when distinct
+        assert_eq!(&seq_mods_with(10, 1000, Seq::Semi2p, 1, [5, 0])[..5], &[10, 15, 25, 35, 55]);
+        assert_eq!(&seq_mods_with(6, 1000, Seq::Semi2p, 1, [2, 1])[..4], &[6, 10, 14, 22]);
+        // the 3×Pn preset is the same family at k 3, distinct
+        assert_eq!(seq_mods_with(6, 1000, Seq::Semi2p, 1, [3, 1]), seq_mods(6, 1000, Seq::Semi3p, 1));
+        // a start off the first term shifts the whole walk
+        assert_eq!(&seq_mods_with(5, 1000, Seq::Semi2p, 1, [2, 0])[..4], &[5, 7, 11, 15]);
+        assert_eq!(&seq_mods_with(2, 100, Seq::PrimeSemi, 1, [3, 0])[..8], &[2, 3, 5, 6, 7, 9, 11, 13]);
+        assert_eq!(&seq_mods_with(2, 1000, Seq::SemiFull, 1, [4, 0])[..2], &[210, 330]);
+        // Lucas numbers from seeds 2, 1 (the 1 is below every modulus), cubes, base 3
+        assert_eq!(&seq_mods_with(2, 1000, Seq::Fib, 1, [2, 1])[..5], &[3, 4, 7, 11, 18]);
+        assert_eq!(&seq_mods_with(2, 1000, Seq::Square, 1, [3, 0])[..4], &[2, 3, 11, 38]);
+        assert_eq!(&seq_mods_with(2, 1000, Seq::Pow2, 1, [3, 0])[..4], &[2, 3, 6, 15]);
+        assert_eq!(&seq_mods_with(2, 1000, Seq::Prime, 1, [2, 0])[..4], &[2, 6, 12, 22]);
+        // every preset's standard knobs reproduce it, and every list ascends
+        for q in Seq::ALL {
+            assert_eq!(seq_mods_with(4, 5000, q, 3, q.standard()), seq_mods(4, 5000, q, 3), "{q:?}");
+            assert_eq!(q.describe(q.standard()), q.label());
+            for kn in q.knobs() {
+                assert!((kn.lo..=kn.hi).contains(&kn.standard), "{q:?} {}", kn.name);
+            }
+            for knobs in [[1, 0], [7, 1], [3, 1]] {
+                let l = seq_mods_with(4, 5000, q, 3, knobs);
+                assert!(l.windows(2).all(|w| w[0] < w[1]), "{q:?} {knobs:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn choosing_a_preset_again_resets_its_knobs() {
+        let mut s = Sweep { mode: ModMode::Interval, ..Default::default() };
+        s.choose_seq(Seq::Semi2p);
+        assert_eq!((s.knobs(), s.start), ([2, 0], 4));
+        s.set_knobs([5, 0]);
+        assert_eq!((s.seq_name().as_str(), s.start), ("5×Pn", 10));
+        assert_eq!(s.snap(24), 25);
+        // the start moved by hand shifts the walk; the knobs stay
+        s.start = 11;
+        assert_eq!(s.knobs(), [5, 0]);
+        // the same preset again: back to the standard 2×Pn, on its first term
+        s.choose_seq(Seq::Semi2p);
+        assert!(s.standard_knobs());
+        assert_eq!((s.seq_name().as_str(), s.start), ("2×Pn", 4));
+        assert_eq!(s.snap(25), 26);
+        // knobs belong to their sequence: another one runs at its own standard values
+        s.set_knobs([7, 1]);
+        s.seq = Seq::Sphenic;
+        assert_eq!(s.knobs(), [3, 0]);
+        // out-of-range knobs are clamped
+        s.set_knobs([99, 0]);
+        assert_eq!(s.knobs(), [7, 0]);
+    }
+
+    #[test]
+    fn snapping_and_stepping() {
+        let mut s = Sweep { mode: ModMode::Prime, ..Default::default() };
+        assert_eq!(s.snap(8), 7);
+        assert_eq!(s.snap(9), 7); // tie goes to the lower prime, as in the reference
+        assert_eq!(s.snap(10), 11);
+        assert_eq!(s.next_in_dir(7, 1), 11);
+        assert_eq!(s.next_in_dir(2, -1), *prime_tables().primes.last().unwrap()); // prime bank wraps
+        s.mode = ModMode::Composite;
+        assert_eq!(s.snap(7), 6);
+        assert_eq!(s.next_in_dir(10, 1), 12);
+        assert_eq!(s.next_in_dir(4, -1), 4);
+        s.mode = ModMode::Even;
+        assert_eq!(s.snap(7), 8);
+        assert_eq!(s.next_in_dir(8, 1), 10);
+        s.mode = ModMode::Interval;
+        s.seq = Seq::Fixed;
+        s.start = 5;
+        s.step = 4;
+        assert_eq!(s.snap(12), 13);
+        assert_eq!(s.next_in_dir(13, 1), 17);
+        s.seq = Seq::Fib;
+        assert_eq!(s.snap(20), 21);
+        assert_eq!(s.next_in_dir(21, 1), 34);
+        assert_eq!(s.step_by(5, 3), 21);
+    }
+
+    #[test]
+    fn playback_loops_and_stops_at_range_ends() {
+        let mut s = Sweep { start: 10, end: 13, looping: true, playing: true, ..Default::default() };
+        let mut v = 10;
+        let seen: Vec<u32> = (0..6).map(|_| {
+            v = s.tick(v);
+            v
+        }).collect();
+        assert_eq!(seen, vec![11, 12, 13, 10, 11, 12]);
+        s.looping = false;
+        let mut v = 12;
+        v = s.tick(v);
+        assert_eq!(v, 13);
+        assert!(!s.playing, "stops on reaching the edge");
+        s.playing = true;
+        s.dir = -1;
+        let mut v = 11;
+        v = s.tick(v);
+        assert_eq!((v, s.playing), (10, false));
+    }
+
+    #[test]
+    fn decimals_glide_through_the_gaps() {
+        // primes, one decimal: 7 → 7.1 → … → 10.9 → 11
+        let mut s = Sweep { mode: ModMode::Prime, decimals: 1, start: 2, end: 30, ..Default::default() };
+        assert_eq!(s.step_fine((7, 0), 1), (7, 1));
+        assert_eq!(s.step_fine((7, 39), 1), (11, 0), "7 + 3.9 is the last step before 11");
+        assert_eq!(s.step_fine_by((7, 0), 40), (11, 0));
+        assert_eq!(s.step_fine((11, 0), -1), (7, 39));
+        assert_eq!(s.step_fine((7, 5), -1), (7, 4));
+        // playback stops (or loops) at the range end, a whole modulus
+        s.looping = false;
+        s.playing = true;
+        assert_eq!(s.tick_fine((29, 0)), (29, 0));
+        assert!(!s.playing);
+        s.looping = true;
+        assert_eq!(s.tick_fine((29, 0)), (2, 0));
+        s.dir = -1;
+        assert_eq!(s.tick_fine((2, 0)), (29, 0));
+        assert_eq!(s.tick_fine((3, 0)), (2, 9));
+        // whole steps without decimals
+        s.decimals = 0;
+        s.dir = 1;
+        assert_eq!(s.step_fine((7, 0), 1), (11, 0));
+        // nine decimals to step by; exact ones while μ·10ᵈ stays within MOD_CAP
+        let s = Sweep { end: 128, ..Default::default() };
+        assert_eq!(s.max_decimals(), 9);
+        assert_eq!((Sweep::exact_decimals(7.4), Sweep::exact_decimals(128.0), Sweep::exact_decimals(50_000.0)), (5, 3, 1));
+    }
+
+
+    #[test]
+    fn super_primes_are_prime_numerator_fractions() {
+        // around 7, decimals: 7, 29/4 = 7.25, 59/8 = 7.375, 37/5 = 7.4, … and the user's
+        // list is in it (7.3 = 73/10, 7.39 = 739/100, 7.388 = 1847/250, …)
+        let mut s = Sweep { mode: ModMode::SuperPrime, start: 7, end: 8, decimals: 3, ..Default::default() };
+        let list = s.super_list().to_vec();
+        for f in [(7, 1), (37, 5), (59, 8), (73, 10), (739, 100), (1847, 250), (3697, 500), (7393, 1000), (29, 4)] {
+            assert!(list.contains(&f), "{f:?}");
+        }
+        assert!(list.iter().all(|&(p, q)| prime_tables().is_prime(p) && q % p != 0 && p >= 7 * q && p <= 8 * q));
+        // by value: ascending, starting 7, 29/4 before 59/8 before 37/5
+        assert_eq!(list[0], (7, 1));
+        assert!(list.windows(2).all(|w| (w[0].0 as u64 * w[1].1 as u64) <= (w[1].0 as u64 * w[0].1 as u64)));
+        let pos = |f| list.iter().position(|&x| x == f).unwrap();
+        assert!(pos((29, 4)) < pos((59, 8)) && pos((59, 8)) < pos((37, 5)));
+        // by numerator: the smallest numerators first
+        s.super_primes.order = SpOrder::Numerator;
+        let by_p = s.super_list().to_vec();
+        assert_eq!(&by_p[..4], &[(7, 1), (29, 4), (31, 4), (37, 5)]);
+        // any denominator: 22/3 is out (22 is not prime), 23/3 in, 37/5 still in
+        s.super_primes = SuperPrimes { denoms: SpDenoms::Any, qmax: 6, order: SpOrder::Value, unreduced: false };
+        let any = s.super_list().to_vec();
+        assert!(any.contains(&(23, 3)) && any.contains(&(37, 5)) && any.contains(&(43, 6)) && !any.contains(&(59, 8)));
+        // the cousins of 37 lie to its left: 37/2, 37/4, 37/5, …
+        let mut c = Sweep { mode: ModMode::SuperPrime, start: 1, end: 40, decimals: 1, ..Default::default() };
+        c.super_primes.order = SpOrder::Numerator;
+        let l = c.super_list().to_vec();
+        let cousins: Vec<(u32, u32)> = l.iter().copied().filter(|f| f.0 == 37).collect();
+        assert_eq!(cousins, vec![(37, 1), (37, 2), (37, 5), (37, 10)]);
+        // stepping and the nearest fraction
+        assert_eq!(s.super_nearest(37, 5).map(|i| s.super_list()[i]), Some((37, 5)));
+        let i = s.super_nearest(74, 10).unwrap();
+        assert_eq!(s.super_list()[i], (37, 5), "7.4 itself is 37/5");
+    }
+
+
+    #[test]
+    fn all_by_numerator_walks_every_fraction() {
+        // [7, 8], one decimal: by numerator 7, 15/2, 71/10, 73/10, … every lowest-terms
+        // fraction, composites too (74/10 is 37/5, not listed twice)
+        let mut s = Sweep { mode: ModMode::All, all_order: SpOrder::Numerator, start: 7, end: 8, decimals: 1, ..Default::default() };
+        assert!(s.fraction_mode());
+        let l = s.super_list().to_vec();
+        assert_eq!(&l[..5], &[(7, 1), (8, 1), (15, 2), (36, 5), (37, 5)]);
+        assert!(l.windows(2).all(|w| w[0] < w[1]), "by numerator");
+        let n = l.len();
+        assert_eq!(n, 2 + 1 + 4 + 4, "7, 8; 15/2; 36/5…39/5; 71/10, 73/10, 77/10, 79/10");
+        assert!(l.contains(&(77, 10)) && !l.contains(&(74, 10)) && !l.contains(&(75, 10)));
+        // the same settings in super-prime mode keep the prime numerators only
+        s.mode = ModMode::SuperPrime;
+        let sp = s.super_list().to_vec();
+        assert!(sp.iter().all(|f| prime_tables().is_prime(f.0)) && sp.contains(&(37, 5)) && !sp.contains(&(38, 5)));
+        // by value in mode All is the decimal grid, not a list
+        s.mode = ModMode::All;
+        s.all_order = SpOrder::Value;
+        assert!(!s.fraction_mode());
+        // a big walk is cut at SP_MAX, the largest numerators left out
+        let big = fractions(1, 1_000_000, &[1, 2, 4, 5, 8, 10], SpOrder::Value, false);
+        assert_eq!(big.len(), SP_MAX);
+        assert!(big.iter().all(|f| f.0 < 150_000));
+    }
+
+
+    #[test]
+    fn the_range_can_start_at_zero() {
+        // numerator 10, any Q ≤ 12: from 2 only 10 and 10/3; from 0 also 10/7, 10/9
+        // and 10/11 (below 1); unreduced, every Q
+        let tens = |s: &mut Sweep| s.super_list().iter().copied().filter(|f| f.0 == 10).collect::<Vec<_>>();
+        let sp = SuperPrimes { denoms: SpDenoms::Any, qmax: 12, order: SpOrder::Numerator, unreduced: false };
+        let mut s = Sweep { all_order: SpOrder::Numerator, super_primes: sp, start: 2, end: 128, ..Default::default() };
+        assert_eq!(tens(&mut s), vec![(10, 1), (10, 3)]);
+        s.start = 0;
+        assert_eq!(tens(&mut s), vec![(10, 1), (10, 3), (10, 7), (10, 9), (10, 11)]);
+        s.super_primes.unreduced = true;
+        assert_eq!(tens(&mut s), (1..=12).map(|q| (10, q)).collect::<Vec<_>>());
+        s.start = 2;
+        assert_eq!(tens(&mut s), (1..=5).map(|q| (10, q)).collect::<Vec<_>>());
+        // the fractions below 1 lead the by-value walk from 0: 1/12 first
+        s.super_primes.unreduced = false;
+        s.start = 0;
+        s.super_primes.order = SpOrder::Value;
+        s.mode = ModMode::SuperPrime;
+        assert_eq!(s.super_list()[0], (2, 11), "the smallest prime-numerator fraction");
+
+        // decimals from 0: 0.1, 0.2, … 0.9, 1, 1.1, … (μ = 0 itself is no modulus)
+        let mut s = Sweep { decimals: 1, start: 0, end: 3, looping: true, playing: true, ..Default::default() };
+        assert_eq!(s.first_pos(), (0, 1));
+        assert_eq!(s.step_fine((0, 9), 1), (1, 0));
+        assert_eq!(s.step_fine((1, 0), -1), (0, 9));
+        assert_eq!(s.step_fine((0, 1), -1), (0, 1), "no step to 0");
+        assert_eq!(s.tick_fine((3, 0)), (0, 1), "loops back to 0.1");
+        s.dir = -1;
+        assert_eq!(s.tick_fine((0, 1)), (3, 0));
+        s.looping = false;
+        s.playing = true;
+        assert_eq!(s.tick_fine((0, 1)), (0, 1));
+        assert!(!s.playing);
+        // primes from 0: 0.1 … 1.9, then 2
+        let mut s = Sweep { mode: ModMode::Prime, decimals: 1, start: 0, end: 30, ..Default::default() };
+        assert_eq!(s.step_fine((0, 19), 1), (2, 0));
+        assert_eq!(s.step_fine((2, 0), -1), (0, 19));
+        // from 2 the walk keeps its old ends
+        s.start = 2;
+        assert_eq!(s.first_pos(), (2, 0));
+    }
+
+    #[test]
+    fn kinship_walks_by_resemblance() {
+        // one factor: the families in turn, each step a prime multiplied in or divided out
+        // where one is left (16 → 24 is two: ÷2, ×3); against an independent prototype
+        assert_eq!(kinship(1, 24, KinOrder::Lattice), vec![1, 2, 4, 8, 16, 24, 12, 6, 3, 9, 18, 15, 5, 10, 20, 14, 7, 21, 11, 22, 13, 17, 19, 23]);
+        // look-alike: Jaccard of the zero sets over the first 96 rows, against a Python twin
+        assert_eq!(kinship(2, 24, KinOrder::LookAlike), vec![2, 4, 12, 6, 3, 9, 18, 15, 5, 10, 20, 8, 24, 16, 14, 7, 21, 13, 11, 22, 23, 17, 19]);
+        assert_eq!(
+            kinship(1, 40, KinOrder::LookAlike),
+            vec![1, 2, 4, 12, 6, 3, 9, 18, 36, 24, 8, 16, 32, 40, 20, 10, 5, 15, 30, 35, 7, 14, 28, 21, 39, 13, 26, 22, 11, 33, 29, 31, 37, 19, 38, 34, 17, 23, 25, 27]
+        );
+        // every modulus of the range exactly once
+        for order in KinOrder::ALL {
+            let mut w = kinship(5, 300, order);
+            assert_eq!(w[0], 5);
+            w.sort_unstable();
+            assert_eq!(w, (5..=300).collect::<Vec<_>>(), "{order:?}");
+        }
+        // big ranges are cut, not slow
+        assert_eq!(kinship(1, 1_000_000, KinOrder::LookAlike).len(), KIN_LOOK_MAX);
+        // the sweep walks it as a list: playback, steps, the range from 0
+        let mut s = Sweep { mode: ModMode::Kinship, start: 0, end: 24, looping: true, playing: true, ..Default::default() };
+        assert!(s.fraction_mode());
+        assert_eq!(s.super_list()[..6], [(1, 1), (2, 1), (4, 1), (8, 1), (16, 1), (24, 1)]);
+        assert_eq!(s.super_tick(23), 0, "loops");
+        assert_eq!(s.super_nearest(6, 1), Some(7));
+        s.kin_order = KinOrder::LookAlike;
+        s.start = 2;
+        assert_eq!(s.super_list()[..4], [(2, 1), (4, 1), (12, 1), (6, 1)]);
+    }
+
+    #[test]
+    fn prime_walks_look_up_fast_and_steps_stay_on_the_mode() {
+        // every prime order: a step lands where a linear search of the walk puts it
+        for order in [PrimeOrder::All, PrimeOrder::Rem1, PrimeOrder::Rem3, PrimeOrder::ByRem4] {
+            let mut s = Sweep { mode: ModMode::Prime, prime_order: order, ..Default::default() };
+            let pool = s.pool().unwrap().to_vec();
+            for i in (0..pool.len()).step_by(977).chain([0, pool.len() - 1]) {
+                assert_eq!(prime_pos(&pool, order, pool[i]), Some(i), "{order:?} {}", pool[i]);
+                assert_eq!(s.next_in_dir(pool[i], 1), pool[(i + 1) % pool.len()]);
+                assert_eq!(s.next_in_dir(pool[i], -1), pool[(i + pool.len() - 1) % pool.len()]);
+            }
+            assert_eq!(prime_pos(&pool, order, 9), None);
+        }
+        // the whole prime range counts in well under a frame, and again from the cache
+        let mut s = Sweep { mode: ModMode::Prime, start: 2, end: MOD_CAP, ..Default::default() };
+        let t = std::time::Instant::now();
+        assert_eq!(s.frames_in_range(100_000), 78_498);
+        assert_eq!(s.frames_in_range(100_000), 78_498);
+        assert!(t.elapsed().as_millis() < 500, "{:?}", t.elapsed());
+        s.end = 97;
+        assert_eq!(s.frames_in_range(100_000), 25, "a new range recounts");
+        // a step off the end of the evens, the odds or a fixed interval stays put
+        let mut e = Sweep { mode: ModMode::Even, ..Default::default() };
+        assert_eq!((e.next_in_dir(2, -1), e.next_in_dir(MOD_CAP, 1), e.next_in_dir(4, -1)), (2, MOD_CAP, 2));
+        let mut o = Sweep { mode: ModMode::Odd, ..Default::default() };
+        assert_eq!((o.next_in_dir(1, -1), o.next_in_dir(MOD_CAP - 1, 1), o.next_in_dir(3, 1)), (1, MOD_CAP - 1, 5));
+        let mut f = Sweep { mode: ModMode::Interval, seq: Seq::Fixed, step: 4, start: 5, ..Default::default() };
+        assert_eq!((f.next_in_dir(5, -1), f.next_in_dir(9, -1), f.next_in_dir(5, 1)), (5, 5, 9));
+    }
+}
