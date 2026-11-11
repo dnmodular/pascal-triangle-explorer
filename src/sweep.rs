@@ -529,6 +529,8 @@ pub struct Sweep {
     kin_cache: Option<(KinKey, Vec<(u32, u32)>)>,
     /// Cached walk lists, rebuilt when the mode parameters change.
     cache: Option<(PoolKey, Vec<u32>)>,
+    /// The last [`Sweep::frames_in_range`] count (the sweep bar asks every frame).
+    frames_cache: Option<(FramesKey, usize)>,
 }
 
 impl Default for Sweep {
@@ -554,6 +556,7 @@ impl Default for Sweep {
             sp_cache: None,
             kin_cache: None,
             cache: None,
+            frames_cache: None,
         }
     }
 }
@@ -627,12 +630,7 @@ pub fn fractions_with(lo: u32, hi: u32, denoms: &[u32], order: SpOrder, prime_on
     let t = prime_tables();
     let (lo, hi) = (lo as u64, hi.max(1) as u64);
     let mut out = Vec::new();
-    let gcd = |mut a: u64, mut b: u64| {
-        while b != 0 {
-            (a, b) = (b, a % b);
-        }
-        a
-    };
+    let gcd = crate::math::gcd_u64;
     'outer: for p in lo.max(1)..=MOD_CAP as u64 {
         if prime_only && !t.is_prime(p as u32) {
             continue;
@@ -836,6 +834,23 @@ pub fn super_primes(lo: u32, hi: u32, denoms: &[u32], order: SpOrder) -> Vec<(u3
 
 /// What a walk list is built from: mode, prime order, sequence, step, knobs, anchor.
 type PoolKey = (ModMode, PrimeOrder, Seq, u32, [u32; 2], u32);
+/// What a frame count depends on: the walk, the range and the cap.
+type FramesKey = (ModMode, PrimeOrder, Seq, u32, [u32; 2], u32, u32, usize);
+
+/// Where prime `cur` sits in a prime walk list. The lists are ascending, except the
+/// grouped one, [2] then the primes ≡ 1 (mod 4) then those ≡ 3, each group ascending.
+fn prime_pos(pool: &[u32], order: PrimeOrder, cur: u32) -> Option<usize> {
+    if order != PrimeOrder::ByRem4 {
+        return pool.binary_search(&cur).ok();
+    }
+    if pool.first() == Some(&cur) {
+        return Some(0);
+    }
+    let rest = &pool[1.min(pool.len())..];
+    let split = rest.partition_point(|&p| p % 4 == 1);
+    let (group, base) = if cur % 4 == 1 { (&rest[..split], 1) } else { (&rest[split..], 1 + split) };
+    group.binary_search(&cur).ok().map(|i| base + i)
+}
 
 impl Sweep {
     /// Choose sequence `q` at its standard knobs (choosing the current one again resets
@@ -1009,7 +1024,7 @@ impl Sweep {
     /// of them are exact; the exact real residue needs μ's numerator within MOD_CAP,
     /// so (see `Modulus::from_decimal_nearest`) where it would pass it the nearest
     /// fraction that fits is drawn: 7.123456 is exact, 712.3456 rounds to 712345/1000.
-    pub fn max_decimals(&mut self) -> u32 {
+    pub fn max_decimals(&self) -> u32 {
         MAX_DECIMALS
     }
 
@@ -1175,12 +1190,14 @@ impl Sweep {
             return if dir > 0 { self.first_visited() } else { 0 };
         }
         let mode = self.mode;
+        let order = self.prime_order;
         let step = self.step.max(1) as i64;
+        let anchor = self.anchor() as i64;
         if let Some(pool) = self.pool() {
             if !pool.is_empty() {
                 if mode == ModMode::Prime {
                     let n = pool.len() as i64;
-                    let next = match pool.iter().position(|&p| p == cur) {
+                    let next = match prime_pos(pool, order, cur) {
                         None => 0,
                         Some(i) => (i as i64 + dir as i64).rem_euclid(n),
                     };
@@ -1200,9 +1217,18 @@ impl Sweep {
                 }
                 v.clamp(4, MOD_CAP as i64) as u32
             }
-            ModMode::Interval => clamp_mod(cur as i64 + dir as i64 * step),
             ModMode::All | ModMode::SuperPrime | ModMode::Kinship => clamp_mod(cur as i64 + dir as i64),
-            _ => clamp_mod(cur as i64 + dir as i64 * 2),
+            // a step that would leave the mode's own moduli (below the anchor, below 2
+            // for the evens, past the cap) stays put: clamping would land between them
+            _ => {
+                let (stride, least) = match mode {
+                    ModMode::Interval => (step, anchor),
+                    ModMode::Even => (2, 2),
+                    _ => (2, 1),
+                };
+                let v = cur as i64 + dir as i64 * stride;
+                if v < least || v > MOD_CAP as i64 { cur } else { v as u32 }
+            }
         }
     }
 
@@ -1265,6 +1291,18 @@ impl Sweep {
 
     /// Number of moduli in the range for the active mode (capped at `limit`).
     pub fn frames_in_range(&mut self, limit: usize) -> usize {
+        let key: FramesKey = (self.mode, self.prime_order, self.seq, self.step, self.knobs(), self.start, self.end, limit);
+        if let Some((k, n)) = self.frames_cache {
+            if k == key {
+                return n;
+            }
+        }
+        let n = self.count_frames(limit);
+        self.frames_cache = Some((key, n));
+        n
+    }
+
+    fn count_frames(&mut self, limit: usize) -> usize {
         let (lo, hi) = self.bounds();
         let mut v = lo;
         let mut n = 1;
@@ -1451,7 +1489,7 @@ mod tests {
         s.dir = 1;
         assert_eq!(s.step_fine((7, 0), 1), (11, 0));
         // nine decimals to step by; exact ones while μ·10ᵈ stays within MOD_CAP
-        let mut s = Sweep { end: 128, ..Default::default() };
+        let s = Sweep { end: 128, ..Default::default() };
         assert_eq!(s.max_decimals(), 9);
         assert_eq!((Sweep::exact_decimals(7.4), Sweep::exact_decimals(128.0), Sweep::exact_decimals(50_000.0)), (5, 3, 1));
     }
@@ -1592,5 +1630,35 @@ mod tests {
         s.kin_order = KinOrder::LookAlike;
         s.start = 2;
         assert_eq!(s.super_list()[..4], [(2, 1), (4, 1), (12, 1), (6, 1)]);
+    }
+
+    #[test]
+    fn prime_walks_look_up_fast_and_steps_stay_on_the_mode() {
+        // every prime order: a step lands where a linear search of the walk puts it
+        for order in [PrimeOrder::All, PrimeOrder::Rem1, PrimeOrder::Rem3, PrimeOrder::ByRem4] {
+            let mut s = Sweep { mode: ModMode::Prime, prime_order: order, ..Default::default() };
+            let pool = s.pool().unwrap().to_vec();
+            for i in (0..pool.len()).step_by(977).chain([0, pool.len() - 1]) {
+                assert_eq!(prime_pos(&pool, order, pool[i]), Some(i), "{order:?} {}", pool[i]);
+                assert_eq!(s.next_in_dir(pool[i], 1), pool[(i + 1) % pool.len()]);
+                assert_eq!(s.next_in_dir(pool[i], -1), pool[(i + pool.len() - 1) % pool.len()]);
+            }
+            assert_eq!(prime_pos(&pool, order, 9), None);
+        }
+        // the whole prime range counts in well under a frame, and again from the cache
+        let mut s = Sweep { mode: ModMode::Prime, start: 2, end: MOD_CAP, ..Default::default() };
+        let t = std::time::Instant::now();
+        assert_eq!(s.frames_in_range(100_000), 78_498);
+        assert_eq!(s.frames_in_range(100_000), 78_498);
+        assert!(t.elapsed().as_millis() < 500, "{:?}", t.elapsed());
+        s.end = 97;
+        assert_eq!(s.frames_in_range(100_000), 25, "a new range recounts");
+        // a step off the end of the evens, the odds or a fixed interval stays put
+        let mut e = Sweep { mode: ModMode::Even, ..Default::default() };
+        assert_eq!((e.next_in_dir(2, -1), e.next_in_dir(MOD_CAP, 1), e.next_in_dir(4, -1)), (2, MOD_CAP, 2));
+        let mut o = Sweep { mode: ModMode::Odd, ..Default::default() };
+        assert_eq!((o.next_in_dir(1, -1), o.next_in_dir(MOD_CAP - 1, 1), o.next_in_dir(3, 1)), (1, MOD_CAP - 1, 5));
+        let mut f = Sweep { mode: ModMode::Interval, seq: Seq::Fixed, step: 4, start: 5, ..Default::default() };
+        assert_eq!((f.next_in_dir(5, -1), f.next_in_dir(9, -1), f.next_in_dir(5, 1)), (5, 5, 9));
     }
 }

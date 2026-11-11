@@ -63,18 +63,6 @@ pub fn is_prime(n: u32) -> bool {
     n >= 2 && factorize(n).len() == 1 && factorize(n)[0].e == 1
 }
 
-/// Next prime above `n` (or `n` itself when `from_self`), capped at `MOD_CAP`.
-pub fn next_prime(n: u32, dir: i32) -> Option<u32> {
-    let mut x = n as i64 + dir as i64;
-    while x >= 2 && x <= MOD_CAP as i64 {
-        if is_prime(x as u32) {
-            return Some(x as u32);
-        }
-        x += dir as i64;
-    }
-    None
-}
-
 /// Human form of a factorization, e.g. `2³·3·5`.
 pub fn factor_string(fs: &[PrimePower]) -> String {
     const SUP: [char; 10] = ['⁰', '¹', '²', '³', '⁴', '⁵', '⁶', '⁷', '⁸', '⁹'];
@@ -386,19 +374,7 @@ impl Modulus {
     /// μ as text, exactly: a decimal when q divides a power of 10 (the expansion
     /// ends), else the fraction m/q.
     pub fn label(&self) -> String {
-        let mut q = self.q;
-        while q.is_multiple_of(2) {
-            q /= 2;
-        }
-        while q.is_multiple_of(5) {
-            q /= 5;
-        }
-        if q == 1 { decimal_text(self.m as u64, self.q as u64) } else { format!("{}/{}", self.m, self.q) }
-    }
-
-    /// μ = P/Q as a fraction (P/1 for a whole modulus).
-    pub fn fraction(&self) -> String {
-        format!("{}/{}", self.m, self.q)
+        fraction_label(self.m, self.q)
     }
 
     pub fn is_prime(&self) -> bool {
@@ -436,7 +412,22 @@ impl Modulus {
     }
 }
 
-fn gcd_u64(mut a: u64, mut b: u64) -> u64 {
+/// μ = p/q as text, exactly, in lowest terms: a decimal when the reduced q divides a
+/// power of 10 (the expansion ends), else the fraction (no modulus tables needed).
+pub fn fraction_label(p: u32, q: u32) -> String {
+    let g = gcd_u64(p as u64, q.max(1) as u64).max(1) as u32;
+    let (m, q) = (p / g, q.max(1) / g);
+    let mut r = q;
+    while r.is_multiple_of(2) {
+        r /= 2;
+    }
+    while r.is_multiple_of(5) {
+        r /= 5;
+    }
+    if r == 1 { decimal_text(m as u64, q as u64) } else { format!("{m}/{q}") }
+}
+
+pub fn gcd_u64(mut a: u64, mut b: u64) -> u64 {
     while b != 0 {
         (a, b) = (b, a % b);
     }

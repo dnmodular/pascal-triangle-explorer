@@ -243,15 +243,17 @@ impl Model {
     /// Go to μ = p/q exactly (lowest terms taken; p ≥ 1 within MOD_CAP, so μ > 0), off
     /// the sweep's grid; with `follow`, linked rows follow it.
     fn set_fraction(&mut self, p: u32, q: u32, follow: bool) {
-        let md = Modulus::decimal(p, q.max(1));
-        let changed = (md.m, md.q) != (self.modulus.m, self.modulus.q) || self.morph.is_some();
-        self.m = (md.m / md.q).max(1);
+        // (lowest terms first: the tables are built only when μ changes)
+        let g = math::gcd_u64(p as u64, q.max(1) as u64).max(1) as u32;
+        let (p, q) = (p / g, q.max(1) / g);
+        let changed = (p, q) != (self.modulus.m, self.modulus.q) || self.morph.is_some();
+        if changed {
+            self.modulus = if q == 1 { self.whole(p) } else { Arc::new(Modulus::decimal(p, q)) };
+        }
+        self.m = (p / q).max(1);
         self.sub = 0;
         self.morph = None;
-        self.free_fraction = md.is_decimal();
-        if changed {
-            self.modulus = Arc::new(md);
-        }
+        self.free_fraction = q > 1;
         self.m_text = self.modulus.label();
         if changed && follow {
             self.apply_link();
@@ -300,13 +302,17 @@ impl Model {
                 // from the whole m to the next visited modulus, t of the way
                 let gap = self.sweep.gap_after(m);
                 let t = sub as f64 / (gap as u64 * self.sweep.fine_units()) as f64;
-                self.morph = Some((Arc::new(Modulus::new((m + gap).min(MOD_CAP))), t as f32));
-                if self.modulus.m != m || self.modulus.is_decimal() {
-                    self.modulus = Arc::new(Modulus::new(m));
-                }
+                // (both ends are reused while the walk stays in this gap)
+                let (base, target) = (self.whole(m), self.whole((m + gap).min(MOD_CAP)));
+                self.modulus = base;
+                self.morph = Some((target, t as f32));
+            } else if sub == 0 {
+                self.modulus = self.whole(m);
+                self.morph = None;
+                self.rounded = false;
             } else {
                 self.morph = None;
-                let (md, rounded) = if sub == 0 { (Modulus::new(m), false) } else { Modulus::from_decimal_nearest(m, sub, d, MOD_CAP) };
+                let (md, rounded) = Modulus::from_decimal_nearest(m, sub, d, MOD_CAP);
                 self.modulus = Arc::new(md);
                 self.rounded = rounded;
             }
@@ -328,9 +334,27 @@ impl Model {
         }
     }
 
-    /// μ's value (the decimal modulus, or a morph's position).
+    /// μ's value: the modulus drawn, or the sweep's position while that is a morph or
+    /// a rounded decimal.
     fn mu(&self) -> f64 {
-        self.m as f64 + self.sub as f64 / self.sweep.fine_units() as f64
+        if self.morph.is_some() || (self.rounded && self.sub > 0) {
+            self.m as f64 + self.sub as f64 / self.sweep.fine_units() as f64
+        } else {
+            self.modulus.mu()
+        }
+    }
+
+    /// The whole modulus m's tables: the ones already held (the modulus drawn, or a
+    /// morph's far end) when they are m's, else built (O(m) for a prime m).
+    fn whole(&self, m: u32) -> Arc<Modulus> {
+        let held = |md: &Arc<Modulus>| md.m == m && md.q == 1;
+        if held(&self.modulus) {
+            return self.modulus.clone();
+        }
+        match &self.morph {
+            Some((b, _)) if held(b) => b.clone(),
+            _ => Arc::new(Modulus::new(m)),
+        }
     }
 
     /// The style the frame is drawn in: the canvas style with the fraction colors
@@ -357,9 +381,9 @@ impl Model {
         // a fraction, "37/5": exactly that μ (in the super-prime walk, its place there)
         if let Some((a, b)) = t.split_once('/') {
             let (Ok(a), Ok(b)) = (a.trim().parse::<u64>(), b.trim().parse::<u64>()) else { return false };
-            let g = { let (mut x, mut y) = (a, b); while y != 0 { (x, y) = (y, x % y); } x.max(1) };
+            let g = math::gcd_u64(a, b).max(1);
             let (p, q) = (a / g, b / g);
-            if q == 0 || p == 0 || p > MOD_CAP as u64 {
+            if q == 0 || p == 0 || p > MOD_CAP as u64 || q > u32::MAX as u64 {
                 return false;
             }
             if self.super_mode() {
@@ -559,15 +583,6 @@ impl Model {
     fn fit(&mut self, cw: f64, ch: f64) {
         self.view = View::fit(cw, ch, self.fit_rows);
         self.auto_fit = true;
-    }
-
-    /// The key an inspector line or in-cell number shows for a cell.
-    fn cell_value(&self, n: u32, k: u32) -> Option<String> {
-        match self.layers.preset() {
-            Some(Preset::Residue) | Some(Preset::Mask) => Some(math::decimal_text(self.modulus.scaled(n, k) as u64, self.modulus.q as u64)),
-            Some(Preset::Valuation) => Some(math::carries(n, k, self.modulus.p).to_string()),
-            None => None,
-        }
     }
 
     fn inspector_text(&self, n: u32, k: u32) -> String {
@@ -1966,7 +1981,7 @@ fn sweep_bar(ui: &mut egui::Ui, model: &mut Model) {
                 _ => pascal::sweep::SP_MAX,
             };
             let list = sw.super_list();
-            let mut pv: Vec<String> = list.iter().take(6).map(|&(p, q)| Modulus::decimal(p, q).label()).collect();
+            let mut pv: Vec<String> = list.iter().take(6).map(|&(p, q)| math::fraction_label(p, q)).collect();
             if list.len() > 6 {
                 pv.push("…".into());
             }
@@ -2186,26 +2201,31 @@ fn canvas_overlays(ui: &mut egui::Ui, model: &mut Model, rect: Rect, ppp: f32, h
             let font = FontId::monospace(((pt.log2() * 4.0).round() / 4.0).exp2() as f32);
             let x1 = model.view.x0 + cw / model.view.ppc;
             let level_map = model.palette.level_map(model.modulus.m, model.style.offset);
-            for n in n_lo..=n_hi {
+            // (per frame, not per cell: the preset, the color denominator, the ν scale)
+            let md = &*model.modulus;
+            let preset = model.layers.preset();
+            let color_q = if model.frame_style().phase { 1 } else { md.q };
+            let nu_max = ((n_hi.max(1) as f64).ln() / (md.p as f64).ln()).floor().max(1.0);
+            'rows: for n in n_lo..=n_hi {
                 let k_lo = (model.view.x0 + n as f64 / 2.0 - 0.5).ceil().max(0.0) as i64;
                 let k_hi = (x1 + n as f64 / 2.0 + 0.5).floor().min(n as f64) as i64;
                 for k in k_lo..=k_hi {
                     let k = k as u32;
-                    let Some(text) = model.cell_value(n, k) else { break };
-                    let r = model.modulus.scaled(n, k);
-                    let (rgb, show) = match model.layers.preset() {
-                        Some(Preset::Residue) => (model.palette.residue_color_scaled(r, model.modulus.m, if model.frame_style().phase { 1 } else { model.modulus.q }, &level_map), r != 0),
-                        Some(Preset::Mask) => (pascal::palette::LIGHT, r != 0),
-                        Some(Preset::Valuation) => {
-                            let nu = math::carries(n, k, model.modulus.p) as f64;
-                            let max = ((n_hi.max(1) as f64).ln() / (model.modulus.p as f64).ln()).floor().max(1.0);
-                            (model.palette.ramp[((nu / max).clamp(0.0, 1.0) * 255.0).round() as usize], true)
+                    let (rgb, text) = match preset {
+                        Some(Preset::Residue) | Some(Preset::Mask) => {
+                            let r = md.scaled(n, k);
+                            if r == 0 {
+                                continue;
+                            }
+                            let rgb = if preset == Some(Preset::Mask) { pascal::palette::LIGHT } else { model.palette.residue_color_scaled(r, md.m, color_q, &level_map) };
+                            (rgb, math::decimal_text(r as u64, md.q as u64))
                         }
-                        None => break,
+                        Some(Preset::Valuation) => {
+                            let nu = math::carries(n, k, md.p);
+                            (model.palette.ramp[((nu as f64 / nu_max).clamp(0.0, 1.0) * 255.0).round() as usize], nu.to_string())
+                        }
+                        None => break 'rows,
                     };
-                    if !show {
-                        continue;
-                    }
                     let lum = 0.299 * rgb[0] as f64 + 0.587 * rgb[1] as f64 + 0.114 * rgb[2] as f64;
                     let color = if lum > 140.0 { Color32::BLACK } else { Color32::WHITE };
                     let (x, y, w, h) = model.view.cell_rect(n, k);
@@ -2946,5 +2966,38 @@ mod tests {
         assert_eq!(md.sweep.super_list()[md.sp_index], (15, 1));
         md.step(1);
         assert_eq!(md.modulus.m, 5);
+    }
+
+    #[test]
+    fn tables_are_reused_and_fractions_keep_their_value() {
+        let mut md = Model::new();
+        // a morph keeps both ends' tables while the walk stays in the gap, and landing
+        // on the far end takes the tables the morph already held
+        md.sweep.decimals = 1;
+        md.sweep.morph = true;
+        md.set_pos(7, 1, false);
+        let (base, far) = (md.modulus.clone(), md.morph.as_ref().unwrap().0.clone());
+        assert_eq!((base.m, far.m), (7, 8));
+        md.set_pos(7, 2, false);
+        assert!(Arc::ptr_eq(&md.modulus, &base) && Arc::ptr_eq(&md.morph.as_ref().unwrap().0, &far));
+        md.set_pos(8, 0, false);
+        assert!(Arc::ptr_eq(&md.modulus, &far) && md.morph.is_none());
+        md.sweep.morph = false;
+        // the same fraction again builds nothing
+        assert!(md.goto_text("37/5"));
+        let held = md.modulus.clone();
+        md.set_fraction(74, 10, false);
+        assert!(Arc::ptr_eq(&md.modulus, &held));
+        // rows linked to a fraction follow its value, not its whole part
+        assert!((md.mu() - 7.4).abs() < 1e-12);
+        md.link_rows = true;
+        md.link_factor = 10.0;
+        assert_eq!(md.linked_rows(), 74.0);
+        assert!(md.goto_text("7/10") && (md.mu() - 0.7).abs() < 1e-12);
+        // a denominator past u32 is refused, not truncated
+        assert!(!md.goto_text("7/4294967301"));
+        assert_eq!(math::fraction_label(74, 10), "7.4");
+        assert_eq!(math::fraction_label(10, 4), "2.5");
+        assert_eq!(math::fraction_label(23, 3), "23/3");
     }
 }
