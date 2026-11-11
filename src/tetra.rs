@@ -302,6 +302,12 @@ impl Default for TetraConfig {
 }
 
 impl TetraConfig {
+    /// The view shows the stack itself (the stack, or the top face, the stack seen from
+    /// above): the views where the cell shapes and the shape settings apply.
+    pub fn shows_stack(&self) -> bool {
+        shows_stack(self.view, self.face)
+    }
+
     /// What the geometry of `view` depends on (the scene is rebuilt when it changes):
     /// the face view also on its face and how many layers into it (`depth`).
     pub fn scene_key(&self, view: View, depth: u32) -> SceneKey {
@@ -430,6 +436,11 @@ pub fn view_stride(view: View, mods: &[u32], spacing: Spacing, budget: u32) -> u
 /// The stack's stride in true spacing (for callers that only know the stack).
 pub fn stride_for(mods: &[u32], budget: u32) -> u32 {
     view_stride(View::Stack, mods, Spacing::True, budget)
+}
+
+/// The stack itself is on show: the stack view, or the top face (the stack from above).
+fn shows_stack(view: View, face: Face) -> bool {
+    view == View::Stack || (view == View::Face && face == Face::Top)
 }
 
 /// A side of the stack that peels: the three sides of every triangle (as faces of the
@@ -941,7 +952,7 @@ impl Layout {
     /// The stack is shown here (the stack view, or the top face, which is the stack
     /// turned): the cells it draws as `cell`; every other view draws boxes.
     pub fn draws(&self, cell: Cell) -> Cell {
-        if self.view == View::Stack || (self.view == View::Face && self.face == Face::Top) {
+        if shows_stack(self.view, self.face) {
             cell
         } else {
             Cell::Cube

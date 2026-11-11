@@ -617,7 +617,7 @@ fn options(ui: &mut egui::Ui, t: &mut TetraView) {
             _ => {}
         });
     }
-    ui.add_enabled_ui(c.view == View::Stack || (c.view == View::Face && c.face == Face::Top), |ui| {
+    ui.add_enabled_ui(c.shows_stack(), |ui| {
         ui.horizontal(|ui| {
             weak(ui, "shape");
             egui::ComboBox::from_id_salt("tetra shape").width(150.0).selected_text(c.shape.label()).show_ui(ui, |ui| {
@@ -627,7 +627,7 @@ fn options(ui: &mut egui::Ui, t: &mut TetraView) {
             }).response.on_hover_text(c.shape.note()).on_disabled_hover_text("The faces and the diamond are flat: the shape is the stack's (the top shows it)");
         });
     });
-    ui.add_enabled_ui(c.view == View::Stack || (c.view == View::Face && c.face == Face::Top), |ui| {
+    ui.add_enabled_ui(c.shows_stack(), |ui| {
         ui.horizontal(|ui| {
             weak(ui, "cell");
             for cl in Cell::ALL {
@@ -635,7 +635,7 @@ fn options(ui: &mut egui::Ui, t: &mut TetraView) {
             }
         });
     });
-    if c.cell != Cell::Cube && (c.shape != Shape::Regular || c.spacing != Spacing::True) && (c.view == View::Stack || (c.view == View::Face && c.face == Face::Top)) {
+    if c.cell != Cell::Cube && (c.shape != Shape::Regular || c.spacing != Spacing::True) && c.shows_stack() {
         note(ui, "The rhombic and sphere cells fit the equilateral shape in true spacing: elsewhere the slices do not sit in each other's hollows, and the cells overlap or leave gaps.");
     }
     ui.horizontal(|ui| {

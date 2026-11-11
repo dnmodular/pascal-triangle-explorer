@@ -700,6 +700,7 @@ src/widgets.rs   small egui helpers the panels share
 src/tetra_ui.rs  the stack's panel, tile and 3D space
 shaders/common.wgsl    bindings, grid mapping, lattice neighbours (prepended to every 2D pass, with binom.wgsl)
 shaders/binom.wgsl     Montgomery mulmod, Granville / Lucas, Kummer: no bindings, shared with the tetra stack
+shaders/tetra_common.wgsl the slice record both tetra modules read
 shaders/tetra_cells.wgsl  the stack's residues, one thread per (m, n, k), appended to two cube lists
 shaders/tetra_draw.wgsl   instanced cubes with fragment-shader edges, the ID pass, dashed lines
 shaders/value.wgsl     residue + carries + divisibility mask per texel

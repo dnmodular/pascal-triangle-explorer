@@ -637,6 +637,27 @@ impl WaveOverlay {
         }
     }
 
+    /// The closed form for modulus m: the one held (the app's, see `share_closed_form`,
+    /// or one built here) when it is m's, else built now.
+    fn closed_for(&mut self, m: u32) -> Arc<Modulus> {
+        match &self.closed {
+            Some(c) if c.m == m => c.clone(),
+            _ => {
+                let md = Arc::new(Modulus::new(m));
+                self.closed = Some(md.clone());
+                md
+            }
+        }
+    }
+
+    /// Every target frequency gets a displayed entry to ease from (allocates only on a
+    /// source change).
+    fn seed_displayed(&mut self) {
+        for &f in self.target.keys() {
+            self.displayed.entry(f).or_insert(0.0);
+        }
+    }
+
     /// Fill `target` with the nonzero r_k of `src`; false when the row is out of reach.
     fn rebuild_target(&mut self, src: Source) -> bool {
         self.target.clear();
@@ -658,11 +679,7 @@ impl WaveOverlay {
                 }
             }
         } else if m <= MOD_CAP as u64 && n <= u32::MAX as u64 {
-            let m32 = m as u32;
-            if self.closed.as_ref().map(|c| c.m) != Some(m32) {
-                self.closed = Some(Arc::new(Modulus::new(m32)));
-            }
-            let md = self.closed.as_ref().expect("closed form just built");
+            let md = self.closed_for(m as u32);
             for k in k_lo..=k_hi {
                 let r = md.binom(n as u32, k as u32);
                 if r != 0 {
@@ -675,11 +692,7 @@ impl WaveOverlay {
             log::debug!("wave overlay: row {n} mod {m} is beyond the overlay's range");
             return false;
         }
-        // every target frequency gets a displayed entry to ease from (allocates only
-        // here, on a source change)
-        for &f in self.target.keys() {
-            self.displayed.entry(f).or_insert(0.0);
-        }
+        self.seed_displayed();
         true
     }
 
@@ -710,9 +723,7 @@ impl WaveOverlay {
             }
             if exact || self.region_bands(m, n_lo, n_hi, x2_lo, x2_hi, &mut stats) {
                 self.region_stats = stats;
-                for &f in self.target.keys() {
-                    self.displayed.entry(f).or_insert(0.0);
-                }
+                self.seed_displayed();
                 return true;
             }
         }
@@ -739,10 +750,7 @@ impl WaveOverlay {
         let deep_lo = n_lo.max(PASCAL_MAX_ROW + 1);
         if n_hi >= deep_lo {
             if m > 1 {
-                let m32 = m as u32;
-                if self.closed.as_ref().map(|c| c.m) != Some(m32) {
-                    self.closed = Some(Arc::new(Modulus::new(m32)));
-                }
+                self.closed_for(m as u32);
             }
             let rows = n_hi - deep_lo + 1;
             let probe = rows.div_ceil(REGION_ROW_BUDGET).max(1);
@@ -779,9 +787,7 @@ impl WaveOverlay {
         }
         stats.total = stats.total.max(stats.cells);
         self.region_stats = stats;
-        for &f in self.target.keys() {
-            self.displayed.entry(f).or_insert(0.0);
-        }
+        self.seed_displayed();
         true
     }
 
@@ -825,11 +831,7 @@ impl WaveOverlay {
                 }
             }
         } else {
-            let m32 = m as u32;
-            if self.closed.as_ref().map(|c| c.m) != Some(m32) {
-                self.closed = Some(Arc::new(Modulus::new(m32)));
-            }
-            let md = self.closed.as_ref().expect("closed form just built");
+            let md = self.closed_for(m as u32);
             for (i, v) in seg.iter_mut().enumerate() {
                 let k = lo + i as u64;
                 if k <= n_lo {
@@ -993,9 +995,7 @@ impl WaveOverlay {
                 for (&f, &v) in b {
                     *self.target.entry(f).or_insert(0.0) += t * v;
                 }
-                for &f in self.target.keys() {
-                    self.displayed.entry(f).or_insert(0.0);
-                }
+                self.seed_displayed();
                 self.settled = false;
             }
         }

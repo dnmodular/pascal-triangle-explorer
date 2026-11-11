@@ -1186,11 +1186,15 @@ impl Renderer {
         (w.div_ceil(WG), h.div_ceil(WG))
     }
 
-    fn dispatch_scalar(&self, enc: &mut wgpu::CommandEncoder, passes: &mut Vec<PassParams>, pipe: &wgpu::ComputePipeline, binds: [Bind<'_>; 4], pp: PassParams) {
+    /// One compute dispatch of a measure or field pass: the four buffers, the pass's
+    /// parameter slot (a dynamic offset into `pass_buf`) and the layout's own last
+    /// binding, over `groups` workgroups.
+    #[allow(clippy::too_many_arguments)] // one pass's bindings, by position
+    fn dispatch(&self, enc: &mut wgpu::CommandEncoder, passes: &mut Vec<PassParams>, pipe: &wgpu::ComputePipeline, layout: &wgpu::BindGroupLayout, binds: [Bind<'_>; 4], last: wgpu::BindingResource<'_>, pp: PassParams, groups: (u32, u32)) {
         let off = Self::push_pass(passes, pp);
         let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
-            layout: &self.bgl_scalar,
+            layout,
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: binds[0].resource() },
                 wgpu::BindGroupEntry { binding: 1, resource: binds[1].resource() },
@@ -1200,43 +1204,29 @@ impl Renderer {
                     binding: 4,
                     resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding { buffer: &self.pass_buf, offset: 0, size: NonZeroU64::new(std::mem::size_of::<PassParams>() as u64) }),
                 },
-                wgpu::BindGroupEntry { binding: 5, resource: self.counts_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: last },
             ],
         });
-        let g = self.grid.unwrap();
-        let (gx, gy) = Self::groups(g.w, g.h);
         let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
         pass.set_pipeline(pipe);
         pass.set_bind_group(0, &self.bg0, &[]);
         pass.set_bind_group(1, &bg, &[off]);
-        pass.dispatch_workgroups(gx, gy, 1);
+        pass.dispatch_workgroups(groups.0, groups.1, 1);
     }
 
+    /// A measure pass over the grid (its last binding: the RARITY histogram).
+    fn dispatch_scalar(&self, enc: &mut wgpu::CommandEncoder, passes: &mut Vec<PassParams>, pipe: &wgpu::ComputePipeline, binds: [Bind<'_>; 4], pp: PassParams) {
+        let g = self.grid.unwrap();
+        self.dispatch(enc, passes, pipe, &self.bgl_scalar, binds, self.counts_buf.as_entire_binding(), pp, Self::groups(g.w, g.h));
+    }
+
+    /// A field pass over the grid, or over the canvas for the resolve (its last binding:
+    /// the canvas texture).
     #[allow(clippy::too_many_arguments)] // the field passes' bindings, by position
     fn dispatch_field(&self, enc: &mut wgpu::CommandEncoder, passes: &mut Vec<PassParams>, pipe: &wgpu::ComputePipeline, a: Bind<'_>, b: Bind<'_>, c: Bind<'_>, fields: Bind<'_>, pp: PassParams, canvas: bool) {
-        let off = Self::push_pass(passes, pp);
-        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &self.bgl_field,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: a.resource() },
-                wgpu::BindGroupEntry { binding: 1, resource: b.resource() },
-                wgpu::BindGroupEntry { binding: 2, resource: c.resource() },
-                wgpu::BindGroupEntry { binding: 3, resource: fields.resource() },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding { buffer: &self.pass_buf, offset: 0, size: NonZeroU64::new(std::mem::size_of::<PassParams>() as u64) }),
-                },
-                wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&self.canvas.frame_storage) },
-            ],
-        });
         let g = self.grid.unwrap();
-        let (gx, gy) = if canvas { Self::groups(g.canvas_w, g.canvas_h) } else { Self::groups(g.w, g.h) };
-        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
-        pass.set_pipeline(pipe);
-        pass.set_bind_group(0, &self.bg0, &[]);
-        pass.set_bind_group(1, &bg, &[off]);
-        pass.dispatch_workgroups(gx, gy, 1);
+        let groups = if canvas { Self::groups(g.canvas_w, g.canvas_h) } else { Self::groups(g.w, g.h) };
+        self.dispatch(enc, passes, pipe, &self.bgl_field, [a, b, c, fields], wgpu::BindingResource::TextureView(&self.canvas.frame_storage), pp, groups);
     }
 
     /// Encode the whole frame. Call `queue.submit` with the encoder afterwards (the
