@@ -691,7 +691,13 @@ src/export.rs    PNG writer
 src/wave_overlay.rs  the modular-wave overlay (row cache, easing, sampling, egui shapes)
 src/tetra.rs     the tetra stack's selection, layout and stride, camera, CPU ray cast
 src/tetra_gpu.rs the tetra stack on the GPU: residue/compaction pass, cubes, ghosts, pick, outlines
-src/main.rs      winit + egui app (src/tetra_ui.rs: the stack's panel, tile and 3D space)
+src/main.rs      winit + egui app: the frame loop, the command line, exports
+src/model.rs     everything the user can change, and how the modulus moves (with its tests)
+src/panel.rs     the side panel
+src/sweep_bar.rs the sweep bar and the wave-row controls
+src/canvas.rs    pointer and keys on the canvas, its overlays, the status strip, the wave
+src/widgets.rs   small egui helpers the panels share
+src/tetra_ui.rs  the stack's panel, tile and 3D space
 shaders/common.wgsl    bindings, grid mapping, lattice neighbours (prepended to every 2D pass, with binom.wgsl)
 shaders/binom.wgsl     Montgomery mulmod, Granville / Lucas, Kummer: no bindings, shared with the tetra stack
 shaders/tetra_cells.wgsl  the stack's residues, one thread per (m, n, k), appended to two cube lists
