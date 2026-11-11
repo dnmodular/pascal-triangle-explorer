@@ -871,6 +871,10 @@ impl WaveOverlay {
     fn region_bands(&mut self, m: u64, n_lo: u64, n_hi: u64, x2_lo: i64, x2_hi: i64, stats: &mut RegionStats) -> bool {
         const BANDS: u64 = 16;
         let rows = n_hi - n_lo + 1;
+        // (too few rows to band: the caller samples rows instead)
+        if rows < 2 * BANDS {
+            return false;
+        }
         let cells_per_row = (((x2_hi - x2_lo).max(0) / 2 + 1) as u64).min(n_hi + 1);
         // band height h with BANDS · h · (cells + h) ≤ budget
         let per_band = REGION_EXACT_BUDGET / BANDS;
@@ -1958,5 +1962,18 @@ mod tests {
         assert!((-9..=9).all(|f| z.target(f) == 0.0));
     }
 
+
+    #[test]
+    fn a_short_region_of_deep_rows_draws() {
+        // a few rows far down (too wide to sum, too few to band) used to panic in a clamp
+        for (a, b) in [(100_000u64, 100_003u64), (100_000, 100_000), (70_000, 70_015), (1 << 31, (1 << 31) + 5)] {
+            let mut w = overlay();
+            w.set_rows(7, a, b);
+            for _ in 0..3 {
+                w.update(0.016);
+            }
+            assert!(w.samples().iter().all(|v| v.is_finite()), "{a}–{b}");
+        }
+    }
 }
 

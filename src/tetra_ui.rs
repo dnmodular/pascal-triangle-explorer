@@ -26,6 +26,7 @@ const SNAP_TIME: f32 = 0.45;
 /// What a peel extent was counted for: the sides, and the layout (view, face, total,
 /// stride, slices).
 type PeelKey = ([bool; 5], [u32; 5], View, Face, u32, u32, usize);
+type SelectionKey = (pascal::sweep::Sweep, View, Spacing, u32);
 /// Width of the space's options panel (points).
 const OPTIONS_W: f32 = 270.0;
 
@@ -61,6 +62,9 @@ pub struct TetraView {
     /// (layers that peel everything) for the sides and the layout it was counted for.
     peel_clock: f32,
     peel_extent: Option<(PeelKey, u32)>,
+    /// The options panel's selection line, for the settings it was worked out from
+    /// (the panel asks every frame; the selection can be thousands of moduli).
+    selection_text: Option<(SelectionKey, String)>,
     /// A snapped camera gliding into place: from, to, progress 0..1.
     snap: Option<(Camera, Camera, f32)>,
     /// The face the camera is snapped to, until the view is turned by hand: a new shape
@@ -86,6 +90,9 @@ pub struct TetraCache {
     colors: Option<(Scheme, u32)>,
     /// What the target last showed.
     drawn: Option<(DrawOptions, (u32, u32))>,
+    /// The last scene's moduli: a rebuild takes the tables of those it still shows
+    /// (peeling a face a layer deeper rebuilds the scene with the same moduli).
+    moduli: Vec<Modulus>,
 }
 
 fn smoothstep(t: f32) -> f32 {
@@ -392,14 +399,19 @@ pub fn render(model: &mut Model, cache: &mut TetraCache, r: &mut TetraRenderer, 
         if view == View::Diamond {
             layout.set_fold(t.fold_angle());
         }
-        let mds: Vec<Modulus> = layout.slices.iter().map(|s| Modulus::new(s.m)).collect();
+        let mut held: std::collections::HashMap<u32, Modulus> = cache.moduli.drain(..).map(|md| (md.m, md)).collect();
+        let mut mds: Vec<Modulus> = Vec::with_capacity(layout.slices.len());
+        for s in &layout.slices {
+            // (a modulus drawn twice, the diamond's base and face lines, is built once)
+            let md = held.remove(&s.m).or_else(|| mds.last().filter(|x| x.m == s.m).cloned()).unwrap_or_else(|| Modulus::new(s.m));
+            mds.push(md);
+        }
         r.set_scene(&layout, &mds, &model.palette, model.style.offset);
+        cache.moduli = mds;
         r.set_lines(&outline_vertices(&layout));
         t.counts = r.read_counts();
-        // The space's camera: the tile's rebuilds leave it alone, and coming back to the
-        // scene the space last showed keeps it. A new range or view is framed anew; in
-        // the stack a new spacing, shape or level of detail keeps the angle and the
-        // relative zoom.
+        // (the extent cache is per layout)
+        t.peel_extent = None;
         // The space's view is kept through every rebuild of the same view (a new range,
         // visit mode, spacing, shape or level of detail): the same angle, and the pan
         // and zoom relative to the new size. Only a new view (stack, face, diamond) or a
@@ -576,7 +588,7 @@ fn options(ui: &mut egui::Ui, t: &mut TetraView) {
     }
     ui.separator();
     let max_cells = t.cell_cap();
-    let c = &mut t.config;
+    let TetraView { config: c, selection_text, .. } = t;
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("moduli").color(ui.visuals().weak_text_color()));
         mono_drag_with(ui, &mut c.sweep.start, 2..=TETRA_MAX_M, 1.0, false).on_hover_text("First modulus (the apex)");
@@ -646,16 +658,21 @@ fn options(ui: &mut egui::Ui, t: &mut TetraView) {
         }).response.on_hover_text(format!("Most cubes drawn. \"all\" draws every cell of the range, up to {} cubes (what one scene holds here); past that, or under a smaller budget, every s-th slice, row and cell is drawn, as cubes s cells wide (the HUD says so). Fewer cubes turn faster", group(max_cells as u64)));
     });
     ui.checkbox(&mut c.solid_zeros, "solid zeros on the faces / diamond").on_hover_text("Draw the zeros of the flat views as dark cells, so the shapes have no gaps (the stack keeps its zeros as tunnels; from the top, holes show the slices below)");
-    let mods = selected_moduli(&c.sweep);
-    let text = match (mods.first(), mods.last()) {
-        (Some(a), Some(b)) => {
-            let s = view_stride(c.view, &mods, c.spacing, c.budget.min(max_cells));
-            let lod = if s > 1 { format!(" · stride {s}") } else { String::new() };
-            format!("{} moduli, {a}–{b}{lod}", mods.len())
-        }
-        _ => "no moduli in the range".into(),
-    };
-    mono_line(ui, &text);
+    let budget = c.budget.min(max_cells);
+    let fresh = selection_text.as_ref().is_some_and(|(k, _)| k.0 == c.sweep && (k.1, k.2, k.3) == (c.view, c.spacing, budget));
+    if !fresh {
+        let mods = selected_moduli(&c.sweep);
+        let text = match (mods.first(), mods.last()) {
+            (Some(a), Some(b)) => {
+                let s = view_stride(c.view, &mods, c.spacing, budget);
+                let lod = if s > 1 { format!(" · stride {s}") } else { String::new() };
+                format!("{} moduli, {a}–{b}{lod}", mods.len())
+            }
+            _ => "no moduli in the range".into(),
+        };
+        *selection_text = Some(((c.sweep.clone(), c.view, c.spacing, budget), text));
+    }
+    mono_line(ui, selection_text.as_ref().map_or("", |(_, t)| t.as_str()));
     ui.separator();
     note(ui, "Keys: V next view · F next face · C next cell · 1–5 snap the stack's camera · ← → step the peel a layer (Shift: ten) · Home / End none / all · P play it, R rewind · U unfold again · G spacing · O options · Esc back. Stack: drag orbit, right / shift-drag pan, wheel zoom. Faces and diamond: drag pan, wheel zoom. Double-click reframes.");
 }

@@ -1094,33 +1094,22 @@ impl Layout {
         if self.view == View::Face && self.face != Face::Top {
             return self.face_peel_extent(o, l);
         }
-        let st = self.stride;
+        // In a slice of R strided rows a cell's layers in from the left, the right and
+        // the front add up to R − 1 whatever the cell, so some cell survives t shared
+        // layers exactly while those three sides' depths, Σ (o_j + l_j·t), fit in
+        // R − 1; the top and the base take whole slices.
         let n_slices = self.layers;
-        let mut extent = 0u32;
-        for (si, s) in self.slices.iter().enumerate() {
-            let last = s.front;
-            // a cell survives t shared layers while every side j is at least o_j + l_j·t
-            // layers away
-            let Some(slice_t) = steps_left(s.layer, o[3], l[3]).zip(steps_left(n_slices - 1 - s.layer, o[4], l[4])).map(|(a, b)| a.min(b)) else { continue };
-            if slice_t.saturating_add(1) <= extent {
-                continue;
-            }
-            for (n, k) in self.slice_cells(si) {
-                let cell_d = [k / st, (n - k) / st, (last - n) / st];
-                let mut t = slice_t;
-                let mut alive = true;
-                for j in 0..3 {
-                    match steps_left(cell_d[j], o[j], l[j]) {
-                        Some(x) => t = t.min(x),
-                        None => alive = false,
-                    }
-                }
-                if alive {
-                    extent = extent.max(t.saturating_add(1));
-                }
-            }
-        }
-        extent
+        let (so, sl) = (o[0].saturating_add(o[1]).saturating_add(o[2]), l[0] + l[1] + l[2]);
+        self.slices
+            .iter()
+            .filter_map(|s| {
+                let top = steps_left(s.layer, o[3], l[3])?;
+                let base = steps_left(n_slices - 1 - s.layer, o[4], l[4])?;
+                let sides = steps_left(s.rows.saturating_sub(1), so, sl)?;
+                Some(top.min(base).min(sides).saturating_add(1))
+            })
+            .max()
+            .unwrap_or(0)
     }
 
     /// The extent of a face that is rebuilt a layer deeper as it peels (every face but
@@ -1133,7 +1122,7 @@ impl Layout {
     /// keeps a cell exactly while (m − 1) / s is at least that.
     fn face_peel_extent(&self, o: [u32; 5], l: [u32; 5]) -> u32 {
         let st = self.stride;
-        let (so, sl) = (o[0] + o[1] + o[2], l[0] + l[1] + l[2]);
+        let (so, sl) = (o[0].saturating_add(o[1]).saturating_add(o[2]), l[0] + l[1] + l[2]);
         let sides = |m: u32| steps_left((m - 1) / st, so, sl);
         let both = |a: Option<u32>, b: Option<u32>| a.zip(b).map(|(a, b)| a.min(b));
         if self.face == Face::Base {
@@ -1167,8 +1156,6 @@ impl Layout {
         }).max().unwrap_or(0)
     }
 
-    /// A camera looking square onto a side of the stack (or straight down / up),
-    /// framing the whole stack, from the stack's own corners so every shape works.
     /// The stack's outward unit normals, in `Side::ALL` order: its left, right and
     /// front faces (from its own corners, so every shape works), the top (up) and the
     /// base (down).
@@ -1185,6 +1172,23 @@ impl Layout {
             }
             nrm
         };
+        if self.slices.len() == 1 {
+            // one slice: a flat triangle, its sides the edges' outward normals in its plane
+            let plane = cross(sub(bl, b0), sub(br, b0));
+            let edge = |a: [f32; 3], b: [f32; 3], away: [f32; 3]| {
+                let mut nrm = normalize(cross(sub(b, a), plane));
+                if dot(nrm, sub(away, a)) > 0.0 {
+                    nrm = scale(nrm, -1.0);
+                }
+                nrm
+            };
+            if dot(plane, plane) > 1e-12 {
+                out[0] = edge(b0, bl, br);
+                out[1] = edge(b0, br, bl);
+                out[2] = edge(bl, br, b0);
+            }
+            return out;
+        }
         out[0] = outward(apex, b0, bl, br);
         out[1] = outward(apex, b0, br, bl);
         out[2] = outward(apex, bl, br, b0);
@@ -1216,6 +1220,8 @@ impl Layout {
         Some(off)
     }
 
+    /// A camera looking square onto a side of the stack (or straight down / up),
+    /// framing the whole stack.
     pub fn snap_camera(&self, snap: Snap) -> Camera {
         let mut cam = Camera::framing(self.bounds());
         if self.slices.is_empty() {
@@ -2088,6 +2094,22 @@ mod tests {
         let last = l.slices.len() - 1;
         assert_eq!(l.shell_offset(last, l.slices[last].front, 0, d, 2.0), Some(scale(nrm[4], 2.0)));
         assert_eq!(l.shell_offset(1, 0, 0, d, 2.0), None, "still on the stack");
+    }
+
+    #[test]
+    fn a_one_slice_stack_still_has_sides() {
+        // a single modulus: the apex and the base are the same slice, so the faces'
+        // planes collapse; the sides are then the triangle's edges, pointing outward
+        let l = Layout::build(View::Stack, &[12], Spacing::True, Shape::Regular, u32::MAX);
+        assert_eq!(l.slices.len(), 1);
+        let nrm = l.side_normals();
+        let s = &l.slices[0];
+        let centre = scale(add(add(l.center(0, 0, 0), l.center(0, s.front, 0)), l.center(0, s.front, s.front)), 1.0 / 3.0);
+        let mids = [l.center(0, s.front / 2, 0), l.center(0, s.front / 2, s.front / 2), l.center(0, s.front, s.front / 2)];
+        for i in 0..3 {
+            assert!((dot(nrm[i], nrm[i]) - 1.0).abs() < 1e-4, "side {i}: {:?}", nrm[i]);
+            assert!(dot(nrm[i], sub(mids[i], centre)) > 0.5, "side {i} points away from the centre");
+        }
     }
 
     #[test]
