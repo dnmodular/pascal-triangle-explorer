@@ -153,22 +153,10 @@ pub fn ramp_rgb(scheme: Scheme, t: f64) -> [u8; 3] {
 
 /// `residueLevel` at a whole modulus: 0 = zero (void), 1 = exactly 1 (white, spectral
 /// only), 2..=255 = palette position. Spectral spreads residues 2..m−1 red → violet; the
-/// other schemes spread 0..m−1 over the whole ramp.
+/// other schemes spread 0..m−1 over the whole ramp. The q = 1 case of
+/// [`residue_level_scaled`].
 pub fn residue_level(r: u32, m: u32, spectral: bool) -> u8 {
-    if r == 0 {
-        return 0;
-    }
-    let x = r as f64;
-    let mu = m as f64;
-    let t = if spectral {
-        if r == 1 {
-            return 1;
-        }
-        (x - 2.0) / f64::max(1.0, mu - 3.0)
-    } else {
-        x / (mu - 1.0)
-    };
-    2 + js_round(253.0 * t.clamp(0.0, 1.0)) as u8
+    residue_level_scaled(r, m, 1, spectral)
 }
 
 /// The color offset (the square scanner's "fractional offset") as a map of palette
@@ -216,15 +204,12 @@ pub fn level_map_words(map: &[u8; 256]) -> [u32; 64] {
     w
 }
 
-/// Level of every residue `0..m`, packed four per u32 for the GPU.
-/// The levels of a decimal modulus μ = m/q, by scaled residue s = q·(C mod μ) in
-/// 0..m: the reference's coloring that is continuous in μ, at x = s/q (0 void, x = 1
-/// white under spectral, else the ramp at (x − 2)/(μ − 3) or x/(μ − 1)). q = 1 is
-/// [`residue_level`] itself.
+/// The levels of a modulus μ = m/q, by scaled residue s = q·(C mod μ) in 0..m: the
+/// reference's coloring, continuous in μ, at x = s/q (0 void, x = 1 white under
+/// spectral, else the ramp at (x − 2)/(μ − 3) or x/(μ − 1)). q = 1 is a whole modulus
+/// (dividing by 1.0 is exact, so it is the reference's integer form).
 pub fn residue_level_scaled(s: u32, m: u32, q: u32, spectral: bool) -> u8 {
-    if q <= 1 {
-        return residue_level(s, m, spectral);
-    }
+    let q = q.max(1);
     if s == 0 {
         return 0;
     }
@@ -240,7 +225,7 @@ pub fn residue_level_scaled(s: u32, m: u32, q: u32, spectral: bool) -> u8 {
     2 + js_round(253.0 * t.clamp(0.0, 1.0)) as u8
 }
 
-/// [`residue_level_scaled`] for every s in 0..m, packed four per word.
+/// [`residue_level_scaled`] for every s in 0..m, packed four per u32 for the GPU.
 pub fn residue_levels_scaled(m: u32, q: u32, spectral: bool) -> Vec<u32> {
     let mut out = vec![0u32; (m as usize).div_ceil(4)];
     for r in 0..m {
@@ -249,12 +234,9 @@ pub fn residue_levels_scaled(m: u32, q: u32, spectral: bool) -> Vec<u32> {
     out
 }
 
+/// The whole modulus m's levels, packed.
 pub fn residue_levels_packed(m: u32, spectral: bool) -> Vec<u32> {
-    let mut out = vec![0u32; (m as usize).div_ceil(4)];
-    for r in 0..m {
-        out[(r / 4) as usize] |= (residue_level(r, m, spectral) as u32) << (8 * (r % 4));
-    }
-    out
+    residue_levels_scaled(m, 1, spectral)
 }
 
 /// Hue (degrees) and saturation (0..1) of an RGB color, as `rgbToHueSat` in the

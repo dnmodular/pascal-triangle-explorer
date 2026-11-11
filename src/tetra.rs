@@ -1067,19 +1067,27 @@ impl Layout {
         add(add(s.origin, scale(s.nvec, n as f32)), [k as f32, 0.0, 0.0])
     }
 
-    /// Whether cell (slice, n, k) is peeled away (the stack and the faces), as the
-    /// shaders decide.
-    pub fn peeled(&self, si: usize, n: u32, k: u32, depths: [u32; 5]) -> bool {
+    /// The sides whose peel takes cell (slice, n, k) at these depths, in `Side::ALL`
+    /// order (the stack and the faces), as the shaders' `peel_mask` decides.
+    pub fn peel_sides(&self, si: usize, n: u32, k: u32, depths: [u32; 5]) -> [bool; 5] {
         if self.view == View::Diamond {
-            return false;
+            return [false; 5];
         }
         let s = &self.slices[si];
         let st = self.stride;
-        (depths[0] > 0 && k < depths[0] * st)
-            || (depths[1] > 0 && n - k < depths[1] * st)
-            || (depths[2] > 0 && s.front - n < depths[2] * st)
-            || (depths[3] > 0 && s.layer < depths[3])
-            || (depths[4] > 0 && self.layers - 1 - s.layer < depths[4])
+        [
+            depths[0] > 0 && k < depths[0] * st,
+            // (wrapping, as the shader's u32 arithmetic)
+            depths[1] > 0 && n.wrapping_sub(k) < depths[1] * st,
+            depths[2] > 0 && s.front.wrapping_sub(n) < depths[2] * st,
+            depths[3] > 0 && s.layer < depths[3],
+            depths[4] > 0 && self.layers.wrapping_sub(1).wrapping_sub(s.layer) < depths[4],
+        ]
+    }
+
+    /// Whether cell (slice, n, k) is peeled away.
+    pub fn peeled(&self, si: usize, n: u32, k: u32, depths: [u32; 5]) -> bool {
+        self.peel_sides(si, n, k, depths).contains(&true)
     }
 
     /// The fewest shared layers that peel the whole stack away: the linked sides moving
@@ -1200,24 +1208,13 @@ impl Layout {
     /// it) for a cell in a last layer, None for a cell still on the stack or peeled
     /// deeper than any side's last layer. As the draw shader decides.
     pub fn shell_offset(&self, si: usize, n: u32, k: u32, depths: [u32; 5], gap: f32) -> Option<[f32; 3]> {
-        if self.view == View::Diamond || !self.peeled(si, n, k, depths) {
-            return None;
-        }
-        // one layer shallower on every side: still peeled there means deeper than the
-        // last layers
-        if self.peeled(si, n, k, depths.map(|d| d.saturating_sub(1))) {
+        let sides = self.peel_sides(si, n, k, depths);
+        // (still peeled one layer shallower on every side: deeper than the last layers)
+        if !sides.contains(&true) || self.peeled(si, n, k, depths.map(|d| d.saturating_sub(1))) {
             return None;
         }
         let normals = self.side_normals();
-        let mut off = [0.0; 3];
-        for (i, nrm) in normals.iter().enumerate() {
-            let mut one = [0; 5];
-            one[i] = depths[i];
-            if self.peeled(si, n, k, one) {
-                off = add(off, scale(*nrm, gap));
-            }
-        }
-        Some(off)
+        Some((0..5).filter(|&i| sides[i]).fold([0.0; 3], |off, i| add(off, scale(normals[i], gap))))
     }
 
     /// A camera looking square onto a side of the stack (or straight down / up),

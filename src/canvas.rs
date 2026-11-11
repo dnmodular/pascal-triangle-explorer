@@ -2,6 +2,11 @@
 
 use super::*;
 
+/// Canvas pixels (the GPU's) → egui points inside `rect`.
+fn canvas_point(rect: Rect, ppp: f32) -> impl Fn(f64, f64) -> Pos2 {
+    move |x, y| Pos2::new(rect.min.x + (x / ppp as f64) as f32, rect.min.y + (y / ppp as f64) as f32)
+}
+
 pub(crate) fn canvas_interaction(ui: &mut egui::Ui, model: &mut Model, response: &egui::Response, rect: Rect, ppp: f32, handle: bool) {
     // the canvas in whole pixels, as the GPU and the fits use it (rect × ppp is
     // fractional at fractional scale factors)
@@ -130,7 +135,7 @@ pub(crate) fn canvas_overlays(ui: &mut egui::Ui, model: &mut Model, rect: Rect, 
     // the canvas in whole pixels, as the GPU and the fits use it (rect × ppp is
     // fractional at fractional scale factors)
     let (cw, ch) = model.canvas;
-    let to_pt = |x: f64, y: f64| Pos2::new(rect.min.x + (x / ppp as f64) as f32, rect.min.y + (y / ppp as f64) as f32);
+    let to_pt = canvas_point(rect, ppp);
 
     // Residue numbers inside cells, when they are big enough.
     if model.show_numbers && model.view.ppc >= NUMBERS_MIN_PX && model.view.visible_cells(cw, ch) <= NUMBERS_MAX_CELLS {
@@ -287,7 +292,7 @@ pub(crate) fn wave_overlay(ui: &mut egui::Ui, model: &mut Model, rect: Rect, ppp
     let painter = ui.painter_at(rect);
     // the selection: its rectangle, a red start mark and a blue end mark (the end
     // follows the pointer while it is being picked)
-    let to_pt = |x: f64, y: f64| Pos2::new(rect.min.x + (x / ppp as f64) as f32, rect.min.y + (y / ppp as f64) as f32);
+    let to_pt = canvas_point(rect, ppp);
     let cell_box = |(n, k): (u32, u32)| {
         let (x, y, w, h) = model.view.cell_rect(n, k);
         Rect::from_min_max(to_pt(x, y), to_pt(x + w, y + h))

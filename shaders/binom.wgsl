@@ -147,3 +147,13 @@ fn binom_mod_prime_power(n: u32, k: u32, F: Factor, full_nu: bool) -> BinomRes {
   }
   return BinomRes(r, nu);
 }
+
+// One step of Garner's mixed-radix CRT: x, the residue modulo the product Q of the prime
+// powers so far, and r, the residue modulo the next one q (F), give the residue modulo
+// Q·q: x + Q·((r − x)·Q^{−1} mod q), which stays below it.
+fn garner_step(x: u32, r: u32, F: Factor) -> u32 {
+  let t = r + F.q - x % F.q;                // in (0, 2q)
+  let diff = select(t, t - F.q, t >= F.q);
+  let cc = mm(diff, F.garner_inv, F);       // plain (r − x)·Q^{−1} mod q
+  return x + F.garner_q * cc;
+}

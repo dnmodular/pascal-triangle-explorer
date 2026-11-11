@@ -483,14 +483,20 @@ impl Model {
 
     /// `n` steps through the active selection mode (sign = direction); stops playback.
     pub(crate) fn step(&mut self, n: i32) {
+        self.step_with(n, true);
+    }
+
+    /// The same; with `follow`, linked rows follow the modulus (the sweep bar's own
+    /// frame steps, like playback, can leave held rows alone).
+    pub(crate) fn step_with(&mut self, n: i32, follow: bool) {
         self.sweep.playing = false;
         if self.super_mode() {
             let i = self.sweep.super_step(self.sp_index, n);
-            self.set_super(i, true);
+            self.set_super(i, follow);
             return;
         }
         let (m, sub) = self.sweep.step_fine_by((self.m, self.sub), n);
-        self.set_pos(m, sub, true);
+        self.set_pos(m, sub, follow);
     }
 
     /// Advance the play timer; true when the modulus moved.

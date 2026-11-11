@@ -20,6 +20,7 @@ use crate::tetra::{rhombic_wgsl, Camera, Cell, CubeId, Layout, Mat4, SliceKind, 
 
 pub const TETRA_CELLS_WGSL: &str = include_str!("../shaders/tetra_cells.wgsl");
 pub const TETRA_DRAW_WGSL: &str = include_str!("../shaders/tetra_draw.wgsl");
+pub const TETRA_COMMON_WGSL: &str = include_str!("../shaders/tetra_common.wgsl");
 
 pub const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
@@ -388,7 +389,7 @@ fn layouts(device: &wgpu::Device) -> (wgpu::BindGroupLayout, wgpu::BindGroupLayo
 
 /// The shader modules exactly as compiled: the compute module and the draw module.
 pub fn module_sources() -> [(&'static str, String); 2] {
-    [("tetra-cells", format!("{BINOM_WGSL}\n{TETRA_CELLS_WGSL}")), ("tetra-draw", format!("{TETRA_DRAW_WGSL}\n{}", rhombic_wgsl()))]
+    [("tetra-cells", format!("{BINOM_WGSL}\n{TETRA_COMMON_WGSL}\n{TETRA_CELLS_WGSL}")), ("tetra-draw", format!("{TETRA_COMMON_WGSL}\n{TETRA_DRAW_WGSL}\n{}", rhombic_wgsl()))]
 }
 
 /// Pipelines by name, for `--check-shaders`.

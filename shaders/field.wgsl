@@ -9,21 +9,6 @@
 // Passes (fixed order): blend → [AVERAGE] → [BAND PASS] → [AFTERIMAGE] → resolve.
 // ============================================================================
 
-struct PassParams {
-  slot: u32,
-  count: u32,
-  mode: u32,
-  flag: u32,
-  f0: f32,
-  f1: f32,
-  f2: f32,
-  f3: f32,
-  hist_start: u32,
-  hist_len: u32,
-  hist_cap: u32,
-  stride: u32,
-};
-
 const MAX_MEASURE_SLOTS: u32 = 8u;
 const HIST_CAP: u32 = 64u;
 const MAX_SS: u32 = 4u;

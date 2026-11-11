@@ -68,8 +68,9 @@ pub(crate) fn slot<R>(ui: &mut egui::Ui, w: f32, add: impl FnOnce(&mut egui::Ui)
     .inner
 }
 
-pub(crate) fn bar_label(ui: &mut egui::Ui, text: &str) {
-    ui.label(egui::RichText::new(text).color(ui.visuals().weak_text_color()));
+/// A label in the weak text color (a caption beside a control).
+pub(crate) fn weak(ui: &mut egui::Ui, text: impl Into<String>) -> egui::Response {
+    ui.label(egui::RichText::new(text).color(ui.visuals().weak_text_color()))
 }
 
 /// Fixed-size monospace number field. A typed value applies on Enter or focus loss

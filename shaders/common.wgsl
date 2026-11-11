@@ -101,6 +101,23 @@ const LIGHT_COLOR: vec3<f32> = vec3<f32>(236.0 / 255.0, 236.0 / 255.0, 226.0 / 2
 // so every intermediate stays below m. Also returns ν_p for the smallest prime
 // (full count only when want_nu) and the per-factor divisibility mask.
 // ---------------------------------------------------------------------------
+// The per-pass uniform of the measure and field passes (group 1): one 256-byte slot
+// per dispatch, picked by a dynamic offset.
+struct PassParams {
+  slot: u32,
+  count: u32,
+  mode: u32,
+  flag: u32,
+  f0: f32,
+  f1: f32,
+  f2: f32,
+  f3: f32,
+  hist_start: u32,
+  hist_len: u32,
+  hist_cap: u32,
+  stride: u32,
+};
+
 struct ResidueInfo { x: u32, nu0: u32, mask: u32 };
 
 fn residue_info(n: u32, k: u32, want_nu: bool) -> ResidueInfo {
@@ -115,11 +132,7 @@ fn residue_info(n: u32, k: u32, want_nu: bool) -> ResidueInfo {
       nu0 = res.nu;
       x = res.r;
     } else {
-      let xq = x % F.q;
-      let t = res.r + F.q - xq;               // in (0, 2q)
-      let diff = select(t, t - F.q, t >= F.q);
-      let cc = mm(diff, F.garner_inv, F);     // plain (r_f − x)·Q^{−1} mod q_f
-      x = x + F.garner_q * cc;
+      x = garner_step(x, res.r, F);
     }
     if (res.nu >= F.e) { mask = mask | (1u << f); }
   }
@@ -136,11 +149,7 @@ fn residue_b(n: u32, k: u32) -> u32 {
     if (f == 0u) {
       x = res.r;
     } else {
-      let xq = x % F.q;
-      let t = res.r + F.q - xq;
-      let diff = select(t, t - F.q, t >= F.q);
-      let cc = mm(diff, F.garner_inv, F);
-      x = x + F.garner_q * cc;
+      x = garner_step(x, res.r, F);
     }
   }
   return x;

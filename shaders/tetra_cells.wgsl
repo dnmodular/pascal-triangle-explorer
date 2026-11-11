@@ -24,25 +24,6 @@ struct CellParams {
   pad2: u32,
 };
 
-struct Slice {
-  m: u32,
-  rows: u32,          // strided rows
-  cell_base: u32,     // first cell of the slice in the enumeration
-  nfactors: u32,
-  factor_off: u32,    // factors[factor_off ..] (garner constants per slice)
-  level_off: u32,     // residue → palette level bytes at levels[level_off + r] (draw pass)
-  kind: u32,          // 0 rows row_n, row_n + s, … (a triangle); else a line, 1 | dn << 1 | dk << 2
-  row_n: u32,
-  ox: f32,            // cell (n, k) sits at o + n·nv + (k, 0, 0) (draw pass)
-  oy: f32,
-  oz: f32,
-  k0: u32,          // a line's first k
-  nx: f32,
-  ny: f32,
-  nz: f32,
-  peel_id: u32,     // the row the front side's peel counts from | layer << 16
-};
-
 @group(0) @binding(0) var<uniform> C: CellParams;
 @group(0) @binding(1) var<storage, read> tables: array<u32>;
 @group(0) @binding(2) var<storage, read> slices: array<Slice>;
@@ -64,11 +45,7 @@ fn slice_residue(n: u32, k: u32, s: Slice) -> u32 {
     if (f == 0u) {
       x = res.r;
     } else {
-      let xq = x % F.q;
-      let t = res.r + F.q - xq;               // in (0, 2q)
-      let diff = select(t, t - F.q, t >= F.q);
-      let cc = mm(diff, F.garner_inv, F);     // plain (r_f − x)·Q^{−1} mod q_f
-      x = x + F.garner_q * cc;
+      x = garner_step(x, res.r, F);
     }
   }
   return x;

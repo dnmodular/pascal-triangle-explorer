@@ -46,25 +46,6 @@ struct DrawParams {
   nrm: array<vec4<f32>, 5>,   // the sides' outward normals: left, right, front, top, base
 };
 
-struct Slice {
-  m: u32,
-  rows: u32,
-  cell_base: u32,
-  nfactors: u32,
-  factor_off: u32,
-  level_off: u32,
-  kind: u32,
-  row_n: u32,
-  ox: f32,          // cell (n, k) sits at o + n·nv + (k, 0, 0)
-  oy: f32,
-  oz: f32,
-  k0: u32,          // a line's first k
-  nx: f32,
-  ny: f32,
-  nz: f32,
-  peel_id: u32,     // the row the front side's peel counts from | layer << 16
-};
-
 @group(0) @binding(0) var<uniform> D: DrawParams;
 @group(0) @binding(1) var<storage, read> slices: array<Slice>;
 @group(0) @binding(2) var<storage, read> levels: array<u32>;   // residue levels, 4 per word
@@ -92,56 +73,46 @@ fn cube_center(c: vec2<u32>, s: Slice) -> vec3<f32> {
   return vec3<f32>(s.ox + n * s.nx + k, s.oy + n * s.ny, s.oz + n * s.nz);
 }
 
-// Peeled cubes are not drawn (the stack's sides come off layer by layer, and a face's
-// edges). The thresholds are the CPU's: layers × stride on the triangles' sides, layers
-// of slices (a face's lines) at the top and the base. The diamond's are all 0.
-fn peeled(c: vec2<u32>, si: u32, s: Slice) -> bool {
+// The sides whose peel takes cell c, a bit each (left, right, front, top, base), for
+// thresholds `a` (k < x, n − k < y, last row − n < z in cells; slice layer < w) and
+// `base` layers up from the bottom. The thresholds are the CPU's: layers × stride on
+// the triangles' sides, layers of slices (a face's lines) at the top and the base; 0
+// is a side that does not peel. The diamond's are all 0.
+fn peel_mask(c: vec2<u32>, s: Slice, a: vec4<u32>, base: u32) -> u32 {
   let n = c.x & 0xffffu;
   let k = c.x >> 16u;
   let last = s.peel_id & 0xffffu;
   let layer = s.peel_id >> 16u;
-  return (D.peel_a.x > 0u && k < D.peel_a.x)
-      || (D.peel_a.y > 0u && n - k < D.peel_a.y)
-      || (D.peel_a.z > 0u && last - n < D.peel_a.z)
-      || (D.peel_a.w > 0u && layer < D.peel_a.w)
-      || (D.peel_b.x > 0u && D.peel_b.y - 1u - layer < D.peel_b.x);
+  return u32(a.x > 0u && k < a.x)
+       | (u32(a.y > 0u && n - k < a.y) << 1u)
+       | (u32(a.z > 0u && last - n < a.z) << 2u)
+       | (u32(a.w > 0u && layer < a.w) << 3u)
+       | (u32(base > 0u && D.peel_b.y - 1u - layer < base) << 4u);
 }
 
-// The same, every side one layer shallower: still peeled there means deeper than the
-// side's last removed layer.
-fn peeled_shallower(c: vec2<u32>, s: Slice) -> bool {
-  let n = c.x & 0xffffu;
-  let k = c.x >> 16u;
-  let last = s.peel_id & 0xffffu;
-  let layer = s.peel_id >> 16u;
-  let st = D.peel_b.z;
-  let a = vec3<u32>(select(0u, D.peel_a.x - st, D.peel_a.x > st), select(0u, D.peel_a.y - st, D.peel_a.y > st), select(0u, D.peel_a.z - st, D.peel_a.z > st));
-  let top = select(0u, D.peel_a.w - 1u, D.peel_a.w > 1u);
-  let base = select(0u, D.peel_b.x - 1u, D.peel_b.x > 1u);
-  return (a.x > 0u && k < a.x)
-      || (a.y > 0u && n - k < a.y)
-      || (a.z > 0u && last - n < a.z)
-      || (top > 0u && layer < top)
-      || (base > 0u && D.peel_b.y - 1u - layer < base);
+// Peeled cubes are not drawn (the stack's sides come off layer by layer, and a face's
+// edges).
+fn peeled(c: vec2<u32>, s: Slice) -> bool {
+  return peel_mask(c, s, D.peel_a, D.peel_b.x) != 0u;
 }
 
 // Where a cell goes: xyz its offset, w 1 when it is drawn. A cell on the stack stays;
-// a peeled one is drawn only in a side's last removed layer while those show, pulled
-// out along the normal of every side whose last layer holds it (an edge cell along
-// two), so the sheets stay joined.
-fn placement(c: vec2<u32>, si: u32, s: Slice) -> vec4<f32> {
-  if (!peeled(c, si, s)) { return vec4<f32>(0.0, 0.0, 0.0, 1.0); }
-  if (D.shell.y < 0.5 || peeled_shallower(c, s)) { return vec4<f32>(0.0); }
-  let n = c.x & 0xffffu;
-  let k = c.x >> 16u;
-  let last = s.peel_id & 0xffffu;
-  let layer = s.peel_id >> 16u;
+// a peeled one is drawn only in a side's last removed layer while those show (still
+// peeled with every side one layer shallower means deeper than that), pulled out along
+// the normal of every side whose last layer holds it (an edge cell along two), so the
+// sheets stay joined. The pick pass does not use this: the sheets are not picked.
+fn placement(c: vec2<u32>, s: Slice) -> vec4<f32> {
+  let sides = peel_mask(c, s, D.peel_a, D.peel_b.x);
+  if (sides == 0u) { return vec4<f32>(0.0, 0.0, 0.0, 1.0); }
+  if (D.shell.y < 0.5) { return vec4<f32>(0.0); }
+  let st = D.peel_b.z;
+  let a = D.peel_a;
+  let shallower = vec4<u32>(select(0u, a.x - st, a.x > st), select(0u, a.y - st, a.y > st), select(0u, a.z - st, a.z > st), select(0u, a.w - 1u, a.w > 1u));
+  if (peel_mask(c, s, shallower, select(0u, D.peel_b.x - 1u, D.peel_b.x > 1u)) != 0u) { return vec4<f32>(0.0); }
   var dir = vec3<f32>(0.0);
-  if (D.peel_a.x > 0u && k < D.peel_a.x) { dir = dir + D.nrm[0].xyz; }
-  if (D.peel_a.y > 0u && n - k < D.peel_a.y) { dir = dir + D.nrm[1].xyz; }
-  if (D.peel_a.z > 0u && last - n < D.peel_a.z) { dir = dir + D.nrm[2].xyz; }
-  if (D.peel_a.w > 0u && layer < D.peel_a.w) { dir = dir + D.nrm[3].xyz; }
-  if (D.peel_b.x > 0u && D.peel_b.y - 1u - layer < D.peel_b.x) { dir = dir + D.nrm[4].xyz; }
+  for (var i = 0u; i < 5u; i = i + 1u) {
+    if (((sides >> i) & 1u) != 0u) { dir = dir + D.nrm[i].xyz; }
+  }
   return vec4<f32>(dir * D.shell.x, 1.0);
 }
 
@@ -236,7 +207,7 @@ fn cube_vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> 
   let c = cubes[cube_index(ii)];
   let si = c.y & 0xffffu;
   let s = slices[si];
-  let place = placement(c, si, s);
+  let place = placement(c, s);
   let center = cube_center(c, s) + place.xyz;
   let cv = cell_vertex(vi);
   let world = center + cv.offset;
@@ -365,7 +336,7 @@ fn pick_vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> 
   let center = cube_center(c, s);
   let world = center + cell_vertex(vi).offset;
   var out: PickOut;
-  out.pos = select(D.view_proj * vec4<f32>(world, 1.0), NOWHERE, peeled(c, si, s));
+  out.pos = select(D.view_proj * vec4<f32>(world, 1.0), NOWHERE, peeled(c, s));
   out.id = vec2<u32>(c.x, c.y | 0x80000000u);
   out.world = world;
   out.center = center;

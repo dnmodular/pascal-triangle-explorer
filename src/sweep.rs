@@ -708,11 +708,7 @@ pub fn kinship(lo: u32, hi: u32, order: KinOrder) -> Vec<u32> {
     let (lo, hi) = (lo.min(hi), lo.max(hi));
     let cap = if order == KinOrder::Lattice { KIN_LATTICE_MAX } else { KIN_LOOK_MAX };
     let mods: Vec<u32> = (lo..=hi).take(cap).collect();
-    let n = mods.len();
-    let mut out = Vec::with_capacity(n);
-    let mut left = vec![true; n];
-    let mut cur = 0usize;
-    match order {
+    let chain = match order {
         KinOrder::Lattice => {
             // Ω and the sum of prime factors (with multiplicity), additive: Ω(m/g) = Ω(m) − Ω(g)
             let top = *mods.last().unwrap_or(&1) as usize;
@@ -737,44 +733,21 @@ pub fn kinship(lo: u32, hi: u32, order: KinOrder) -> Vec<u32> {
                 (c, s)
             };
             let table: Vec<(u32, u64)> = (0..=top as u32).map(parts).collect();
-            let info: Vec<(u32, u64)> = mods.iter().map(|&m| table[m as usize]).collect();
-            let gcd = |mut a: u32, mut b: u32| {
-                while b != 0 {
-                    (a, b) = (b, a % b);
-                }
-                a
-            };
-            for _ in 0..n {
-                left[cur] = false;
-                out.push(mods[cur]);
-                let m = mods[cur];
-                let mut best: Option<((u32, u64, u32), usize)> = None;
-                for (j, &x) in mods.iter().enumerate() {
-                    if !left[j] {
-                        continue;
-                    }
-                    let g = table[gcd(m, x) as usize];
-                    let (a, b) = (info[cur], info[j]);
-                    let key = (a.0 + b.0 - 2 * g.0, a.1 + b.1 - 2 * g.1, x);
-                    if best.is_none_or(|(k, _)| key < k) {
-                        best = Some((key, j));
-                    }
-                }
-                match best {
-                    Some((_, j)) => cur = j,
-                    None => break,
-                }
-            }
+            greedy_chain(mods.len(), |i, j| {
+                let g = table[crate::math::gcd_u64(mods[i] as u64, mods[j] as u64) as usize];
+                let (a, b) = (table[mods[i] as usize], table[mods[j] as usize]);
+                (a.0 + b.0 - 2 * g.0, a.1 + b.1 - 2 * g.1)
+            })
         }
         KinOrder::LookAlike => {
             let rows = (hi as u64 * 3 / 2).clamp(96, 384) as usize;
-            let cells = rows * (rows + 1) / 2;
-            let words = cells.div_ceil(64);
+            let words = (rows * (rows + 1) / 2).div_ceil(64);
             let masks: Vec<Vec<u64>> = mods
                 .iter()
                 .map(|&m| {
+                    // the zero set of rows 0..rows mod m, a bit per cell (two row buffers)
                     let mut bits = vec![0u64; words];
-                    let mut row = vec![1u32 % m.max(1)];
+                    let (mut row, mut next) = (vec![1 % m], Vec::with_capacity(rows + 1));
                     let mut i = 0usize;
                     for _ in 0..rows {
                         for &v in &row {
@@ -783,43 +756,50 @@ pub fn kinship(lo: u32, hi: u32, order: KinOrder) -> Vec<u32> {
                             }
                             i += 1;
                         }
-                        let mut next = Vec::with_capacity(row.len() + 1);
+                        next.clear();
                         next.push(1 % m);
-                        for w in row.windows(2) {
+                        next.extend(row.windows(2).map(|w| {
                             let s = w[0] + w[1];
-                            next.push(if s >= m { s - m } else { s });
-                        }
+                            if s >= m { s - m } else { s }
+                        }));
                         next.push(1 % m);
-                        row = next;
+                        std::mem::swap(&mut row, &mut next);
                     }
                     bits
                 })
                 .collect();
-            for _ in 0..n {
-                left[cur] = false;
-                out.push(mods[cur]);
-                let a = &masks[cur];
-                let mut best: Option<(f64, usize)> = None;
-                for j in 0..n {
-                    if !left[j] {
-                        continue;
-                    }
-                    let b = &masks[j];
-                    let (mut inter, mut uni) = (0u32, 0u32);
-                    for (x, y) in a.iter().zip(b) {
-                        inter += (x & y).count_ones();
-                        uni += (x | y).count_ones();
-                    }
-                    let d = if uni == 0 { 0.0 } else { 1.0 - inter as f64 / uni as f64 };
-                    if best.is_none_or(|(bd, _)| d < bd) {
-                        best = Some((d, j));
-                    }
+            greedy_chain(mods.len(), |i, j| {
+                let (mut inter, mut uni) = (0u32, 0u32);
+                for (x, y) in masks[i].iter().zip(&masks[j]) {
+                    inter += (x & y).count_ones();
+                    uni += (x | y).count_ones();
                 }
-                match best {
-                    Some((_, j)) => cur = j,
-                    None => break,
-                }
+                if uni == 0 { 0.0 } else { 1.0 - inter as f64 / uni as f64 }
+            })
+        }
+    };
+    chain.into_iter().map(|i| mods[i]).collect()
+}
+
+/// A walk over 0..n from 0, each next index the unvisited one nearest the last by
+/// `dist(last, candidate)`; ties go to the smaller index.
+fn greedy_chain<K: PartialOrd>(n: usize, dist: impl Fn(usize, usize) -> K) -> Vec<usize> {
+    let mut out = Vec::with_capacity(n);
+    let mut left = vec![true; n];
+    let mut cur = 0usize;
+    for _ in 0..n {
+        left[cur] = false;
+        out.push(cur);
+        let mut best: Option<(K, usize)> = None;
+        for j in (0..n).filter(|&j| left[j]) {
+            let d = dist(cur, j);
+            if best.as_ref().is_none_or(|(b, _)| d < *b) {
+                best = Some((d, j));
             }
+        }
+        match best {
+            Some((_, j)) => cur = j,
+            None => break,
         }
     }
     out
@@ -1145,17 +1125,9 @@ impl Sweep {
                 let k = ((x as i64 - a) as f64 / n as f64).round().max(0.0) as i64;
                 clamp_mod(a + k * n)
             }
-            ModMode::Even => {
-                if x.is_multiple_of(2) {
-                    x
-                } else if x < MOD_CAP {
-                    x + 1
-                } else {
-                    x - 1
-                }
-            }
-            ModMode::Odd => {
-                if x % 2 == 1 {
+            ModMode::Even | ModMode::Odd => {
+                let want = u32::from(self.mode == ModMode::Odd);
+                if x % 2 == want {
                     x
                 } else if x < MOD_CAP {
                     x + 1

@@ -7,9 +7,9 @@ use super::*;
 pub(crate) fn wave_rows(ui: &mut egui::Ui, model: &mut Model) {
     let (mut a, mut b) = main_rows(model);
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("rows").color(ui.visuals().weak_text_color()));
+        weak(ui, "rows");
         let ra = mono_drag_with(ui, &mut a, 0..=u32::MAX - 1, 0.1, false).on_hover_text("First row of the selection (type it, or drag); the selection takes every cell of each row");
-        ui.label(egui::RichText::new("to").color(ui.visuals().weak_text_color()));
+        weak(ui, "to");
         let rb = mono_drag_with(ui, &mut b, 0..=u32::MAX - 1, 0.1, false).on_hover_text("Last row of the selection");
         if ra.changed() || rb.changed() {
             model.wave_select = WaveSelect::Active((a.min(b), 0), (a.max(b), 0));
@@ -38,7 +38,7 @@ pub(crate) fn ghost_controls(ui: &mut egui::Ui, model: &mut Model) {
             g.rows = main;
         }
         if g.on {
-            ui.label(egui::RichText::new("mod").color(ui.visuals().weak_text_color()));
+            weak(ui, "mod");
             mono_drag_with(ui, &mut g.modulus, 2..=MOD_CAP, 0.1, false).on_hover_text("The ghost's modulus: it stays here while the main wave's modulus moves");
             if ui.small_button("= m").on_hover_text("The current modulus").clicked() {
                 g.modulus = model.m;
@@ -49,9 +49,9 @@ pub(crate) fn ghost_controls(ui: &mut egui::Ui, model: &mut Model) {
         return;
     }
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("rows").color(ui.visuals().weak_text_color()));
+        weak(ui, "rows");
         mono_drag_with(ui, &mut g.rows.0, 0..=u32::MAX - 1, 0.1, false).on_hover_text("The ghost's first row (type it, or drag)");
-        ui.label(egui::RichText::new("to").color(ui.visuals().weak_text_color()));
+        weak(ui, "to");
         mono_drag_with(ui, &mut g.rows.1, 0..=u32::MAX - 1, 0.1, false).on_hover_text("The ghost's last row");
         if ui.small_button("← main").on_hover_text("Take the main wave's rows").clicked() {
             g.rows = main;
@@ -93,7 +93,7 @@ pub(crate) fn fraction_controls(ui: &mut egui::Ui, sw: &mut Sweep, super_primes:
         ui.selectable_value(&mut sp.denoms, SpDenoms::Any, "any Q").on_hover_text("Every denominator up to Q: 23/3, 43/6, …");
     }).response.on_hover_text("Which denominators the fractions P/Q take");
     if sp.denoms == SpDenoms::Any {
-        bar_label(ui, "Q ≤");
+        weak(ui, "Q ≤");
         bar_drag(ui, 44.0, &mut sp.qmax, 1..=10_000u32, 0.1);
     }
     ui.checkbox(&mut sp.unreduced, "unreduced").on_hover_text("Also list the fractions not in lowest terms: 10/2, 10/4, 10/6, 10/8 beside 10/3, 10/7, 10/9. Each is the same μ as its lowest terms (10/4 = 5/2) and draws the same picture, so every numerator shows all its denominators");
@@ -131,7 +131,7 @@ pub(crate) fn seq_picker(ui: &mut egui::Ui, sw: &mut pascal::sweep::Sweep, id: &
         .response
         .on_hover_text(format!("{note} Picking the selected sequence again resets it."));
     if sw.seq == Seq::Fixed {
-        bar_label(ui, "step");
+        weak(ui, "step");
         bar_drag(ui, 56.0, &mut sw.step, 1..=10000u32, 0.2);
         return;
     }
@@ -142,7 +142,7 @@ pub(crate) fn seq_picker(ui: &mut egui::Ui, sw: &mut pascal::sweep::Sweep, id: &
             ui.checkbox(&mut on, kn.name).on_hover_text(kn.tip);
             *v = on as u32;
         } else {
-            bar_label(ui, kn.name);
+            weak(ui, kn.name);
             let w = if kn.hi >= 1000 { 52.0 } else { 36.0 };
             bar_drag(ui, w, v, kn.lo..=kn.hi, 0.1).on_hover_text(format!("{} (standard {})", kn.tip, kn.standard));
         }
@@ -164,7 +164,7 @@ pub(crate) fn sweep_bar(ui: &mut egui::Ui, model: &mut Model) {
 
     // ---- row 1: transport · selection mode · mode options · range ----
     ui.horizontal(|ui| {
-        bar_label(ui, "SWEEP");
+        weak(ui, "SWEEP");
         ui.add_space(4.0);
         if bar_button(ui, "⇤", false, "Jump to the range start") {
             sw.playing = false;
@@ -188,7 +188,7 @@ pub(crate) fn sweep_bar(ui: &mut egui::Ui, model: &mut Model) {
             action = Some(1);
         }
         bar_sep(ui);
-        bar_label(ui, "visit");
+        weak(ui, "visit");
         egui::ComboBox::from_id_salt("modmode")
             .width(96.0)
             .selected_text(sw.mode.label())
@@ -223,28 +223,28 @@ pub(crate) fn sweep_bar(ui: &mut egui::Ui, model: &mut Model) {
             _ => {}
         });
         bar_sep(ui);
-        bar_label(ui, "range");
+        weak(ui, "range");
         bar_drag(ui, 70.0, &mut sw.start, 0..=MOD_CAP, 1.0);
-        bar_label(ui, "to");
+        weak(ui, "to");
         bar_drag(ui, 70.0, &mut sw.end, 1..=MOD_CAP, 1.0);
     });
 
     // ---- row 2: frame speed · loop · tween · what the range visits ----
     ui.horizontal(|ui| {
         ui.add_space(54.0);
-        bar_label(ui, "frame");
+        weak(ui, "frame");
         ui.spacing_mut().slider_width = 110.0;
         // the slider spans 16 ms–1 s; the field takes any value typed or dragged up to 10 s
         ui.add(egui::Slider::new(&mut sw.speed_ms, 16..=1000).show_value(false).clamping(egui::SliderClamping::Never));
         bar_drag(ui, 56.0, &mut sw.speed_ms, 16..=10_000u32, 1.0).on_hover_text("Time per frame while playing, in ms: click to type, drag to change");
-        bar_label(ui, "ms");
+        weak(ui, "ms");
         ui.checkbox(&mut sw.looping, "loop").on_hover_text("Wrap at the range ends; off stops on the last frame.");
         bar_sep(ui);
-        bar_label(ui, "tween");
+        weak(ui, "tween");
         bar_drag(ui, 56.0, &mut sw.tween_ms, 0..=3000u32, 5.0).on_hover_text("Display-only transition between moduli: fields morph, plain residue coloring cross-dissolves. Exports, layer history and the inspector use the true frames. 0 = hard cuts. With rows following m the view changes too, so frames cross-fade rather than morph.");
-        bar_label(ui, "ms");
+        weak(ui, "ms");
         bar_sep(ui);
-        bar_label(ui, "decimals");
+        weak(ui, "decimals");
         let max = sw.max_decimals();
         sw.decimals = sw.decimals.min(max);
         bar_drag(ui, 36.0, &mut sw.decimals, 0..=max, 0.05).on_hover_text(format!(
@@ -289,22 +289,13 @@ pub(crate) fn sweep_bar(ui: &mut egui::Ui, model: &mut Model) {
             let last = model.sweep.super_list().len().saturating_sub(1);
             model.set_super(if model.sweep.dir > 0 { 0 } else { last }, true);
         }
-        Some(n) if model.super_mode() => {
-            model.sweep.playing = false;
-            let i = model.sweep.super_step(model.sp_index, n);
-            model.set_super(i, !model.link_hold_sweep);
-        }
         Some(0) => {
             let hi = model.sweep.bounds().1;
             let (m, sub) = if model.sweep.dir > 0 { model.sweep.first_pos() } else { (hi, 0) };
             model.set_pos(m, sub, true);
         }
-        Some(n) => {
-            // the sweep's own frame steps, like playback, leave held rows alone
-            model.sweep.playing = false;
-            let (m, sub) = model.sweep.step_fine_by((model.m, model.sub), n);
-            model.set_pos(m, sub, !model.link_hold_sweep);
-        }
+        // the sweep's own frame steps, like playback, leave held rows alone
+        Some(n) => model.step_with(n, !model.link_hold_sweep),
         None => {}
     }
     // re-snap when the mode or its parameters changed, as the reference does (a new

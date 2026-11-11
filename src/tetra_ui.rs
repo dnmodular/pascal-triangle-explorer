@@ -13,7 +13,7 @@ use pascal::tetra::{describe, Cell, Face, TILE_BUDGET, Side, Snap, face_row_alte
 use pascal::tetra_gpu::{outline_vertices, DrawOptions, PickSpec, TetraRenderer, BACKGROUND};
 use pascal::wave_overlay::Corner;
 
-use super::{group, mono_drag, mono_drag_with, mono_line, note, Model};
+use super::{group, mono_drag, mono_drag_with, mono_line, note, weak, Model};
 
 /// Preview spin, rad/s.
 const SPIN: f32 = 0.35;
@@ -544,7 +544,7 @@ fn options(ui: &mut egui::Ui, t: &mut TetraView) {
     });
     ui.separator();
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("view").color(ui.visuals().weak_text_color()));
+        weak(ui, "view");
         for v in View::ALL {
             if ui.selectable_label(t.config.view == v, v.label()).on_hover_text(v.note()).clicked() {
                 t.set_view(v);
@@ -554,7 +554,7 @@ fn options(ui: &mut egui::Ui, t: &mut TetraView) {
     note(ui, t.config.view.note());
     if t.config.view == View::Face {
         ui.horizontal_wrapped(|ui| {
-            ui.label(egui::RichText::new("face").color(ui.visuals().weak_text_color()));
+            weak(ui, "face");
             for f in Face::ALL {
                 ui.selectable_value(&mut t.config.face, f, f.label()).on_hover_text(format!("{} (F)", f.note()));
             }
@@ -567,7 +567,7 @@ fn options(ui: &mut egui::Ui, t: &mut TetraView) {
     if t.config.view == View::Stack {
         ui.separator();
         ui.horizontal_wrapped(|ui| {
-            ui.label(egui::RichText::new("snap").color(ui.visuals().weak_text_color()));
+            weak(ui, "snap");
             for (i, sn) in Snap::ALL.iter().enumerate() {
                 let tip = match sn {
                     Snap::Top => "Straight down onto the apex",
@@ -590,13 +590,13 @@ fn options(ui: &mut egui::Ui, t: &mut TetraView) {
     let max_cells = t.cell_cap();
     let TetraView { config: c, selection_text, .. } = t;
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("moduli").color(ui.visuals().weak_text_color()));
+        weak(ui, "moduli");
         mono_drag_with(ui, &mut c.sweep.start, 2..=TETRA_MAX_M, 1.0, false).on_hover_text("First modulus (the apex)");
-        ui.label(egui::RichText::new("to").color(ui.visuals().weak_text_color()));
+        weak(ui, "to");
         mono_drag_with(ui, &mut c.sweep.end, 2..=TETRA_MAX_M, 1.0, false).on_hover_text(format!("Last modulus (the base slice), at most {TETRA_MAX_M}"));
     });
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("visit").color(ui.visuals().weak_text_color()));
+        weak(ui, "visit");
         egui::ComboBox::from_id_salt("tetra mode").width(96.0).selected_text(c.sweep.mode.label()).show_ui(ui, |ui| {
             for m in ModMode::WHOLE {
                 ui.selectable_value(&mut c.sweep.mode, m, m.label()).on_hover_text(m.note());
@@ -619,7 +619,7 @@ fn options(ui: &mut egui::Ui, t: &mut TetraView) {
     }
     ui.add_enabled_ui(c.view == View::Stack || (c.view == View::Face && c.face == Face::Top), |ui| {
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("shape").color(ui.visuals().weak_text_color()));
+            weak(ui, "shape");
             egui::ComboBox::from_id_salt("tetra shape").width(150.0).selected_text(c.shape.label()).show_ui(ui, |ui| {
                 for sh in Shape::ALL {
                     ui.selectable_value(&mut c.shape, sh, sh.label()).on_hover_text(sh.note());
@@ -629,7 +629,7 @@ fn options(ui: &mut egui::Ui, t: &mut TetraView) {
     });
     ui.add_enabled_ui(c.view == View::Stack || (c.view == View::Face && c.face == Face::Top), |ui| {
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("cell").color(ui.visuals().weak_text_color()));
+            weak(ui, "cell");
             for cl in Cell::ALL {
                 ui.selectable_value(&mut c.cell, cl, cl.label()).on_hover_text(format!("{} (C)", cl.note()));
             }
@@ -639,18 +639,18 @@ fn options(ui: &mut egui::Ui, t: &mut TetraView) {
         note(ui, "The rhombic and sphere cells fit the equilateral shape in true spacing: elsewhere the slices do not sit in each other's hollows, and the cells overlap or leave gaps.");
     }
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("spacing").color(ui.visuals().weak_text_color()));
+        weak(ui, "spacing");
         ui.selectable_value(&mut c.spacing, Spacing::True, "true").on_hover_text("Height (or a face row's place) follows m: skipped moduli leave gaps (in the stack dashed, with the gap size) and the edges stay straight (G)");
         ui.selectable_value(&mut c.spacing, Spacing::Packed, "packed").on_hover_text("By index: no gaps, but the sides curve because slice size no longer tracks height (G)");
     });
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("highlight").color(ui.visuals().weak_text_color()));
+        weak(ui, "highlight");
         ui.add_enabled_ui(!c.color_slice, |ui| mono_drag(ui, &mut c.brush, 0.0..=64.0, 0.05).on_hover_text("Cubes within this many cells of the hovered cube light up"));
         ui.checkbox(&mut c.color_slice, "whole slice").on_hover_text("Light up the whole hovered slice (or face row) instead");
     });
     ui.horizontal(|ui| {
         ui.checkbox(&mut c.ghosts, "ghost zeros").on_hover_text("Zero cells as faint ghost cubes: the tunnels glow through the solid");
-        ui.label(egui::RichText::new("cubes ≤").color(ui.visuals().weak_text_color()));
+        weak(ui, "cubes ≤");
         egui::ComboBox::from_id_salt("tetra budget").width(70.0).selected_text(short(c.budget)).show_ui(ui, |ui| {
             for b in BUDGETS {
                 ui.selectable_value(&mut c.budget, b, short(b));
@@ -687,7 +687,7 @@ fn peel_controls(ui: &mut egui::Ui, t: &mut TetraView) {
         p.layers = p.layers.min(extent);
     }
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("peel").color(ui.visuals().weak_text_color()));
+        weak(ui, "peel");
         ui.label(egui::RichText::new("link · side · own depth").small().color(ui.visuals().weak_text_color()));
     });
     let depths = p.depths();
@@ -712,9 +712,9 @@ fn peel_controls(ui: &mut egui::Ui, t: &mut TetraView) {
     ui.checkbox(&mut p.shell, "show the last layer off each side").on_hover_text("Draw each side's most recently removed layer (the stack view), pulled out from the stack along that side's outward normal. Cells where two sides' last layers meet move out along both, so the sheets stay joined at their edges.");
     if p.shell {
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("gap").color(ui.visuals().weak_text_color()));
+            weak(ui, "gap");
             mono_drag(ui, &mut p.gap, 0.0..=200.0, 0.05).on_hover_text("How far the removed layers float out from the stack, in cells");
-            ui.label(egui::RichText::new("cells").color(ui.visuals().weak_text_color()));
+            weak(ui, "cells");
         });
     }
     if let Some((i, d)) = side_step {
@@ -754,9 +754,9 @@ fn peel_controls(ui: &mut egui::Ui, t: &mut TetraView) {
         mono_line(ui, &format!("{} / {}", p.layers, extent));
     });
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("speed").color(ui.visuals().weak_text_color()));
+        weak(ui, "speed");
         mono_drag(ui, &mut p.speed, 0.1..=120.0, 0.05).on_hover_text("Layers a second while it plays");
-        ui.label(egui::RichText::new("layers / s").color(ui.visuals().weak_text_color()));
+        weak(ui, "layers / s");
     });
     if let Some(d) = act {
         t.step_peel(d);

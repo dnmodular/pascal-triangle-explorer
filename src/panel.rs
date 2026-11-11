@@ -17,7 +17,7 @@ pub(crate) fn panel_ui(ui: &mut egui::Ui, model: &mut Model, canvas_px: (u32, u3
 
     section(ui, "Modulus", |ui| {
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("m").color(ui.visuals().weak_text_color()));
+            weak(ui, "m");
             let resp = ui.add(egui::TextEdit::singleline(&mut model.m_text).font(FontId::monospace(12.0)).desired_width(90.0));
             if resp.lost_focus() || (resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
                 let text = model.m_text.clone();
@@ -64,7 +64,7 @@ pub(crate) fn panel_ui(ui: &mut egui::Ui, model: &mut Model, canvas_px: (u32, u3
 
     section(ui, "View", |ui| {
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("rows").color(ui.visuals().weak_text_color()));
+            weak(ui, "rows");
             let shown = model.fit_rows.round() as u32;
             let mut rows = shown;
             let tip = if model.link_rows { "Linked to the modulus: a new row count moves m to rows ÷ factor" } else { "Rows to fit" };
@@ -88,7 +88,7 @@ pub(crate) fn panel_ui(ui: &mut egui::Ui, model: &mut Model, canvas_px: (u32, u3
                 model.link_rows = on;
                 model.apply_link();
             }
-            ui.label(egui::RichText::new("×").color(ui.visuals().weak_text_color()));
+            weak(ui, "×");
             let f = ui.add_enabled_ui(model.link_rows, |ui| mono_drag(ui, &mut model.link_factor, 0.01..=1000.0, 0.01).on_hover_text("rows = m × this")).inner;
             if f.changed() {
                 model.apply_link();
@@ -101,7 +101,7 @@ pub(crate) fn panel_ui(ui: &mut egui::Ui, model: &mut Model, canvas_px: (u32, u3
             mono_line(ui, &format!("rows {}–{} · {:.3} px/cell", group(a as u64), group(b as u64), model.view.ppc));
         }
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("supersample").color(ui.visuals().weak_text_color()));
+            weak(ui, "supersample");
             egui::ComboBox::from_id_salt("ss").selected_text(match model.ss {
                 1 => "off",
                 2 => "2 × 2",
@@ -131,9 +131,9 @@ pub(crate) fn panel_ui(ui: &mut egui::Ui, model: &mut Model, canvas_px: (u32, u3
             });
         });
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("scroll").color(ui.visuals().weak_text_color()));
+            weak(ui, "scroll");
             mono_drag(ui, &mut model.wave.config.scroll, -3.0..=3.0, 0.01).on_hover_text("The wave slides sideways at this many rad/s of θ (negative: to the left); 0 holds it still");
-            ui.label(egui::RichText::new("rad/s").color(ui.visuals().weak_text_color()));
+            weak(ui, "rad/s");
             ui.checkbox(&mut model.wave.config.fill, "fill");
             if let Some(n) = model.pinned_row {
                 if ui.small_button(format!("unpin {}", group(n as u64))).on_hover_text("Back to the hovered / last visible row (Esc)").clicked() {
@@ -180,7 +180,7 @@ pub(crate) fn panel_ui(ui: &mut egui::Ui, model: &mut Model, canvas_px: (u32, u3
 
     section(ui, "Color", |ui| {
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("palette").color(ui.visuals().weak_text_color()));
+            weak(ui, "palette");
             let mut s = model.scheme;
             egui::ComboBox::from_id_salt("scheme").selected_text(s.label()).show_ui(ui, |ui| {
                 for sc in Scheme::ALL {
@@ -207,7 +207,7 @@ pub(crate) fn panel_ui(ui: &mut egui::Ui, model: &mut Model, canvas_px: (u32, u3
             _ => "Zeros are void; residues 1..m−1 run along the ramp.",
         });
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("offset").color(ui.visuals().weak_text_color()));
+            weak(ui, "offset");
             let r = mono_drag(ui, &mut model.style.offset, -1.0..=1.0, 0.005).on_hover_text("Fractional color offset: moves every residue color this far along the palette, wrapping around (0 and spectral's 1 stay)");
             model.offset_editing = r.has_focus() || r.dragged();
             let playing = model.offset_playing;
@@ -216,14 +216,14 @@ pub(crate) fn panel_ui(ui: &mut egui::Ui, model: &mut Model, canvas_px: (u32, u3
                 model.offset_playing = !playing;
             }
             mono_drag(ui, &mut model.offset_period, 0.1..=120.0, 0.05).on_hover_text("Seconds per full turn of the cycling offset");
-            ui.label(egui::RichText::new("s / turn").color(ui.visuals().weak_text_color()));
+            weak(ui, "s / turn");
         });
         ui.horizontal(|ui| {
             ui.checkbox(&mut model.style.outlines, "outlines").on_hover_text("A faint outline around each cell once cells are a few pixels wide");
             ui.checkbox(&mut model.style.glow, "glow").on_hover_text("A soft halo around zero cells — where m divides C(n,k) — once cells are a few pixels wide");
         });
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("fractions by").color(ui.visuals().weak_text_color()));
+            weak(ui, "fractions by");
             let fc = &mut model.frac_colors;
             egui::ComboBox::from_id_salt("frac colors").width(70.0).selected_text(fc.label()).show_ui(ui, |ui| {
                 for x in FracColors::ALL {
@@ -236,7 +236,7 @@ pub(crate) fn panel_ui(ui: &mut egui::Ui, model: &mut Model, canvas_px: (u32, u3
     section(ui, "Layers", |ui| {
         note(ui, "Measures produce a 0..1 field per cell and blend together; transforms run on top in a fixed order.");
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("field color").color(ui.visuals().weak_text_color()));
+            weak(ui, "field color");
             ui.selectable_value(&mut model.layers.color_mode, FieldColorMode::MathRamp, "math ramp");
             ui.selectable_value(&mut model.layers.color_mode, FieldColorMode::PaletteBlend, "palette blend");
         });
@@ -245,7 +245,7 @@ pub(crate) fn panel_ui(ui: &mut egui::Ui, model: &mut Model, canvas_px: (u32, u3
             FieldColorMode::PaletteBlend => "Measures light the palette image; transforms run per RGB channel, so a red region ghosts cyan.",
         });
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("blend").color(ui.visuals().weak_text_color()));
+            weak(ui, "blend");
             egui::ComboBox::from_id_salt("blend").selected_text(model.layers.blend.label()).show_ui(ui, |ui| {
                 for b in BlendMode::ALL {
                     ui.selectable_value(&mut model.layers.blend, b, b.label());
@@ -279,7 +279,7 @@ pub(crate) fn panel_ui(ui: &mut egui::Ui, model: &mut Model, canvas_px: (u32, u3
                     }
                     for p in d.params {
                         ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new(p.label).color(ui.visuals().weak_text_color()));
+                            weak(ui, p.label);
                             let mut v = model.layers.param(p.key);
                             if !p.choices.is_empty() {
                                 let before = v;
@@ -319,7 +319,7 @@ pub(crate) fn panel_ui(ui: &mut egui::Ui, model: &mut Model, canvas_px: (u32, u3
             }
         });
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("folder").color(ui.visuals().weak_text_color()));
+            weak(ui, "folder");
             ui.add(egui::TextEdit::singleline(&mut model.export_dir).font(FontId::monospace(12.0)).desired_width(f32::INFINITY));
         });
         mono_line(ui, &format!("{} × {} px", canvas_px.0, canvas_px.1));
